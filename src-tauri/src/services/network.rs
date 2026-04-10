@@ -9,7 +9,6 @@
 ///
 /// This is intentionally best-effort; the primary connectivity signal is the
 /// browser `navigator.onLine` flag propagated via JS events.
-#[allow(dead_code)]
 pub fn is_likely_online() -> bool {
     use std::net::TcpStream;
     use std::time::Duration;

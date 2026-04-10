@@ -146,11 +146,17 @@ const OFFLINE_BANNER_SCRIPT: &str = r#"
 
 /// JavaScript snippet that triggers snapshot capture and forwards the HTML to
 /// Rust via `invoke('save_snapshot', …)`.  Called from the Rust snapshot timer.
+///
+/// Guards against offline/error states: only snapshots when the browser reports
+/// online **and** the page is actually on `messenger.com` (prevents overwriting
+/// a good snapshot with an error page or offline-degraded DOM).
 const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 (function() {
     try {
+        if (!navigator.onLine) return;
+        var url = window.location.href;
+        if (url.indexOf('messenger.com') === -1) return;
         var html = document.documentElement.outerHTML;
-        var url  = window.location.href;
         window.__TAURI__.core.invoke('save_snapshot', { html: html, url: url });
     } catch(e) { console.error('[MessengerX] Failed to save snapshot:', e); }
 })();
@@ -231,11 +237,21 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let nav_app_handle = app.handle().clone();
 
     // ------------------------------------------------------------------
-    // 3. Build the main window programmatically.
+    // 3. Determine initial URL based on connectivity.
+    //    If offline, load a local fallback page instead of messenger.com.
     // ------------------------------------------------------------------
-    let messenger_url = url::Url::parse("https://www.messenger.com")?;
+    let is_online = services::network::is_likely_online();
+    let webview_url = if is_online {
+        WebviewUrl::External(url::Url::parse("https://www.messenger.com")?)
+    } else {
+        log::info!("[MessengerX] Offline at startup — loading local fallback page");
+        WebviewUrl::App("index.html".into())
+    };
 
-    let webview = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(messenger_url))
+    // ------------------------------------------------------------------
+    // 4. Build the main window programmatically.
+    // ------------------------------------------------------------------
+    let webview = WebviewWindowBuilder::new(app, "main", webview_url)
         .title("Messenger X")
         .inner_size(1200.0, 800.0)
         .min_inner_size(400.0, 300.0)
@@ -256,7 +272,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // open everything else in the system browser.
         .on_navigation(move |url| {
             let scheme = url.scheme();
-            // Pass through non-HTTP schemes (blob:, data:, about:, etc.).
+            // Pass through non-HTTP schemes (blob:, data:, about:, tauri:, etc.).
             if scheme != "http" && scheme != "https" {
                 return true;
             }
@@ -286,7 +302,63 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // ------------------------------------------------------------------
-    // 4. System tray icon.
+    // 5. Offline fallback: inject cached content or show offline message.
+    //    Also starts a reconnect timer that redirects to messenger.com
+    //    once connectivity is restored.
+    // ------------------------------------------------------------------
+    if !is_online {
+        let fallback_handle = app.handle().clone();
+        let fallback_webview = webview.clone();
+        std::thread::spawn(move || {
+            // Wait for the local page to render.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+
+            // Try to load cached snapshot and inject it.
+            let has_cache = if let Ok(Some(snapshot)) =
+                services::cache::load_latest_snapshot(&fallback_handle)
+            {
+                let html_json = serde_json::to_string(&snapshot.html).unwrap_or_default();
+                let inject = format!(
+                    r#"(function(){{
+    document.open();
+    document.write({html});
+    document.close();
+    var b=document.createElement('div');
+    b.id='__messenger_offline_banner__';
+    b.style.cssText='display:block;position:fixed;top:0;left:0;right:0;z-index:999999;background:#f0ad4e;color:#fff;text-align:center;padding:8px 16px;font-size:13px;font-weight:500;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;';
+    b.textContent='Offline Mode \u2014 Viewing cached content';
+    if(document.body)document.body.prepend(b);
+}})()"#,
+                    html = html_json
+                );
+                fallback_webview.eval(&inject).is_ok()
+            } else {
+                false
+            };
+
+            if !has_cache {
+                // No cached snapshot — update the loading screen.
+                let _ = fallback_webview.eval(
+                    "if(document.querySelector('.loading p')){document.querySelector('.loading p').textContent='No internet connection. Waiting to reconnect\\u2026';}",
+                );
+            }
+
+            // Start reconnect timer: check every 15 s and redirect when online.
+            let _ = fallback_webview.eval(
+                r#"(function(){
+    setInterval(function(){
+        var img=new Image();
+        img.onload=function(){window.location.href='https://www.messenger.com';};
+        img.onerror=function(){};
+        img.src='https://static.xx.fbcdn.net/rsrc.php/v4/yJ/r/bWHaFYtfBCe.png?'+Date.now();
+    },15000);
+})()"#,
+            );
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // 6. System tray icon.
     // ------------------------------------------------------------------
     if let Some(icon) = app.default_window_icon() {
         match tauri::tray::TrayIconBuilder::with_id("messengerx-tray")
@@ -300,7 +372,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ------------------------------------------------------------------
-    // 5. Periodic snapshot timer (every 60 seconds).
+    // 7. Periodic snapshot timer (every 60 seconds).
+    //    The JS itself guards against offline/error pages (see
+    //    `SNAPSHOT_TRIGGER_SCRIPT`).
     // ------------------------------------------------------------------
     let snapshot_webview = webview.clone();
     std::thread::spawn(move || loop {
