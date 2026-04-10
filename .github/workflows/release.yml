@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Matrix produces 7 artifacts:
 #   macOS      — arm64 (.dmg) + x86_64 (.dmg)
@@ -84,7 +87,8 @@ jobs:
             libgtk-3-dev \
             libglib2.0-dev \
             libssl-dev \
-            libdbus-1-dev
+            libdbus-1-dev \
+            xdg-utils
 
       # ── Node.js ──────────────────────────────────────────────────────────
       - name: Set up Node.js
