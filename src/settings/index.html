@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Settings — Messenger X</title>
+  <link rel="stylesheet" href="settings.css" />
+</head>
+<body>
+  <div id="settings">
+    <h1>Settings</h1>
+    
+    <div class="setting-group">
+      <h2>Account</h2>
+      <label class="setting-row">
+        <span>Stay logged in</span>
+        <div class="toggle-switch">
+          <input type="checkbox" id="stay-logged-in" checked />
+          <span class="toggle-slider"></span>
+        </div>
+      </label>
+    </div>
+
+    <div class="setting-group">
+      <h2>Display</h2>
+      <div class="setting-row">
+        <span>Zoom Level</span>
+        <div class="zoom-controls">
+          <button id="zoom-out" class="zoom-btn">−</button>
+          <span id="zoom-level">100%</span>
+          <button id="zoom-in" class="zoom-btn">+</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-group">
+      <h2>Data</h2>
+      <button id="logout-btn" class="danger-btn">Log out &amp; clear all data</button>
+      <p class="hint">This will clear your session, cached data, and all settings.</p>
+    </div>
+
+    <div class="setting-group">
+      <h2>About</h2>
+      <p class="version">Messenger X v0.1.0</p>
+      <p class="hint">Cross-platform Messenger client built with Tauri.</p>
+    </div>
+  </div>
+  <script type="module" src="settings.ts"></script>
+</body>
+</html>

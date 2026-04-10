@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Rust build
+src-tauri/target/
+
+# Tauri build output
+src-tauri/gen/
+
+# TypeScript output
+dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Lock files (keep package-lock.json)
+Cargo.lock
+
+# Agent memory (local-only)
+.opencode/
+opencode.json
+
+# Internal docs (local-only, not for GitHub)
+AGENTS.md
+PRD.md
