@@ -80,6 +80,7 @@
       },
       "allowDowngrades": true,
       "nsis": {
+        "installerIcon": "icons/icon.ico",
         "installMode": "currentUser",
         "languages": ["English"],
         "displayLanguageSelector": false
