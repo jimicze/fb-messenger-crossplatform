@@ -1,6 +1,6 @@
 {
   "productName": "Messenger X",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "identifier": "com.lasakondrej.messengerx",
   "build": {
     "frontendDist": "../src"
@@ -14,8 +14,12 @@
   "bundle": {
     "createUpdaterArtifacts": true,
     "active": true,
-    "targets": ["dmg", "app", "nsis", "appimage"],
-
+    "targets": [
+      "dmg",
+      "app",
+      "nsis",
+      "appimage"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -23,33 +27,38 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-
     "category": "SocialNetworking",
     "copyright": "© 2026 Messenger X Contributors",
     "shortDescription": "Cross-platform Facebook Messenger desktop client",
     "longDescription": "Messenger X is a lightweight, cross-platform desktop client for Facebook Messenger built with Tauri. It provides native desktop notifications, system tray integration, offline detection, and a clean WebView-powered interface on macOS, Windows, and Linux.",
-
     "linux": {
       "appimage": {
         "bundleMediaFramework": false,
         "files": {}
       }
     },
-
     "macOS": {
       "minimumSystemVersion": "10.13",
       "hardenedRuntime": true,
       "dmg": {
-        "windowSize": { "width": 660, "height": 400 },
-        "appPosition": { "x": 180, "y": 170 },
-        "applicationFolderPosition": { "x": 480, "y": 170 }
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
       },
       "entitlements": null,
       "signingIdentity": null,
       "providerShortName": null,
       "files": {}
     },
-
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
@@ -59,7 +68,9 @@
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "installMode": "currentUser",
-        "languages": ["English"],
+        "languages": [
+          "English"
+        ],
         "displayLanguageSelector": false
       },
       "wix": null,
