@@ -262,18 +262,12 @@ jobs:
                 elif [[ "$asset" == *aarch64.* ]]; then
                   add_entry "linux-aarch64-rpm" "$asset" "$sig_path"
                 fi ;;
-              *_en-US.msi)
-                if [[ "$asset" == *_x64_* ]]; then
-                  add_entry "windows-x86_64"     "$asset" "$sig_path"
-                  add_entry "windows-x86_64-msi" "$asset" "$sig_path"
-                elif [[ "$asset" == *_arm64_* ]]; then
-                  add_entry "windows-aarch64"     "$asset" "$sig_path"
-                  add_entry "windows-aarch64-msi" "$asset" "$sig_path"
-                fi ;;
               *-setup.exe)
                 if [[ "$asset" == *_x64-* ]]; then
+                  add_entry "windows-x86_64"      "$asset" "$sig_path"
                   add_entry "windows-x86_64-nsis" "$asset" "$sig_path"
                 elif [[ "$asset" == *_arm64-* ]]; then
+                  add_entry "windows-aarch64"      "$asset" "$sig_path"
                   add_entry "windows-aarch64-nsis" "$asset" "$sig_path"
                 fi ;;
             esac
