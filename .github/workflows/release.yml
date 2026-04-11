@@ -5,72 +5,158 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Two-phase release:
-#   1. create-release  — creates a single GitHub Release (eliminates race)
-#   2. build-tauri     — 6 parallel matrix jobs upload artifacts to that release
+# Four-phase release:
 #
-# Matrix produces artifacts for:
-#   macOS      — arm64 (.dmg) + x86_64 (.dmg)
-#   Windows    — x64 (.exe) + arm64 (.exe)
-#   Linux x64  — .AppImage
-#   Linux arm64— .AppImage
+#   0. bump-version    — (workflow_dispatch only) bump semver in source files,
+#                        commit to main, push tag; no-op on tag-push trigger
+#   1. create-release  — create a single GitHub Release (eliminates race)
+#   2. build-tauri     — 6 parallel matrix jobs upload artifacts to that release
+#   3. publish-updater — generate one complete latest.json after all builds
+#
+# Triggering a release:
+#   • From GitHub UI / gh cli: Actions → Release → Run workflow → pick bump type
+#   • From terminal (manual): git tag vX.Y.Z && git push origin vX.Y.Z
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Phase 0: Bump semver, commit, push tag.
+  # Only runs on workflow_dispatch. On tag-push this job is a no-op (the
+  # bump step is skipped) so downstream jobs always have a job to depend on.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  bump-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new-tag: ${{ steps.bump.outputs.new-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Bump version, commit and push tag
+        id: bump
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+
+          BUMP="${{ github.event.inputs.bump_type }}"
+          CURRENT=$(jq -r .version package.json)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW="${MAJOR}.${MINOR}.${PATCH}"
+          TAG="v${NEW}"
+
+          echo "Bumping ${CURRENT} → ${NEW} (${BUMP})"
+
+          # ── Update version in all three version-carrying files ──────────────
+          jq --arg v "$NEW" '.version = $v' package.json \
+            > /tmp/package.json && mv /tmp/package.json package.json
+
+          jq --arg v "$NEW" '.version = $v' src-tauri/tauri.conf.json \
+            > /tmp/tauri.conf.json && mv /tmp/tauri.conf.json src-tauri/tauri.conf.json
+
+          # Cargo.toml: replace `version = "X.Y.Z"` at start of line (under [package])
+          sed -i "s/^version = \"[^\"]*\"/version = \"${NEW}\"/" src-tauri/Cargo.toml
+
+          # ── Update Cargo.lock if it is tracked ────────────────────────────────
+          if git ls-files --error-unmatch src-tauri/Cargo.lock 2>/dev/null; then
+            sed -i '/^name = "messengerx"/{n;s/version = "[^"]*"/version = "'"${NEW}"'"/}' \
+              src-tauri/Cargo.lock
+            git add src-tauri/Cargo.lock
+          fi
+
+          # ── Commit and tag ────────────────────────────────────────────────────
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          git commit -m "chore: bump version to ${TAG}"
+          git tag "$TAG"
+
+          git push origin HEAD:main
+          git push origin "$TAG"
+
+          echo "new-tag=${TAG}" >> "$GITHUB_OUTPUT"
+
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   # Phase 1: Create a single GitHub Release before any builds start.
-  # This eliminates the race condition where parallel matrix jobs each tried
-  # to create their own draft release (causing lost artifacts in v0.2.1).
+  # Resolves the tag from either the bump-version output or the pushed tag.
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   create-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: bump-version
+    if: |
+      always() &&
+      needs.bump-version.result != 'failure' &&
+      (startsWith(github.ref, 'refs/tags/v') || needs.bump-version.outputs.new-tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
       release-id: ${{ steps.create.outputs.id }}
+      tag-name:   ${{ steps.resolve-tag.outputs.name }}
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Resolve tag name
+        id: resolve-tag
+        run: |
+          if [[ -n "${{ needs.bump-version.outputs.new-tag }}" ]]; then
+            echo "name=${{ needs.bump-version.outputs.new-tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub Release
         id: create
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: 'Messenger X ${{ github.ref_name }}'
+          tag_name: ${{ steps.resolve-tag.outputs.name }}
+          name: 'Messenger X ${{ steps.resolve-tag.outputs.name }}'
           body: |
             ## Downloads
 
             | Platform | Architecture | Installer |
             |----------|-------------|-----------|
-            | **Windows** | x64 | `.exe` (NSIS) or `.msi` |
-            | **Windows** | ARM64 | `.exe` (NSIS) or `.msi` |
+            | **Windows** | x64 | `.exe` (NSIS) |
+            | **Windows** | ARM64 | `.exe` (NSIS) |
             | **macOS** | Apple Silicon | `.dmg` |
             | **macOS** | Intel | `.dmg` |
-            | **Linux** | x64 | `.deb` / `.rpm` / `.AppImage` |
-            | **Linux** | ARM64 | `.deb` / `.rpm` / `.AppImage` |
+            | **Linux** | x64 | `.AppImage` |
+            | **Linux** | ARM64 | `.AppImage` |
 
-            ### Linux distro guide
-            - **Debian / Ubuntu / Linux Mint** → `.deb`
-            - **Fedora / RHEL / openSUSE** → `.rpm`
-            - **Arch Linux / any other** → `.AppImage`
+            > Auto-update is supported — existing installs will be notified automatically.
           draft: false
           prerelease: false
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   # Phase 2: Build on all platforms and upload artifacts to the release.
-  # Each job receives the releaseId so no job tries to create its own release.
-  # For workflow_dispatch (no tag), jobs only build without uploading.
+  # Checks out the exact tag so all jobs use the bumped version files.
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   build-tauri:
-    needs: create-release
-    if: always()
+    needs: [bump-version, create-release]
+    if: always() && needs.create-release.result == 'success'
     permissions:
       contents: write
     strategy:
@@ -105,7 +191,7 @@ jobs:
             rust-targets: ''
             label: 'Linux-x64'
 
-          # ── Linux arm64 ────────────────────────────────────────────────────
+          # ── Linux arm64 ───────────────────────────────────────────────────
           - platform: 'ubuntu-22.04-arm'
             args: ''
             rust-targets: ''
@@ -117,6 +203,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          # Always build from the exact release tag (works for both trigger paths).
+          ref: ${{ needs.create-release.outputs.tag-name }}
 
       # ── Linux system dependencies ────────────────────────────────────────
       - name: Install Linux system dependencies
@@ -175,26 +264,23 @@ jobs:
           # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         with:
-          # Upload to the pre-created release (tag push) or build-only (workflow_dispatch).
-          # When releaseId is empty, tauri-action builds without uploading.
-          releaseId: ${{ needs.create-release.outputs.release-id || '' }}
-          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseId: ${{ needs.create-release.outputs.release-id }}
+          tagName:   ${{ needs.create-release.outputs.tag-name }}
           includeUpdaterJson: false
           args: ${{ matrix.args }}
           projectPath: '.'
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   # Phase 3: Generate a single, complete updater manifest (latest.json).
-  # This runs AFTER all build jobs finish, so it sees all platform artifacts.
-  # Eliminates the race condition where parallel jobs each tried to upload
-  # their own latest.json (causing "already_exists" failures in v0.2.4).
+  # Runs after all build jobs so it sees every platform's .sig file.
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   publish-updater:
-    needs: build-tauri
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [create-release, build-tauri]
+    if: always() && needs.build-tauri.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Generate and upload latest.json
         env:
@@ -202,7 +288,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ needs.create-release.outputs.tag-name }}"
           VERSION="${TAG#v}"
           REPO="${GITHUB_REPOSITORY}"
           BASE="https://github.com/${REPO}/releases/download/${TAG}"
@@ -268,9 +354,9 @@ jobs:
           echo "Generated latest.json with $PLATFORM_COUNT platform entries:"
           jq -r '.platforms | keys[]' latest.json
 
-          # Delete existing latest.json if a build job uploaded one, then upload ours
+          # Delete existing latest.json (if a build job uploaded one) then upload ours
           gh release delete-asset "$TAG" latest.json --repo "$REPO" --yes 2>/dev/null || true
           gh release upload "$TAG" latest.json --repo "$REPO"
 
-          echo "✅ Published complete updater manifest"
+          echo "Done: published complete updater manifest for ${TAG}"
           rm -rf "$WORK"
