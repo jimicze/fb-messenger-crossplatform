@@ -262,7 +262,7 @@ mod tests {
         };
         let json = serde_json::to_string(&settings).expect("serialize");
         let deserialized: AppSettings = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(deserialized.stay_logged_in, false);
+        assert!(!deserialized.stay_logged_in);
         assert!((deserialized.zoom_level - 1.5).abs() < f64::EPSILON);
     }
 
@@ -303,11 +303,19 @@ mod tests {
 
     #[test]
     fn test_zoom_clamp_logic() {
-        // Verify the clamping constants are sensible
-        assert!(MIN_ZOOM > 0.0);
-        assert!(MIN_ZOOM < 1.0);
-        assert!(MAX_ZOOM > 1.0);
-        assert!(MAX_ZOOM <= 5.0);
+        // Verify the clamping constants are sensible (checked at compile-time via type system)
+        const _: () = {
+            assert!(MIN_ZOOM > 0.0);
+        };
+        const _: () = {
+            assert!(MIN_ZOOM < 1.0);
+        };
+        const _: () = {
+            assert!(MAX_ZOOM > 1.0);
+        };
+        const _: () = {
+            assert!(MAX_ZOOM <= 5.0);
+        };
 
         // Test clamping behavior
         let too_low = 0.1_f64.clamp(MIN_ZOOM, MAX_ZOOM);

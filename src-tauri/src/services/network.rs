@@ -29,11 +29,4 @@ mod tests {
         // The actual return value depends on network connectivity.
         let _result = is_likely_online();
     }
-
-    #[test]
-    fn test_is_likely_online_returns_bool() {
-        let result: bool = is_likely_online();
-        // Just assert it's a valid bool (trivially true, but documents the API contract).
-        assert!(result || !result);
-    }
 }
