@@ -15,7 +15,7 @@ use tauri::{AppHandle, Manager};
 pub struct AppSettings {
     /// Whether to persist the login session across app restarts.
     pub stay_logged_in: bool,
-    /// Webview zoom level in the range [0.5, 3.0] (1.0 = 100 %).
+    /// Webview zoom level in the range [0.6, 1.2] (1.0 = 100 %).
     pub zoom_level: f64,
     /// Whether native OS notifications are enabled.
     pub notifications_enabled: bool,
@@ -55,10 +55,10 @@ pub struct SnapshotData {
 // Zoom bounds
 // ---------------------------------------------------------------------------
 
-/// Minimum allowed zoom level (50 %).
-const MIN_ZOOM: f64 = 0.5;
-/// Maximum allowed zoom level (300 %).
-const MAX_ZOOM: f64 = 3.0;
+/// Minimum allowed zoom level (60 %).
+const MIN_ZOOM: f64 = 0.6;
+/// Maximum allowed zoom level (120 %).
+const MAX_ZOOM: f64 = 1.2;
 
 // ---------------------------------------------------------------------------
 // Unread-count guard (prevents redundant tray updates — B5 badge-flicker fix)
@@ -164,7 +164,7 @@ pub fn open_external(url: String, app: AppHandle) -> Result<(), String> {
 
 /// Set and persist the webview zoom level.
 ///
-/// The level is clamped to [0.5, 3.0].  The new level is saved to settings and
+/// The level is clamped to [0.6, 1.2].  The new level is saved to settings and
 /// immediately applied to the main webview via the native `set_zoom` API.
 /// Unlike CSS `body.style.zoom`, the native API scales the entire viewport so
 /// the page layout fills the window correctly at all zoom levels.
@@ -190,91 +190,6 @@ pub fn set_zoom(level: f64, app: AppHandle) -> Result<(), String> {
 pub fn get_zoom(app: AppHandle) -> Result<f64, String> {
     let settings = crate::services::auth::load_settings(&app).unwrap_or_default();
     Ok(settings.zoom_level)
-}
-
-/// Returns the UI translation strings for the detected system locale.
-///
-/// The frontend calls this at startup to localise all visible text.
-#[tauri::command]
-pub fn get_translations() -> Result<std::collections::HashMap<String, String>, String> {
-    let locale = crate::services::locale::detect_locale();
-    let t = crate::services::locale::get_translations(&locale);
-
-    let mut map = std::collections::HashMap::new();
-    map.insert("locale".to_string(), locale);
-    map.insert("tray_tooltip".to_string(), t.tray_tooltip);
-    map.insert("tray_tooltip_unread".to_string(), t.tray_tooltip_unread);
-    map.insert("loading_title".to_string(), t.loading_title);
-    map.insert("loading_text".to_string(), t.loading_text);
-    map.insert("loading_offline".to_string(), t.loading_offline);
-    map.insert("offline_banner".to_string(), t.offline_banner);
-    map.insert("settings_title".to_string(), t.settings_title);
-    map.insert("settings_account".to_string(), t.settings_account);
-    map.insert(
-        "settings_stay_logged_in".to_string(),
-        t.settings_stay_logged_in,
-    );
-    map.insert("settings_display".to_string(), t.settings_display);
-    map.insert("settings_zoom_level".to_string(), t.settings_zoom_level);
-    map.insert("settings_data".to_string(), t.settings_data);
-    map.insert("settings_logout".to_string(), t.settings_logout);
-    map.insert("settings_logout_hint".to_string(), t.settings_logout_hint);
-    map.insert(
-        "settings_logout_confirm".to_string(),
-        t.settings_logout_confirm,
-    );
-    map.insert("settings_about".to_string(), t.settings_about);
-    map.insert(
-        "settings_about_description".to_string(),
-        t.settings_about_description,
-    );
-    map.insert("settings_updates".to_string(), t.settings_updates);
-    map.insert("settings_check_update".to_string(), t.settings_check_update);
-    map.insert("settings_checking".to_string(), t.settings_checking);
-    map.insert(
-        "settings_update_available".to_string(),
-        t.settings_update_available,
-    );
-    map.insert(
-        "settings_update_downloading".to_string(),
-        t.settings_update_downloading,
-    );
-    map.insert("settings_update_ready".to_string(), t.settings_update_ready);
-    map.insert("settings_no_update".to_string(), t.settings_no_update);
-    map.insert("settings_update_error".to_string(), t.settings_update_error);
-    map.insert(
-        "settings_install_restart".to_string(),
-        t.settings_install_restart,
-    );
-    map.insert(
-        "settings_notifications".to_string(),
-        t.settings_notifications,
-    );
-    map.insert(
-        "settings_notifications_enabled".to_string(),
-        t.settings_notifications_enabled,
-    );
-    map.insert(
-        "settings_notification_sound".to_string(),
-        t.settings_notification_sound,
-    );
-    map.insert("settings_startup".to_string(), t.settings_startup);
-    map.insert("settings_autostart".to_string(), t.settings_autostart);
-    map.insert(
-        "settings_start_minimized".to_string(),
-        t.settings_start_minimized,
-    );
-    Ok(map)
-}
-
-/// Open the settings window, or focus it if already open.
-///
-/// Called from the injected keyboard shortcut (Cmd+, / Ctrl+,) or from the
-/// tray context menu.
-#[tauri::command]
-pub fn open_settings(app: AppHandle) -> Result<(), String> {
-    crate::open_settings_window(&app);
-    Ok(())
 }
 
 /// Check whether a newer version is available from the update endpoint.
@@ -421,7 +336,7 @@ mod tests {
             assert!(MAX_ZOOM > 1.0);
         };
         const _: () = {
-            assert!(MAX_ZOOM <= 5.0);
+            assert!(MAX_ZOOM <= 2.0);
         };
 
         // Test clamping behavior
@@ -431,7 +346,7 @@ mod tests {
         let too_high = 10.0_f64.clamp(MIN_ZOOM, MAX_ZOOM);
         assert!((too_high - MAX_ZOOM).abs() < f64::EPSILON);
 
-        let normal = 1.5_f64.clamp(MIN_ZOOM, MAX_ZOOM);
-        assert!((normal - 1.5).abs() < f64::EPSILON);
+        let normal = 1.1_f64.clamp(MIN_ZOOM, MAX_ZOOM);
+        assert!((normal - 1.1).abs() < f64::EPSILON);
     }
 }

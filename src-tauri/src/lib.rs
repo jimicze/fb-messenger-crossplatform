@@ -7,7 +7,7 @@
 mod commands;
 mod services;
 
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 // ---------------------------------------------------------------------------
@@ -166,59 +166,6 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 })();
 "#;
 
-/// Injects a keyboard shortcut listener that opens the Settings window
-/// when the user presses Cmd+, (macOS) or Ctrl+, (Windows/Linux).
-///
-/// This ensures the shortcut works even when the webview has focus.
-const SETTINGS_SHORTCUT_SCRIPT: &str = r#"
-(function() {
-    document.addEventListener('keydown', function(e) {
-        if ((e.metaKey || e.ctrlKey) && e.key === ',') {
-            e.preventDefault();
-            try {
-                window.__TAURI__.core.invoke('open_settings');
-            } catch(err) { console.error('[MessengerX] Failed to open settings:', err); }
-        }
-    });
-})();
-"#;
-
-// ---------------------------------------------------------------------------
-// Settings window helper
-// ---------------------------------------------------------------------------
-
-/// Opens the settings window, or focuses it if it already exists.
-///
-/// Used by the tray context menu, the macOS app menu bar, and the
-/// `open_settings` IPC command.
-pub(crate) fn open_settings_window(app_handle: &tauri::AppHandle) {
-    // If the settings window already exists, just focus it.
-    if let Some(window) = app_handle.get_webview_window("settings") {
-        let _ = window.show();
-        let _ = window.set_focus();
-        return;
-    }
-
-    // Load translations for the window title.
-    let locale = services::locale::detect_locale();
-    let tr = services::locale::get_translations(&locale);
-
-    match WebviewWindowBuilder::new(
-        app_handle,
-        "settings",
-        WebviewUrl::App("settings/index.html".into()),
-    )
-    .title(&tr.settings_title)
-    .inner_size(520.0, 640.0)
-    .min_inner_size(400.0, 400.0)
-    .resizable(true)
-    .build()
-    {
-        Ok(_) => {}
-        Err(e) => log::warn!("[MessengerX] Failed to open settings window: {e}"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Application entry point
 // ---------------------------------------------------------------------------
@@ -254,8 +201,6 @@ pub fn run() {
             commands::open_external,
             commands::set_zoom,
             commands::get_zoom,
-            commands::get_translations,
-            commands::open_settings,
             commands::check_for_update,
             commands::install_update,
             commands::set_autostart,
@@ -333,8 +278,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(OFFLINE_DIALOG_HIDER_SCRIPT)
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
-        // Keyboard shortcut: Cmd+, / Ctrl+, opens Settings.
-        .initialization_script(SETTINGS_SHORTCUT_SCRIPT)
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -447,21 +390,140 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // ------------------------------------------------------------------
     // 6. System tray icon with context menu.
+    //    All settings are now inline CheckMenuItems instead of a separate
+    //    settings window.
     // ------------------------------------------------------------------
     if let Some(icon) = app.default_window_icon() {
-        // Build tray context menu items (localised).
-        let show_item = MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
-        let settings_item =
-            MenuItemBuilder::with_id("tray_settings", &tr.tray_settings).build(app)?;
-        let separator = PredefinedMenuItem::separator(app)?;
-        let quit_item = MenuItemBuilder::with_id("tray_quit", &tr.tray_quit).build(app)?;
+        use tauri::menu::CheckMenuItemBuilder;
 
+        // Load current autostart state from the OS (may differ from saved).
+        let autostart_checked = {
+            use tauri_plugin_autostart::ManagerExt;
+            app.autolaunch()
+                .is_enabled()
+                .unwrap_or(settings.autostart)
+        };
+
+        // --- Build menu items ---
+
+        let show_item =
+            MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
+
+        // Toggles
+        let stay_logged_in_item = CheckMenuItemBuilder::with_id(
+            "stay_logged_in",
+            &tr.settings_stay_logged_in,
+        )
+        .checked(settings.stay_logged_in)
+        .build(app)?;
+
+        let notifications_item = CheckMenuItemBuilder::with_id(
+            "notifications_enabled",
+            &tr.settings_notifications_enabled,
+        )
+        .checked(settings.notifications_enabled)
+        .build(app)?;
+
+        let notification_sound_item = CheckMenuItemBuilder::with_id(
+            "notification_sound",
+            &tr.settings_notification_sound,
+        )
+        .checked(settings.notification_sound)
+        .build(app)?;
+
+        // Zoom submenu with radio-like CheckMenuItems (60%-120%)
+        let zoom_levels: &[(u32, &str)] = &[
+            (60, "60%"),
+            (70, "70%"),
+            (80, "80%"),
+            (90, "90%"),
+            (100, "100%"),
+            (110, "110%"),
+            (120, "120%"),
+        ];
+        let current_zoom_pct = (settings.zoom_level * 100.0).round() as u32;
+        let mut zoom_checks: Vec<tauri::menu::CheckMenuItem<tauri::Wry>> = Vec::new();
+        for &(pct, label) in zoom_levels {
+            let item = CheckMenuItemBuilder::with_id(format!("zoom_{pct}"), label)
+                .checked(pct == current_zoom_pct)
+                .build(app)?;
+            zoom_checks.push(item);
+        }
+
+        let mut zoom_builder = SubmenuBuilder::new(app, &tr.settings_zoom_level);
+        for item in &zoom_checks {
+            zoom_builder = zoom_builder.item(item);
+        }
+        let zoom_submenu = zoom_builder.build()?;
+
+        // Startup toggles
+        let autostart_item = CheckMenuItemBuilder::with_id(
+            "autostart",
+            &tr.settings_autostart,
+        )
+        .checked(autostart_checked)
+        .build(app)?;
+
+        let start_minimized_item = CheckMenuItemBuilder::with_id(
+            "start_minimized",
+            &tr.settings_start_minimized,
+        )
+        .checked(settings.start_minimized)
+        .build(app)?;
+
+        // Action items
+        let check_update_item = MenuItemBuilder::with_id(
+            "check_update",
+            &tr.settings_check_update,
+        )
+        .build(app)?;
+
+        let logout_item =
+            MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
+
+        let quit_item =
+            MenuItemBuilder::with_id("tray_quit", &tr.tray_quit).build(app)?;
+
+        // --- Separators ---
+        let sep1 = PredefinedMenuItem::separator(app)?;
+        let sep2 = PredefinedMenuItem::separator(app)?;
+        let sep3 = PredefinedMenuItem::separator(app)?;
+        let sep4 = PredefinedMenuItem::separator(app)?;
+
+        // --- Assemble tray menu ---
         let tray_menu = MenuBuilder::new(app)
-            .items(&[&show_item, &settings_item, &separator, &quit_item])
+            .item(&show_item)
+            .item(&sep1)
+            .item(&stay_logged_in_item)
+            .item(&notifications_item)
+            .item(&notification_sound_item)
+            .item(&sep2)
+            .item(&zoom_submenu)
+            .item(&sep3)
+            .item(&autostart_item)
+            .item(&start_minimized_item)
+            .item(&sep4)
+            .item(&check_update_item)
+            .item(&logout_item)
+            .item(&quit_item)
             .build()?;
 
+        // --- Clone items for the menu-event closure ---
         let tray_click_handle = app.handle().clone();
         let tray_menu_handle = app.handle().clone();
+
+        let stay_logged_in_c = stay_logged_in_item.clone();
+        let notifications_c = notifications_item.clone();
+        let notification_sound_c = notification_sound_item.clone();
+        let autostart_c = autostart_item.clone();
+        let start_minimized_c = start_minimized_item.clone();
+        let zoom_checks_c = zoom_checks.clone();
+
+        // Translated strings for update-check notifications.
+        let tr_update_available = tr.settings_update_available.clone();
+        let tr_no_update = tr.settings_no_update.clone();
+        let tr_update_error = tr.settings_update_error.clone();
+        let tr_update_ready = tr.settings_update_ready.clone();
 
         match tauri::tray::TrayIconBuilder::with_id("messengerx-tray")
             .icon(icon.clone())
@@ -483,21 +545,213 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })
-            .on_menu_event(move |_tray, event| match event.id().as_ref() {
-                "tray_show" => {
-                    if let Some(window) = tray_menu_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
+            .on_menu_event(move |_tray, event| {
+                let handle = &tray_menu_handle;
+                let id = event.id().as_ref();
+
+                match id {
+                    // ---- Show window ----
+                    "tray_show" => {
+                        if let Some(window) = handle.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
                     }
+
+                    // ---- Toggle: stay logged in ----
+                    "stay_logged_in" => {
+                        if let Ok(checked) = stay_logged_in_c.is_checked() {
+                            let mut s =
+                                services::auth::load_settings(handle).unwrap_or_default();
+                            s.stay_logged_in = checked;
+                            let _ = services::auth::save_settings(handle, &s);
+                        }
+                    }
+
+                    // ---- Toggle: notifications enabled ----
+                    "notifications_enabled" => {
+                        if let Ok(checked) = notifications_c.is_checked() {
+                            let mut s =
+                                services::auth::load_settings(handle).unwrap_or_default();
+                            s.notifications_enabled = checked;
+                            let _ = services::auth::save_settings(handle, &s);
+                        }
+                    }
+
+                    // ---- Toggle: notification sound ----
+                    "notification_sound" => {
+                        if let Ok(checked) = notification_sound_c.is_checked() {
+                            let mut s =
+                                services::auth::load_settings(handle).unwrap_or_default();
+                            s.notification_sound = checked;
+                            let _ = services::auth::save_settings(handle, &s);
+                        }
+                    }
+
+                    // ---- Toggle: autostart ----
+                    "autostart" => {
+                        if let Ok(checked) = autostart_c.is_checked() {
+                            use tauri_plugin_autostart::ManagerExt;
+                            let autolaunch = handle.autolaunch();
+                            if checked {
+                                let _ = autolaunch.enable();
+                            } else {
+                                let _ = autolaunch.disable();
+                            }
+                            let mut s =
+                                services::auth::load_settings(handle).unwrap_or_default();
+                            s.autostart = checked;
+                            let _ = services::auth::save_settings(handle, &s);
+                        }
+                    }
+
+                    // ---- Toggle: start minimized ----
+                    "start_minimized" => {
+                        if let Ok(checked) = start_minimized_c.is_checked() {
+                            let mut s =
+                                services::auth::load_settings(handle).unwrap_or_default();
+                            s.start_minimized = checked;
+                            let _ = services::auth::save_settings(handle, &s);
+                        }
+                    }
+
+                    // ---- Zoom (radio-like behaviour) ----
+                    _ if id.starts_with("zoom_") => {
+                        if let Ok(pct) = id[5..].parse::<u32>() {
+                            let level = pct as f64 / 100.0;
+                            // Enforce radio: uncheck all, check selected.
+                            for zitem in &zoom_checks_c {
+                                let _ = zitem.set_checked(zitem.id().as_ref() == id);
+                            }
+                            // Apply native zoom.
+                            if let Some(wv) = handle.get_webview_window("main") {
+                                let _ = wv.set_zoom(level);
+                            }
+                            // Persist.
+                            let mut s =
+                                services::auth::load_settings(handle).unwrap_or_default();
+                            s.zoom_level = level;
+                            let _ = services::auth::save_settings(handle, &s);
+                        }
+                    }
+
+                    // ---- Check for updates ----
+                    "check_update" => {
+                        let h = handle.clone();
+                        let tr_avail = tr_update_available.clone();
+                        let tr_none = tr_no_update.clone();
+                        let tr_err = tr_update_error.clone();
+                        let tr_ready = tr_update_ready.clone();
+                        tauri::async_runtime::spawn(async move {
+                            use tauri_plugin_updater::UpdaterExt;
+                            match h.updater() {
+                                Ok(updater) => match updater.check().await {
+                                    Ok(Some(update)) => {
+                                        let ver = update.version.clone();
+                                        let msg = tr_avail.replace("{}", &ver);
+                                        let _ = services::notification::show_notification(
+                                            &h, "Messenger X", &msg, "update", false,
+                                        );
+                                        match update
+                                            .download_and_install(|_, _| {}, || {})
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                let _ =
+                                                    services::notification::show_notification(
+                                                        &h,
+                                                        "Messenger X",
+                                                        &tr_ready,
+                                                        "update",
+                                                        false,
+                                                    );
+                                                h.restart();
+                                            }
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[MessengerX] Update install failed: {e}"
+                                                );
+                                                let _ =
+                                                    services::notification::show_notification(
+                                                        &h,
+                                                        "Messenger X",
+                                                        &tr_err,
+                                                        "update",
+                                                        false,
+                                                    );
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        let _ = services::notification::show_notification(
+                                            &h, "Messenger X", &tr_none, "update", false,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[MessengerX] Update check failed: {e}"
+                                        );
+                                        let _ = services::notification::show_notification(
+                                            &h, "Messenger X", &tr_err, "update", false,
+                                        );
+                                    }
+                                },
+                                Err(e) => {
+                                    log::warn!("[MessengerX] Updater init failed: {e}");
+                                    let _ = services::notification::show_notification(
+                                        &h, "Messenger X", &tr_err, "update", false,
+                                    );
+                                }
+                            }
+                        });
+                    }
+
+                    // ---- Log out & clear data ----
+                    "logout" => {
+                        let _ = services::cache::clear_snapshots(handle);
+                        let defaults = commands::AppSettings::default();
+                        let _ = services::auth::save_settings(handle, &defaults);
+
+                        // Reset all checkbox states to defaults.
+                        let _ = stay_logged_in_c.set_checked(defaults.stay_logged_in);
+                        let _ = notifications_c.set_checked(defaults.notifications_enabled);
+                        let _ = notification_sound_c.set_checked(defaults.notification_sound);
+                        let _ = start_minimized_c.set_checked(defaults.start_minimized);
+
+                        // Reset zoom to 100 %.
+                        for zitem in &zoom_checks_c {
+                            let _ =
+                                zitem.set_checked(zitem.id().as_ref() == "zoom_100");
+                        }
+                        if let Some(wv) = handle.get_webview_window("main") {
+                            let _ = wv.set_zoom(1.0);
+                        }
+
+                        // Disable autostart.
+                        {
+                            use tauri_plugin_autostart::ManagerExt;
+                            let _ = handle.autolaunch().disable();
+                        }
+                        let _ = autostart_c.set_checked(false);
+
+                        // Navigate to messenger.com to clear session/cookies.
+                        if let Some(wv) = handle.get_webview_window("main") {
+                            let _ = wv.eval(
+                                "window.location.href = 'https://www.messenger.com';",
+                            );
+                            let _ = wv.show();
+                            let _ = wv.set_focus();
+                        }
+                    }
+
+                    // ---- Quit ----
+                    "tray_quit" => {
+                        handle.exit(0);
+                    }
+
+                    _ => {}
                 }
-                "tray_settings" => {
-                    open_settings_window(&tray_menu_handle);
-                }
-                "tray_quit" => {
-                    tray_menu_handle.exit(0);
-                }
-                _ => {}
             })
             .build(app)
         {
@@ -507,20 +761,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ------------------------------------------------------------------
-    // 6b. macOS application menu bar (Settings via Cmd+,, Edit menu
-    //     for clipboard shortcuts, Quit via Cmd+Q).
+    // 6b. macOS application menu bar (Edit menu for clipboard shortcuts,
+    //     Quit via Cmd+Q).  Settings are now in the tray context menu.
     // ------------------------------------------------------------------
     #[cfg(target_os = "macos")]
     {
-        use tauri::menu::SubmenuBuilder;
-
         let app_submenu = SubmenuBuilder::new(app, "Messenger X")
-            .item(
-                &MenuItemBuilder::with_id("menu_settings", &tr.tray_settings)
-                    .accelerator("CmdOrCtrl+,")
-                    .build(app)?,
-            )
-            .separator()
             .quit()
             .build()?;
 
@@ -539,13 +785,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             .build()?;
 
         app.set_menu(app_menu)?;
-
-        let menu_handle = app.handle().clone();
-        app.on_menu_event(move |_app, event| {
-            if event.id().as_ref() == "menu_settings" {
-                open_settings_window(&menu_handle);
-            }
-        });
     }
 
     // ------------------------------------------------------------------
