@@ -233,6 +233,16 @@ pub fn get_translations() -> Result<std::collections::HashMap<String, String>, S
     Ok(map)
 }
 
+/// Open the settings window, or focus it if already open.
+///
+/// Called from the injected keyboard shortcut (Cmd+, / Ctrl+,) or from the
+/// tray context menu.
+#[tauri::command]
+pub fn open_settings(app: AppHandle) -> Result<(), String> {
+    crate::open_settings_window(&app);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,6 +7,7 @@
 mod commands;
 mod services;
 
+use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 // ---------------------------------------------------------------------------
@@ -165,6 +166,59 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 })();
 "#;
 
+/// Injects a keyboard shortcut listener that opens the Settings window
+/// when the user presses Cmd+, (macOS) or Ctrl+, (Windows/Linux).
+///
+/// This ensures the shortcut works even when the webview has focus.
+const SETTINGS_SHORTCUT_SCRIPT: &str = r#"
+(function() {
+    document.addEventListener('keydown', function(e) {
+        if ((e.metaKey || e.ctrlKey) && e.key === ',') {
+            e.preventDefault();
+            try {
+                window.__TAURI__.core.invoke('open_settings');
+            } catch(err) { console.error('[MessengerX] Failed to open settings:', err); }
+        }
+    });
+})();
+"#;
+
+// ---------------------------------------------------------------------------
+// Settings window helper
+// ---------------------------------------------------------------------------
+
+/// Opens the settings window, or focuses it if it already exists.
+///
+/// Used by the tray context menu, the macOS app menu bar, and the
+/// `open_settings` IPC command.
+pub(crate) fn open_settings_window(app_handle: &tauri::AppHandle) {
+    // If the settings window already exists, just focus it.
+    if let Some(window) = app_handle.get_webview_window("settings") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+
+    // Load translations for the window title.
+    let locale = services::locale::detect_locale();
+    let tr = services::locale::get_translations(&locale);
+
+    match WebviewWindowBuilder::new(
+        app_handle,
+        "settings",
+        WebviewUrl::App("settings/index.html".into()),
+    )
+    .title(&tr.settings_title)
+    .inner_size(520.0, 640.0)
+    .min_inner_size(400.0, 400.0)
+    .resizable(true)
+    .build()
+    {
+        Ok(_) => {}
+        Err(e) => log::warn!("[MessengerX] Failed to open settings window: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Application entry point
 // ---------------------------------------------------------------------------
@@ -197,6 +251,7 @@ pub fn run() {
             commands::set_zoom,
             commands::get_zoom,
             commands::get_translations,
+            commands::open_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -281,6 +336,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(OFFLINE_DIALOG_HIDER_SCRIPT)
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
+        // Keyboard shortcut: Cmd+, / Ctrl+, opens Settings.
+        .initialization_script(SETTINGS_SHORTCUT_SCRIPT)
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -381,27 +438,100 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ------------------------------------------------------------------
-    // 6. System tray icon.
+    // 6. System tray icon with context menu.
     // ------------------------------------------------------------------
     if let Some(icon) = app.default_window_icon() {
-        let tray_app_handle = app.handle().clone();
+        // Build tray context menu items (localised).
+        let show_item = MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
+        let settings_item =
+            MenuItemBuilder::with_id("tray_settings", &tr.tray_settings).build(app)?;
+        let separator = PredefinedMenuItem::separator(app)?;
+        let quit_item = MenuItemBuilder::with_id("tray_quit", &tr.tray_quit).build(app)?;
+
+        let tray_menu = MenuBuilder::new(app)
+            .items(&[&show_item, &settings_item, &separator, &quit_item])
+            .build()?;
+
+        let tray_click_handle = app.handle().clone();
+        let tray_menu_handle = app.handle().clone();
+
         match tauri::tray::TrayIconBuilder::with_id("messengerx-tray")
             .icon(icon.clone())
             .tooltip(&tr.tray_tooltip)
+            .menu(&tray_menu)
+            .show_menu_on_left_click(false)
             .on_tray_icon_event(move |_tray, event| {
                 if let tauri::tray::TrayIconEvent::Click { .. } = event {
-                    if let Some(window) = tray_app_handle.get_webview_window("main") {
+                    if let Some(window) = tray_click_handle.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.unminimize();
                         let _ = window.set_focus();
                     }
                 }
             })
+            .on_menu_event(move |_tray, event| match event.id().as_ref() {
+                "tray_show" => {
+                    if let Some(window) = tray_menu_handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+                "tray_settings" => {
+                    open_settings_window(&tray_menu_handle);
+                }
+                "tray_quit" => {
+                    tray_menu_handle.exit(0);
+                }
+                _ => {}
+            })
             .build(app)
         {
             Ok(_tray) => {}
             Err(e) => log::warn!("[MessengerX] Failed to create tray icon: {e}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 6b. macOS application menu bar (Settings via Cmd+,, Edit menu
+    //     for clipboard shortcuts, Quit via Cmd+Q).
+    // ------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::menu::SubmenuBuilder;
+
+        let app_submenu = SubmenuBuilder::new(app, "Messenger X")
+            .item(
+                &MenuItemBuilder::with_id("menu_settings", &tr.tray_settings)
+                    .accelerator("CmdOrCtrl+,")
+                    .build(app)?,
+            )
+            .separator()
+            .quit()
+            .build()?;
+
+        let edit_submenu = SubmenuBuilder::new(app, "Edit")
+            .undo()
+            .redo()
+            .separator()
+            .cut()
+            .copy()
+            .paste()
+            .select_all()
+            .build()?;
+
+        let app_menu = MenuBuilder::new(app)
+            .items(&[&app_submenu, &edit_submenu])
+            .build()?;
+
+        app.set_menu(app_menu)?;
+
+        let menu_handle = app.handle().clone();
+        app.on_menu_event(move |_app, event| {
+            if event.id().as_ref() == "menu_settings" {
+                open_settings_window(&menu_handle);
+            }
+        });
     }
 
     // ------------------------------------------------------------------

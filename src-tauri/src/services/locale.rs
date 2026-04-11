@@ -85,6 +85,14 @@ pub struct Translations {
     pub settings_no_update: String,
     pub settings_update_error: String,
     pub settings_install_restart: String,
+
+    // Tray context menu
+    /// "Show Window" tray menu item label.
+    pub tray_show: String,
+    /// "Settings" tray menu item label.
+    pub tray_settings: String,
+    /// "Quit" tray menu item label.
+    pub tray_quit: String,
 }
 
 /// Returns the translation strings for the given locale code.
@@ -127,6 +135,9 @@ fn english() -> Translations {
         settings_no_update: "You're up to date!".to_string(),
         settings_update_error: "Update check failed".to_string(),
         settings_install_restart: "Install & Restart".to_string(),
+        tray_show: "Show Window".to_string(),
+        tray_settings: "Settings".to_string(),
+        tray_quit: "Quit".to_string(),
     }
 }
 
@@ -165,6 +176,9 @@ fn czech() -> Translations {
         settings_no_update: "M\u{00e1}te nejnov\u{011b}j\u{0161}\u{00ed} verzi!".to_string(),
         settings_update_error: "Kontrola aktualizac\u{00ed} selhala".to_string(),
         settings_install_restart: "Nainstalovat a restartovat".to_string(),
+        tray_show: "Zobrazit okno".to_string(),
+        tray_settings: "Nastaven\u{00ed}".to_string(),
+        tray_quit: "Ukon\u{010d}it".to_string(),
     }
 }
 
@@ -243,6 +257,9 @@ mod tests {
                 &t.settings_no_update,
                 &t.settings_update_error,
                 &t.settings_install_restart,
+                &t.tray_show,
+                &t.tray_settings,
+                &t.tray_quit,
             ];
             for (i, field) in fields.iter().enumerate() {
                 assert!(
