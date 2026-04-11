@@ -111,11 +111,17 @@ Your login session persists across app restarts. Toggle "Stay logged in" in Sett
 #### 📴 Offline Mode
 Automatic HTML snapshots every 60 seconds. When you go offline, the app shows cached content with a non-intrusive banner — no blank screens.
 
+#### 🔄 Auto-Updates
+Built-in update checker in Settings. One-click download, install, and restart — no manual re-downloading needed.
+
+#### 🌍 Localization
+Automatically detects your system language. Currently supports English and Czech, with easy extensibility for more languages.
+
 #### 🔍 Zoom Controls
-Zoom from 50% to 300% with keyboard shortcuts (`Ctrl/Cmd` + `+`/`-`/`0`). Zoom level persists across sessions.
+Zoom from 50% to 300%. Zoom level persists across sessions.
 
 #### 🪟 Window Management
-Window size and position are saved and restored automatically. Default: 1200×800, minimum: 400×300.
+Window size and position are saved and restored. Default: 1200×800, minimum: 400×300.
 
 #### 🔗 Smart Link Handling
 Facebook/Messenger URLs stay in-app. External links open in your default system browser automatically.
@@ -136,21 +142,25 @@ Facebook/Messenger URLs stay in-app. External links open in your default system 
 │   loaded in WebView  │   ├─ Plugin: Notification │
 │                      │   ├─ Plugin: Opener        │
 │   JS Injection:      │   ├─ Plugin: Window-State  │
-│   ├─ Notifications   │   │                       │
-│   ├─ Unread Observer │   Services:               │
-│   ├─ Offline Banner  │   ├─ auth.rs    (session) │
-│   └─ Zoom Control    │   ├─ cache.rs   (offline) │
-│                      │   ├─ network.rs (monitor) │
-│        invoke()      │   └─ notification.rs      │
-│   ─────────────────► │                           │
-│                      │   10 IPC Commands          │
-│   ◄───────────────── │   ├─ send_notification    │
-│        eval()        │   ├─ update_unread_count  │
-│                      │   ├─ get/save_settings    │
-│                      │   ├─ save/load_snapshot   │
+│   ├─ Notifications   │   ├─ Plugin: Updater       │
+│   ├─ Unread Observer │   ├─ Plugin: Process        │
+│   ├─ Offline Banner  │   │                       │
+│   └─ Zoom Control    │   Services:               │
+│                      │   ├─ auth.rs    (session) │
+│   Settings Window:   │   ├─ cache.rs   (offline) │
+│   ├─ Preferences     │   ├─ locale.rs  (i18n)    │
+│   ├─ Updates         │   ├─ network.rs (monitor) │
+│   └─ Zoom            │   └─ notification.rs      │
+│                      │                           │
+│        invoke()      │   11 IPC Commands          │
+│   ─────────────────► │   ├─ send_notification    │
+│                      │   ├─ update_unread_count  │
+│   ◄───────────────── │   ├─ get/save_settings    │
+│        eval()        │   ├─ save/load_snapshot   │
 │                      │   ├─ clear_all_data       │
 │                      │   ├─ open_external        │
-│                      │   └─ set/get_zoom         │
+│                      │   ├─ set/get_zoom         │
+│                      │   └─ get_translations     │
 ├──────────────────────┴──────────────────────────┤
 │             System WebView                       │
 │   macOS: WebKit · Windows: WebView2              │
@@ -248,10 +258,11 @@ fb-messanger-crossplatform/
 │   └── src/
 │       ├── main.rs               #   Entry point
 │       ├── lib.rs                #   App setup, JS injection, navigation
-│       ├── commands.rs           #   10 IPC command handlers
+│       ├── commands.rs           #   11 IPC command handlers
 │       └── services/
 │           ├── auth.rs           #   Session & settings persistence
 │           ├── cache.rs          #   HTML snapshot management
+│           ├── locale.rs         #   i18n (en, cs)
 │           ├── network.rs        #   Network monitoring
 │           └── notification.rs   #   Native notification dispatch
 └── .github/workflows/
@@ -268,7 +279,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-This triggers builds for **all 7 targets** in parallel and creates a **draft GitHub Release** with all installers attached. Review the draft and publish when ready.
+This triggers builds for **all 7 targets** in parallel, signs update artifacts, and creates a **draft GitHub Release** with all installers + updater manifest attached. Review the draft and publish when ready.
 
 ## 🛡️ Security & Privacy
 
@@ -281,9 +292,12 @@ This triggers builds for **all 7 targets** in parallel and creates a **draft Git
 ## 🗺️ Roadmap
 
 - [x] **Phase 1** — Core features (WebView, notifications, badges, offline, zoom, settings)
+- [x] **i18n** — System language detection, English + Czech localization
+- [x] **Enhanced notifications** — Platform-specific sounds, silent mode, tray click handler
+- [x] **Auto-updates** — Built-in update checker & installer via Tauri updater plugin
+- [ ] Code signing — SignPath.io (Windows) + Apple notarization (macOS)
+- [ ] Package managers — winget, Homebrew, APT repository
 - [ ] Cross-platform testing (Windows, Linux Mint, Fedora, Arch)
-- [ ] Code signing (Apple notarization + Windows Authenticode)
-- [ ] Auto-update support (Tauri updater plugin)
 - [ ] Keyboard shortcuts customization
 - [ ] Multiple account support
 
