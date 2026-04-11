@@ -184,6 +184,116 @@ jobs:
           # When releaseId is empty, tauri-action builds without uploading.
           releaseId: ${{ needs.create-release.outputs.release-id || '' }}
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-          includeUpdaterJson: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          includeUpdaterJson: false
           args: ${{ matrix.args }}
           projectPath: '.'
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Phase 3: Generate a single, complete updater manifest (latest.json).
+  # This runs AFTER all build jobs finish, so it sees all platform artifacts.
+  # Eliminates the race condition where parallel jobs each tried to upload
+  # their own latest.json (causing "already_exists" failures in v0.2.4).
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  publish-updater:
+    needs: build-tauri
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate and upload latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          REPO="${GITHUB_REPOSITORY}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          WORK=$(mktemp -d)
+
+          # Download all updater signature files from the release
+          gh release download "$TAG" --repo "$REPO" --dir "$WORK" --pattern '*.sig'
+
+          # Build platforms JSON by mapping each .sig file to Tauri platform identifiers
+          PLATFORMS='{}'
+
+          add_entry() {
+            local key="$1" asset="$2" sig_path="$3"
+            local sig
+            sig=$(cat "$sig_path")
+            PLATFORMS=$(jq -n --argjson p "$PLATFORMS" \
+              --arg k "$key" --arg u "${BASE}/${asset}" --arg s "$sig" \
+              '$p + {($k): {signature: $s, url: $u}}')
+          }
+
+          for sig_path in "$WORK"/*.sig; do
+            [ -f "$sig_path" ] || continue
+            sig_name=$(basename "$sig_path")
+            asset="${sig_name%.sig}"
+
+            case "$asset" in
+              *.app.tar.gz)
+                if [[ "$asset" == *_aarch64.* ]]; then
+                  add_entry "darwin-aarch64"     "$asset" "$sig_path"
+                  add_entry "darwin-aarch64-app" "$asset" "$sig_path"
+                elif [[ "$asset" == *_x64.* ]]; then
+                  add_entry "darwin-x86_64"     "$asset" "$sig_path"
+                  add_entry "darwin-x86_64-app" "$asset" "$sig_path"
+                fi ;;
+              *.AppImage)
+                if [[ "$asset" == *_amd64.* ]]; then
+                  add_entry "linux-x86_64"          "$asset" "$sig_path"
+                  add_entry "linux-x86_64-appimage" "$asset" "$sig_path"
+                elif [[ "$asset" == *_aarch64.* ]]; then
+                  add_entry "linux-aarch64"          "$asset" "$sig_path"
+                  add_entry "linux-aarch64-appimage" "$asset" "$sig_path"
+                fi ;;
+              *.deb)
+                if [[ "$asset" == *_amd64.* ]]; then
+                  add_entry "linux-x86_64-deb" "$asset" "$sig_path"
+                elif [[ "$asset" == *_arm64.* ]]; then
+                  add_entry "linux-aarch64-deb" "$asset" "$sig_path"
+                fi ;;
+              *.rpm)
+                if [[ "$asset" == *x86_64.* ]]; then
+                  add_entry "linux-x86_64-rpm" "$asset" "$sig_path"
+                elif [[ "$asset" == *aarch64.* ]]; then
+                  add_entry "linux-aarch64-rpm" "$asset" "$sig_path"
+                fi ;;
+              *_en-US.msi)
+                if [[ "$asset" == *_x64_* ]]; then
+                  add_entry "windows-x86_64"     "$asset" "$sig_path"
+                  add_entry "windows-x86_64-msi" "$asset" "$sig_path"
+                elif [[ "$asset" == *_arm64_* ]]; then
+                  add_entry "windows-aarch64"     "$asset" "$sig_path"
+                  add_entry "windows-aarch64-msi" "$asset" "$sig_path"
+                fi ;;
+              *-setup.exe)
+                if [[ "$asset" == *_x64-* ]]; then
+                  add_entry "windows-x86_64-nsis" "$asset" "$sig_path"
+                elif [[ "$asset" == *_arm64-* ]]; then
+                  add_entry "windows-aarch64-nsis" "$asset" "$sig_path"
+                fi ;;
+            esac
+          done
+
+          # Generate the complete latest.json manifest
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
+          jq -n \
+            --arg v "$VERSION" \
+            --arg d "$PUB_DATE" \
+            --argjson p "$PLATFORMS" \
+            '{version: $v, notes: "", pub_date: $d, platforms: $p}' > latest.json
+
+          PLATFORM_COUNT=$(jq '.platforms | keys | length' latest.json)
+          echo "Generated latest.json with $PLATFORM_COUNT platform entries:"
+          jq -r '.platforms | keys[]' latest.json
+
+          # Delete existing latest.json if a build job uploaded one, then upload ours
+          gh release delete-asset "$TAG" latest.json --repo "$REPO" --yes 2>/dev/null || true
+          gh release upload "$TAG" latest.json --repo "$REPO"
+
+          echo "✅ Published complete updater manifest"
+          rm -rf "$WORK"
