@@ -17,6 +17,8 @@
     "notification:allow-request-permission",
     "notification:allow-notify",
     "opener:default",
-    "window-state:default"
+    "window-state:default",
+    "updater:default",
+    "process:default"
   ]
 }

@@ -74,6 +74,17 @@ pub struct Translations {
     pub settings_about: String,
     /// About section description text.
     pub settings_about_description: String,
+
+    // Update section
+    pub settings_updates: String,
+    pub settings_check_update: String,
+    pub settings_checking: String,
+    pub settings_update_available: String,
+    pub settings_update_downloading: String,
+    pub settings_update_ready: String,
+    pub settings_no_update: String,
+    pub settings_update_error: String,
+    pub settings_install_restart: String,
 }
 
 /// Returns the translation strings for the given locale code.
@@ -107,6 +118,15 @@ fn english() -> Translations {
         settings_logout_confirm: "Are you sure you want to log out and clear all data?".to_string(),
         settings_about: "About".to_string(),
         settings_about_description: "Cross-platform Messenger client built with Tauri.".to_string(),
+        settings_updates: "Updates".to_string(),
+        settings_check_update: "Check for updates".to_string(),
+        settings_checking: "Checking…".to_string(),
+        settings_update_available: "Update available: v{}".to_string(),
+        settings_update_downloading: "Downloading update…".to_string(),
+        settings_update_ready: "Update ready — restart to apply".to_string(),
+        settings_no_update: "You're up to date!".to_string(),
+        settings_update_error: "Update check failed".to_string(),
+        settings_install_restart: "Install & Restart".to_string(),
     }
 }
 
@@ -136,5 +156,14 @@ fn czech() -> Translations {
         settings_about: "O aplikaci".to_string(),
         settings_about_description:
             "Multiplatformn\u{00ed} Messenger klient postaven\u{00fd} na Tauri.".to_string(),
+        settings_updates: "Aktualizace".to_string(),
+        settings_check_update: "Zkontrolovat aktualizace".to_string(),
+        settings_checking: "Kontroluji\u{2026}".to_string(),
+        settings_update_available: "Dostupn\u{00e1} aktualizace: v{}".to_string(),
+        settings_update_downloading: "Stahov\u{00e1}n\u{00ed} aktualizace\u{2026}".to_string(),
+        settings_update_ready: "Aktualizace p\u{0159}ipravena \u{2014} restartujte pro aplikaci".to_string(),
+        settings_no_update: "M\u{00e1}te nejnov\u{011b}j\u{0161}\u{00ed} verzi!".to_string(),
+        settings_update_error: "Kontrola aktualizac\u{00ed} selhala".to_string(),
+        settings_install_restart: "Nainstalovat a restartovat".to_string(),
     }
 }

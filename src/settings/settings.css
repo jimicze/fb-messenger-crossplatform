@@ -171,3 +171,57 @@ input:checked + .toggle-slider:before {
   font-weight: 500;
   color: #1c1e21;
 }
+
+/* Update section */
+.action-btn {
+  width: 100%;
+  padding: 10px;
+  background: #f0f2f5;
+  color: #1c1e21;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.action-btn:hover {
+  background: #e4e6e9;
+}
+
+.action-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.primary-btn {
+  background: #0084ff;
+  color: #fff;
+  border: none;
+  margin-top: 8px;
+}
+
+.primary-btn:hover {
+  background: #0073e6;
+}
+
+.update-status {
+  font-size: 13px;
+  color: #65676b;
+  margin-bottom: 8px;
+  min-height: 0;
+  transition: all 0.2s;
+}
+
+.update-status.success {
+  color: #31a24c;
+}
+
+.update-status.error {
+  color: #fa3e3e;
+}
+
+.update-status.info {
+  color: #0084ff;
+}

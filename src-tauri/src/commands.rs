@@ -212,5 +212,23 @@ pub fn get_translations() -> Result<std::collections::HashMap<String, String>, S
         "settings_about_description".to_string(),
         t.settings_about_description,
     );
+    map.insert("settings_updates".to_string(), t.settings_updates);
+    map.insert("settings_check_update".to_string(), t.settings_check_update);
+    map.insert("settings_checking".to_string(), t.settings_checking);
+    map.insert(
+        "settings_update_available".to_string(),
+        t.settings_update_available,
+    );
+    map.insert(
+        "settings_update_downloading".to_string(),
+        t.settings_update_downloading,
+    );
+    map.insert("settings_update_ready".to_string(), t.settings_update_ready);
+    map.insert("settings_no_update".to_string(), t.settings_no_update);
+    map.insert("settings_update_error".to_string(), t.settings_update_error);
+    map.insert(
+        "settings_install_restart".to_string(),
+        t.settings_install_restart,
+    );
     Ok(map)
 }

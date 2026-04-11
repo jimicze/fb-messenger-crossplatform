@@ -12,6 +12,7 @@
     }
   },
   "bundle": {
+    "createUpdaterArtifacts": true,
     "active": true,
     "targets": "all",
 
@@ -91,6 +92,14 @@
       "signCommand": null,
       "timestampUrl": null,
       "tsp": false
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3NDEyN0RFNjE1QUIzRjEKUldUeHMxcGgzaWRCUjR2OUVVcDQ0UTJuS2NuQ3Z3ellyZXVBUTNHd3hQbEhOMUZmMXpEeWhIc04K",
+      "endpoints": [
+        "https://github.com/jimicze/fb-messanger-crossplatform/releases/latest/download/latest.json"
+      ]
     }
   }
 }

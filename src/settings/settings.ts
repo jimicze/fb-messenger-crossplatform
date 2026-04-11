@@ -26,6 +26,7 @@ function applyTranslations(t: Record<string, string>): void {
       case 'Account': el.textContent = t.settings_account ?? 'Account'; break;
       case 'Display': el.textContent = t.settings_display ?? 'Display'; break;
       case 'Data':    el.textContent = t.settings_data    ?? 'Data';    break;
+      case 'Updates': el.textContent = t.settings_updates  ?? 'Updates'; break;
       case 'About':   el.textContent = t.settings_about   ?? 'About';   break;
     }
   });
@@ -55,6 +56,12 @@ function applyTranslations(t: Record<string, string>): void {
     hints[1].textContent =
       t.settings_about_description ??
       'Cross-platform Messenger client built with Tauri.';
+  }
+
+  // Update button
+  const checkUpdateBtnEl = document.getElementById('check-update-btn');
+  if (checkUpdateBtnEl) {
+    checkUpdateBtnEl.textContent = t.settings_check_update ?? 'Check for updates';
   }
 }
 
@@ -117,6 +124,78 @@ async function initSettings(): Promise<void> {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
         const currentWindow = getCurrentWindow();
         await currentWindow.close();
+      }
+    });
+
+    // --- Update section ---
+    const checkUpdateBtn = document.getElementById('check-update-btn') as HTMLButtonElement;
+    const installUpdateBtn = document.getElementById('install-update-btn') as HTMLButtonElement;
+    const updateStatus = document.getElementById('update-status') as HTMLDivElement;
+
+    let pendingUpdate: any = null;
+
+    checkUpdateBtn.addEventListener('click', async () => {
+      checkUpdateBtn.disabled = true;
+      updateStatus.className = 'update-status';
+      updateStatus.textContent = translations.settings_checking ?? 'Checking…';
+
+      try {
+        const { check } = await import('@tauri-apps/plugin-updater');
+        const update = await check();
+
+        if (update) {
+          pendingUpdate = update;
+          const versionText = (translations.settings_update_available ?? 'Update available: v{}')
+            .replace('{}', update.version);
+          updateStatus.textContent = versionText;
+          updateStatus.className = 'update-status info';
+          installUpdateBtn.style.display = 'block';
+          installUpdateBtn.textContent =
+            translations.settings_install_restart ?? 'Install & Restart';
+          checkUpdateBtn.textContent =
+            translations.settings_check_update ?? 'Check for updates';
+          checkUpdateBtn.disabled = false;
+        } else {
+          updateStatus.textContent =
+            translations.settings_no_update ?? "You're up to date!";
+          updateStatus.className = 'update-status success';
+          checkUpdateBtn.textContent =
+            translations.settings_check_update ?? 'Check for updates';
+          checkUpdateBtn.disabled = false;
+        }
+      } catch (e) {
+        console.error('[Settings] Update check failed:', e);
+        updateStatus.textContent =
+          translations.settings_update_error ?? 'Update check failed';
+        updateStatus.className = 'update-status error';
+        checkUpdateBtn.textContent =
+          translations.settings_check_update ?? 'Check for updates';
+        checkUpdateBtn.disabled = false;
+      }
+    });
+
+    installUpdateBtn.addEventListener('click', async () => {
+      if (!pendingUpdate) return;
+      installUpdateBtn.disabled = true;
+      checkUpdateBtn.disabled = true;
+      updateStatus.textContent =
+        translations.settings_update_downloading ?? 'Downloading update…';
+      updateStatus.className = 'update-status info';
+
+      try {
+        await pendingUpdate.downloadAndInstall();
+        updateStatus.textContent =
+          translations.settings_update_ready ?? 'Update ready — restart to apply';
+        updateStatus.className = 'update-status success';
+        const { relaunch } = await import('@tauri-apps/plugin-process');
+        await relaunch();
+      } catch (e) {
+        console.error('[Settings] Update install failed:', e);
+        updateStatus.textContent =
+          translations.settings_update_error ?? 'Update check failed';
+        updateStatus.className = 'update-status error';
+        installUpdateBtn.disabled = false;
+        checkUpdateBtn.disabled = false;
       }
     });
 
