@@ -18,3 +18,22 @@ pub fn is_likely_online() -> bool {
     )
     .is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_likely_online_does_not_panic() {
+        // This is a smoke test — verifies the function executes without panic.
+        // The actual return value depends on network connectivity.
+        let _result = is_likely_online();
+    }
+
+    #[test]
+    fn test_is_likely_online_returns_bool() {
+        let result: bool = is_likely_online();
+        // Just assert it's a valid bool (trivially true, but documents the API contract).
+        assert!(result || !result);
+    }
+}

@@ -232,3 +232,81 @@ pub fn get_translations() -> Result<std::collections::HashMap<String, String>, S
     );
     Ok(map)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_settings_default_values() {
+        let settings = AppSettings::default();
+        assert!(settings.stay_logged_in);
+        assert!((settings.zoom_level - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_app_settings_serialization_roundtrip() {
+        let settings = AppSettings {
+            stay_logged_in: false,
+            zoom_level: 1.5,
+        };
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let deserialized: AppSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.stay_logged_in, false);
+        assert!((deserialized.zoom_level - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_app_settings_deserialize_defaults_on_missing_fields() {
+        // If we load a JSON with only one field, serde should error (both fields required).
+        let json = r#"{"stay_logged_in": true}"#;
+        let result: Result<AppSettings, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Missing zoom_level should cause error");
+    }
+
+    #[test]
+    fn test_snapshot_data_serialization_roundtrip() {
+        let snapshot = SnapshotData {
+            html: "<html><body>Test</body></html>".to_string(),
+            url: "https://www.messenger.com".to_string(),
+            timestamp: "2026-04-11T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let deserialized: SnapshotData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.html, snapshot.html);
+        assert_eq!(deserialized.url, snapshot.url);
+        assert_eq!(deserialized.timestamp, snapshot.timestamp);
+    }
+
+    #[test]
+    fn test_snapshot_data_handles_html_special_chars() {
+        let snapshot = SnapshotData {
+            html: r#"<div class="test">Hello "world" & <script>alert('xss')</script></div>"#
+                .to_string(),
+            url: "https://www.messenger.com/t/123".to_string(),
+            timestamp: "2026-04-11T12:00:00+02:00".to_string(),
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let deserialized: SnapshotData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.html, snapshot.html);
+    }
+
+    #[test]
+    fn test_zoom_clamp_logic() {
+        // Verify the clamping constants are sensible
+        assert!(MIN_ZOOM > 0.0);
+        assert!(MIN_ZOOM < 1.0);
+        assert!(MAX_ZOOM > 1.0);
+        assert!(MAX_ZOOM <= 5.0);
+
+        // Test clamping behavior
+        let too_low = 0.1_f64.clamp(MIN_ZOOM, MAX_ZOOM);
+        assert!((too_low - MIN_ZOOM).abs() < f64::EPSILON);
+
+        let too_high = 10.0_f64.clamp(MIN_ZOOM, MAX_ZOOM);
+        assert!((too_high - MAX_ZOOM).abs() < f64::EPSILON);
+
+        let normal = 1.5_f64.clamp(MIN_ZOOM, MAX_ZOOM);
+        assert!((normal - 1.5).abs() < f64::EPSILON);
+    }
+}

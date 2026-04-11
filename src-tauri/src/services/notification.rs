@@ -63,3 +63,27 @@ fn default_sound() -> &'static str {
         "Default"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_sound_returns_non_empty() {
+        let sound = default_sound();
+        assert!(
+            !sound.is_empty(),
+            "default_sound() should return a non-empty string"
+        );
+    }
+
+    #[test]
+    fn test_default_sound_is_known_value() {
+        let sound = default_sound();
+        let known_sounds = ["default", "Default", "message-new-instant"];
+        assert!(
+            known_sounds.contains(&sound),
+            "default_sound() returned unexpected value: {sound}"
+        );
+    }
+}

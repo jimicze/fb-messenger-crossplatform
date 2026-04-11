@@ -167,3 +167,100 @@ fn czech() -> Translations {
         settings_install_restart: "Nainstalovat a restartovat".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_translations_english_returns_all_fields() {
+        let t = get_translations("en");
+        assert_eq!(t.tray_tooltip, "Messenger X");
+        assert_eq!(t.settings_title, "Settings");
+        assert_eq!(t.settings_updates, "Updates");
+        assert_eq!(t.settings_check_update, "Check for updates");
+        assert_eq!(t.settings_install_restart, "Install & Restart");
+        assert!(!t.offline_banner.is_empty());
+        assert!(!t.loading_text.is_empty());
+    }
+
+    #[test]
+    fn test_get_translations_czech_returns_all_fields() {
+        let t = get_translations("cs");
+        assert_ne!(t.settings_title, "Settings"); // Czech should differ
+        assert!(!t.tray_tooltip.is_empty());
+        assert!(!t.offline_banner.is_empty());
+        assert!(!t.settings_updates.is_empty());
+        assert!(!t.settings_check_update.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_locale_falls_back_to_english() {
+        let en = get_translations("en");
+        let unknown = get_translations("xx");
+        assert_eq!(en.settings_title, unknown.settings_title);
+        assert_eq!(en.offline_banner, unknown.offline_banner);
+        assert_eq!(en.settings_updates, unknown.settings_updates);
+    }
+
+    #[test]
+    fn test_detect_locale_returns_supported() {
+        let locale = detect_locale();
+        assert!(
+            SUPPORTED_LOCALES.contains(&locale.as_str()),
+            "detect_locale() returned unsupported locale: {locale}"
+        );
+    }
+
+    #[test]
+    fn test_all_translations_have_no_empty_strings() {
+        for lang in SUPPORTED_LOCALES {
+            let t = get_translations(lang);
+            let fields = [
+                &t.tray_tooltip,
+                &t.tray_tooltip_unread,
+                &t.loading_title,
+                &t.loading_text,
+                &t.loading_offline,
+                &t.offline_banner,
+                &t.settings_title,
+                &t.settings_account,
+                &t.settings_stay_logged_in,
+                &t.settings_display,
+                &t.settings_zoom_level,
+                &t.settings_data,
+                &t.settings_logout,
+                &t.settings_logout_hint,
+                &t.settings_logout_confirm,
+                &t.settings_about,
+                &t.settings_about_description,
+                &t.settings_updates,
+                &t.settings_check_update,
+                &t.settings_checking,
+                &t.settings_update_available,
+                &t.settings_update_downloading,
+                &t.settings_update_ready,
+                &t.settings_no_update,
+                &t.settings_update_error,
+                &t.settings_install_restart,
+            ];
+            for (i, field) in fields.iter().enumerate() {
+                assert!(
+                    !field.is_empty(),
+                    "Locale '{lang}': translation field index {i} is empty"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_update_available_template_has_placeholder() {
+        for lang in SUPPORTED_LOCALES {
+            let t = get_translations(lang);
+            assert!(
+                t.settings_update_available.contains("{}"),
+                "Locale '{lang}': settings_update_available missing {{}} placeholder"
+            );
+        }
+    }
+}
