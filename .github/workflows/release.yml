@@ -10,7 +10,11 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Matrix produces 7 artifacts:
+# Two-phase release:
+#   1. create-release  — creates a single GitHub Release (eliminates race)
+#   2. build-tauri     — 6 parallel matrix jobs upload artifacts to that release
+#
+# Matrix produces artifacts for:
 #   macOS      — arm64 (.dmg) + x86_64 (.dmg)
 #   Windows    — x64 (.exe/.msi) + arm64 (.exe/.msi)
 #   Linux x64  — .deb + .rpm + .AppImage
@@ -23,7 +27,55 @@ env:
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Phase 1: Create a single GitHub Release before any builds start.
+  # This eliminates the race condition where parallel matrix jobs each tried
+  # to create their own draft release (causing lost artifacts in v0.2.1).
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release-id: ${{ steps.create.outputs.id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Create GitHub Release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: 'Messenger X ${{ github.ref_name }}'
+          body: |
+            ## Downloads
+
+            | Platform | Architecture | Installer |
+            |----------|-------------|-----------|
+            | **Windows** | x64 | `.exe` (NSIS) or `.msi` |
+            | **Windows** | ARM64 | `.exe` (NSIS) or `.msi` |
+            | **macOS** | Apple Silicon | `.dmg` |
+            | **macOS** | Intel | `.dmg` |
+            | **Linux** | x64 | `.deb` / `.rpm` / `.AppImage` |
+            | **Linux** | ARM64 | `.deb` / `.rpm` / `.AppImage` |
+
+            ### Linux distro guide
+            - **Debian / Ubuntu / Linux Mint** → `.deb`
+            - **Fedora / RHEL / openSUSE** → `.rpm`
+            - **Arch Linux / any other** → `.AppImage`
+          draft: false
+          prerelease: false
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Phase 2: Build on all platforms and upload artifacts to the release.
+  # Each job receives the releaseId so no job tries to create its own release.
+  # For workflow_dispatch (no tag), jobs only build without uploading.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   build-tauri:
+    needs: create-release
+    if: always()
     permissions:
       contents: write
     strategy:
@@ -59,9 +111,6 @@ jobs:
             label: 'Linux-x64'
 
           # ── Linux arm64 ────────────────────────────────────────────────────
-          # Uses native GitHub ARM runner (ubuntu-22.04-arm).
-          # If unavailable on your plan, swap to self-hosted ARM runner or
-          # remove this entry — the x64 .AppImage covers most users.
           - platform: 'ubuntu-22.04-arm'
             args: ''
             rust-targets: ''
@@ -107,14 +156,13 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
-          # Separate caches per target to avoid collisions.
           key: ${{ matrix.label }}
 
       # ── Frontend ─────────────────────────────────────────────────────────
       - name: Install frontend dependencies
         run: npm ci
 
-      # ── Build & Release ──────────────────────────────────────────────────
+      # ── Build & Upload ───────────────────────────────────────────────────
       - name: Build Tauri app and upload release assets
         uses: tauri-apps/tauri-action@v0
         env:
@@ -132,26 +180,10 @@ jobs:
           # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Messenger X v__VERSION__'
-          releaseBody: |
-            ## Downloads
-
-            | Platform | Architecture | Installer |
-            |----------|-------------|-----------|
-            | **Windows** | x64 | `.exe` (NSIS) or `.msi` |
-            | **Windows** | ARM64 | `.exe` (NSIS) or `.msi` |
-            | **macOS** | Apple Silicon | `.dmg` |
-            | **macOS** | Intel | `.dmg` |
-            | **Linux** | x64 | `.deb` / `.rpm` / `.AppImage` |
-            | **Linux** | ARM64 | `.deb` / `.rpm` / `.AppImage` |
-
-            ### Linux distro guide
-            - **Debian / Ubuntu / Linux Mint** → `.deb`
-            - **Fedora / RHEL / openSUSE** → `.rpm`
-            - **Arch Linux / any other** → `.AppImage`
-          releaseDraft: true
-          prerelease: false
-          includeUpdaterJson: true
+          # Upload to the pre-created release (tag push) or build-only (workflow_dispatch).
+          # When releaseId is empty, tauri-action builds without uploading.
+          releaseId: ${{ needs.create-release.outputs.release-id || '' }}
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          includeUpdaterJson: ${{ startsWith(github.ref, 'refs/tags/v') }}
           args: ${{ matrix.args }}
           projectPath: '.'
