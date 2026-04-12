@@ -541,3 +541,98 @@ jobs:
 
           echo "Done: published complete updater manifest for ${TAG}"
           rm -rf "$WORK"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Phase 4: Update Homebrew tap (jimicze/homebrew-tap).
+  # Updates Casks/messenger-x.rb with the new version + SHA256 hashes.
+  # Requires: HOMEBREW_TAP_PAT secret (fine-grained PAT, write to homebrew-tap)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  update-homebrew:
+    needs: [create-release, publish-updater]
+    if: always() && needs.publish-updater.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Update Homebrew Cask
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HOMEBREW_TAP_PAT}" ]]; then
+            echo "HOMEBREW_TAP_PAT secret not set — skipping Homebrew tap update"
+            exit 0
+          fi
+
+          TAG="${{ needs.create-release.outputs.tag-name }}"
+          VERSION="${TAG#v}"
+
+          # Fetch SHA256 hashes from the GitHub release assets
+          ARM_SHA=$(gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" --json assets \
+            -q ".assets[] | select(.name == \"Messenger.X_${VERSION}_aarch64.dmg\") | .digest" \
+            | sed 's/^sha256://')
+          X64_SHA=$(gh release view "$TAG" \
+            --repo "$GITHUB_REPOSITORY" --json assets \
+            -q ".assets[] | select(.name == \"Messenger.X_${VERSION}_x64.dmg\") | .digest" \
+            | sed 's/^sha256://')
+
+          echo "ARM sha256: ${ARM_SHA}"
+          echo "x64 sha256: ${X64_SHA}"
+
+          # Clone tap, patch formula, push
+          git clone "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/jimicze/homebrew-tap.git"
+          cd homebrew-tap
+
+          sed -i "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/messenger-x.rb
+          sed -i "s/arm:   \"[^\"]*\"/arm:   \"${ARM_SHA}\"/"  Casks/messenger-x.rb
+          sed -i "s/intel: \"[^\"]*\"/intel: \"${X64_SHA}\"/"  Casks/messenger-x.rb
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/messenger-x.rb
+          git diff --cached --quiet && echo "No changes (version already up to date)" && exit 0
+          git commit -m "chore: bump messenger-x to ${VERSION}"
+          git push
+          echo "Homebrew tap updated to ${VERSION}"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Phase 5: Submit updated winget manifest to microsoft/winget-pkgs.
+  # Uses wingetcreate to auto-compute SHA256 and open a PR.
+  # Requires: WINGET_PAT secret (classic PAT with public_repo scope)
+  # Note: only works after the initial package is accepted into the registry.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  update-winget:
+    needs: [create-release, publish-updater]
+    if: always() && needs.publish-updater.result == 'success'
+    runs-on: windows-latest
+
+    steps:
+      - name: Submit winget manifest update
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        shell: pwsh
+        run: |
+          if (-not $env:WINGET_PAT) {
+            Write-Host "WINGET_PAT secret not set — skipping winget manifest update"
+            exit 0
+          }
+
+          $TAG     = "${{ needs.create-release.outputs.tag-name }}"
+          $VERSION = $TAG.TrimStart('v')
+          $BASE    = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$TAG"
+
+          # Download wingetcreate
+          Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" `
+            -OutFile wingetcreate.exe -UseBasicParsing
+
+          # wingetcreate update auto-downloads installers, computes SHA256, and opens a PR
+          .\wingetcreate.exe update jimicze.MessengerX `
+            --version $VERSION `
+            --urls "$BASE/Messenger.X_${VERSION}_x64-setup.exe" `
+                   "$BASE/Messenger.X_${VERSION}_arm64-setup.exe" `
+            --token $env:WINGET_PAT `
+            --submit
+
+          Write-Host "winget manifest submitted for ${VERSION}"

@@ -31,6 +31,19 @@
 
 ## 📥 Downloads
 
+### Package managers
+
+```sh
+# macOS — Homebrew
+brew tap jimicze/tap
+brew install --cask messenger-x
+
+# Windows — winget  (pending registry approval)
+winget install jimicze.MessengerX
+```
+
+### Direct installers
+
 Pick the right installer for your platform:
 
 <table>
@@ -292,7 +305,7 @@ This triggers builds for **all 7 targets** in parallel, signs update artifacts, 
 - [x] **Enhanced notifications** — Platform-specific sounds, silent mode, tray click handler
 - [x] **Auto-updates** — Built-in update checker & installer via Tauri updater plugin
 - [ ] Code signing — [SignPath Foundation](https://signpath.org) (Windows) + Apple notarization (macOS)
-- [ ] Package managers — winget, Homebrew, APT repository
+- [x] **Package managers** — Homebrew tap (`brew install --cask messenger-x`) + winget (`winget install jimicze.MessengerX`, pending approval)
 - [ ] Cross-platform testing (Windows, Linux Mint, Fedora, Arch)
 - [ ] Keyboard shortcuts customization
 - [ ] Multiple account support
