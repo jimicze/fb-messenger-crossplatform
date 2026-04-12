@@ -121,6 +121,11 @@ jobs:
       tag-name:   ${{ steps.resolve-tag.outputs.name }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history + all tags for git log
+
       - name: Resolve tag name
         id: resolve-tag
         run: |
@@ -130,25 +135,86 @@ jobs:
             echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Generate release notes
+        id: notes
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.resolve-tag.outputs.name }}"
+
+          # Ensure the tag itself is visible locally (needed for workflow_dispatch
+          # path where bump-version just pushed it moments ago).
+          git fetch --tags --quiet 2>/dev/null || true
+
+          # Find the tag immediately before the current one (semver-sorted).
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1 || true)
+          echo "Range: ${PREV_TAG:-<beginning>}..${TAG}"
+
+          # Collect commit subjects in the range (or all if first release).
+          if [[ -n "${PREV_TAG}" ]]; then
+            COMMITS=$(git log "${PREV_TAG}..${TAG}" --pretty=format:"%s")
+          else
+            COMMITS=$(git log "${TAG}" --pretty=format:"%s")
+          fi
+
+          FEATURES=""
+          FIXES=""
+          OTHER=""
+
+          while IFS= read -r msg; do
+            [[ -z "$msg" ]] && continue
+            # Skip CI-generated version bump commits.
+            [[ "$msg" == "chore: bump version to"* ]] && continue
+
+            if [[ "$msg" =~ ^feat(\([^)]*\))?!?:[[:space:]](.+)$ ]]; then
+              FEATURES+="- ${BASH_REMATCH[2]}"$'\n'
+            elif [[ "$msg" =~ ^fix(\([^)]*\))?!?:[[:space:]](.+)$ ]]; then
+              FIXES+="- ${BASH_REMATCH[2]}"$'\n'
+            else
+              OTHER+="- ${msg}"$'\n'
+            fi
+          done <<< "$COMMITS"
+
+          # Build the changelog section.
+          CHANGELOG=""
+          [[ -n "$FEATURES" ]] && CHANGELOG+="### ✨ What's new"$'\n'"${FEATURES}"$'\n'
+          [[ -n "$FIXES"    ]] && CHANGELOG+="### 🐛 Bug fixes"$'\n'"${FIXES}"$'\n'
+          # Only show "Other changes" when there are no feat/fix commits at all.
+          if [[ -z "$FEATURES" && -z "$FIXES" && -n "$OTHER" ]]; then
+            CHANGELOG+="### Changes"$'\n'"${OTHER}"$'\n'
+          fi
+
+          # Assemble the full release body: changelog (if any) + downloads table.
+          {
+            if [[ -n "$CHANGELOG" ]]; then
+              echo "$CHANGELOG"
+            fi
+            cat << 'DOWNLOADS'
+          ## 📥 Downloads
+
+          | Platform | Architecture | Installer |
+          |----------|-------------|-----------|
+          | **Windows** | x64 | `.exe` (NSIS) |
+          | **Windows** | ARM64 | `.exe` (NSIS) |
+          | **macOS** | Apple Silicon | `.dmg` |
+          | **macOS** | Intel | `.dmg` |
+          | **Linux** | x64 | `.AppImage` |
+          | **Linux** | ARM64 | `.AppImage` |
+
+          > Auto-update is supported — existing installs will be notified automatically.
+          DOWNLOADS
+          } > /tmp/release_body.md
+
+          echo "Generated release body:"
+          cat /tmp/release_body.md
+
       - name: Create GitHub Release
         id: create
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.resolve-tag.outputs.name }}
           name: 'Messenger X ${{ steps.resolve-tag.outputs.name }}'
-          body: |
-            ## Downloads
-
-            | Platform | Architecture | Installer |
-            |----------|-------------|-----------|
-            | **Windows** | x64 | `.exe` (NSIS) |
-            | **Windows** | ARM64 | `.exe` (NSIS) |
-            | **macOS** | Apple Silicon | `.dmg` |
-            | **macOS** | Intel | `.dmg` |
-            | **Linux** | x64 | `.AppImage` |
-            | **Linux** | ARM64 | `.AppImage` |
-
-            > Auto-update is supported — existing installs will be notified automatically.
+          body_path: /tmp/release_body.md
           draft: false
           prerelease: false
 
