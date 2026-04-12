@@ -352,37 +352,68 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # ── macOS: Import Apple Developer Certificate ─────────────────────────
-      # No-op when APPLE_CERTIFICATE secret is not set (ad-hoc signing used).
-      # Once Apple Developer Program is active and secrets are added, this
-      # step imports the .p12 certificate into a temporary keychain so that
-      # codesign and notarytool can use it during the Tauri build.
+      # ── macOS: Configure code signing + notarization environment ─────────
+      # Consolidates all Apple signing prep into one step so env vars are
+      # only set when the corresponding secrets are actually present.
       #
-      # Required GitHub secrets:
+      # - APPLE_SIGNING_IDENTITY is always exported (falls back to "-" for
+      #   ad-hoc signing when the secret is absent).
+      # - APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID are only written to
+      #   GITHUB_ENV when ALL THREE are non-empty — passing any of them as
+      #   an empty string causes Tauri's bundler to enter the notarization
+      #   path and then fail its own Team ID length validation.
+      # - The .p12 certificate is imported into a temporary keychain only
+      #   when APPLE_CERTIFICATE is present.
+      #
+      # Required GitHub secrets (all optional until Apple Developer Program
+      # is active):
       #   APPLE_CERTIFICATE          — base64-encoded Developer ID Application .p12
       #   APPLE_CERTIFICATE_PASSWORD — password for the .p12 file
-      - name: Import Apple Developer Certificate
+      #   APPLE_SIGNING_IDENTITY     — "Developer ID Application: ..."
+      #   APPLE_ID                   — Apple ID email for notarization
+      #   APPLE_PASSWORD             — app-specific password for notarization
+      #   APPLE_TEAM_ID              — 10-char team identifier
+      - name: Configure macOS signing environment
         if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [[ -z "$APPLE_CERTIFICATE" ]]; then
-            echo "APPLE_CERTIFICATE secret not set — using ad-hoc signing, app will not be notarized"
-            exit 0
+          # Always export signing identity — fall back to ad-hoc when secret absent
+          echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY:--}" >> "$GITHUB_ENV"
+
+          # Import developer certificate when secret is present
+          if [[ -n "$APPLE_CERTIFICATE" ]]; then
+            KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+            echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+            security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+            security default-keychain -s build.keychain
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+            security set-keychain-settings -t 3600 -u build.keychain
+            security import certificate.p12 -k build.keychain \
+              -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list \
+              -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+            rm -f certificate.p12
+            echo "Apple Developer Certificate imported into build.keychain"
+          else
+            echo "APPLE_CERTIFICATE not set — using ad-hoc signing (signingIdentity: -)"
           fi
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
-          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
-          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-          security import certificate.p12 -k build.keychain \
-            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          rm -f certificate.p12
-          echo "Apple Developer Certificate imported into build.keychain"
+
+          # Only export notarization vars when ALL THREE are present.
+          # An empty APPLE_TEAM_ID causes Tauri bundler validation to fail.
+          if [[ -n "$APPLE_ID" && -n "$APPLE_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
+            echo "APPLE_ID=$APPLE_ID"             >> "$GITHUB_ENV"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD" >> "$GITHUB_ENV"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"   >> "$GITHUB_ENV"
+            echo "Notarization credentials configured"
+          else
+            echo "Notarization secrets not set — app will not be notarized"
+          fi
 
       # ── Windows: Import Code Signing Certificate ──────────────────────────
       # No-op when WINDOWS_CERTIFICATE secret is not set (unsigned build).
@@ -434,20 +465,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # ── macOS code signing + notarization ────────────────────────────
-          # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD are intentionally
-          # NOT passed here — the "Import Apple Developer Certificate" step
-          # above already imported the cert into build.keychain.  Passing them
-          # to tauri-action (even as empty strings) triggers its own internal
-          # `security import` call, which fails when no cert is present.
-          #
-          # Safe when secrets are not set:
-          #   APPLE_SIGNING_IDENTITY falls back to "-" (ad-hoc) if secret is empty
-          #   APPLE_ID/PASSWORD/TEAM_ID empty = tauri-action skips notarization
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Apple signing / notarization vars are set by the "Configure macOS
+          # signing environment" step above via GITHUB_ENV, so they are
+          # available as process environment variables here without being
+          # explicitly listed.  Listing them here (even as empty strings) would
+          # override the GITHUB_ENV values and cause Tauri's notarization path
+          # to receive empty strings, which fails Team ID validation.
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           tagName:   ${{ needs.create-release.outputs.tag-name }}
