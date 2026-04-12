@@ -462,6 +462,24 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ------------------------------------------------------------------
+    // 4c. macOS close-button behaviour: hide the window instead of quitting.
+    //     On macOS, clicking the red traffic-light close button is expected
+    //     to hide the window (app stays in the Dock / app menu).  The user
+    //     quits explicitly via Messenger X → Quit (⌘Q).
+    //     Windows and Linux keep the default behaviour (close = quit).
+    // ------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    {
+        let close_webview = webview.clone();
+        webview.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = close_webview.hide();
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
     // 5. Offline fallback: inject cached content or show offline message.
     //    Also starts a reconnect timer that redirects to messenger.com
     //    once connectivity is restored.

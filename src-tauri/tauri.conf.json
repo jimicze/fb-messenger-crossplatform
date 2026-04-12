@@ -1,6 +1,6 @@
 {
   "productName": "Messenger X",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "identifier": "com.lasakondrej.messengerx",
   "build": {
     "frontendDist": "../src"
