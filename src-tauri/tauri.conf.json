@@ -65,7 +65,7 @@
           "y": 170
         }
       },
-      "entitlements": null,
+      "entitlements": "entitlements.plist",
       "signingIdentity": "-",
       "providerShortName": null,
       "files": {}
@@ -86,9 +86,9 @@
       },
       "wix": null,
       "certificateThumbprint": null,
-      "digestAlgorithm": null,
+      "digestAlgorithm": "sha256",
       "signCommand": null,
-      "timestampUrl": null,
+      "timestampUrl": "http://timestamp.comodoca.com",
       "tsp": false
     }
   },

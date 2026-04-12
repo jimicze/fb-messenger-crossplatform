@@ -352,23 +352,98 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # ── macOS: Import Apple Developer Certificate ─────────────────────────
+      # No-op when APPLE_CERTIFICATE secret is not set (ad-hoc signing used).
+      # Once Apple Developer Program is active and secrets are added, this
+      # step imports the .p12 certificate into a temporary keychain so that
+      # codesign and notarytool can use it during the Tauri build.
+      #
+      # Required GitHub secrets:
+      #   APPLE_CERTIFICATE          — base64-encoded Developer ID Application .p12
+      #   APPLE_CERTIFICATE_PASSWORD — password for the .p12 file
+      - name: Import Apple Developer Certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [[ -z "$APPLE_CERTIFICATE" ]]; then
+            echo "APPLE_CERTIFICATE secret not set — using ad-hoc signing, app will not be notarized"
+            exit 0
+          fi
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f certificate.p12
+          echo "Apple Developer Certificate imported into build.keychain"
+
+      # ── Windows: Import Code Signing Certificate ──────────────────────────
+      # No-op when WINDOWS_CERTIFICATE secret is not set (unsigned build).
+      # Once an Authenticode OV/EV certificate (.pfx) is obtained (e.g. via
+      # SignPath.io for OSS or a commercial CA), this step imports it and
+      # exports the thumbprint for use in the config-patching step below.
+      #
+      # Required GitHub secrets:
+      #   WINDOWS_CERTIFICATE          — base64-encoded .pfx certificate
+      #   WINDOWS_CERTIFICATE_PASSWORD — password for the .pfx file
+      - name: Import Windows Code Signing Certificate
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Host "WINDOWS_CERTIFICATE secret not set — Windows installer will be unsigned"
+            exit 0
+          }
+          $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $certPath  = Join-Path $env:RUNNER_TEMP "certificate.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+          $secPwd = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert   = Import-PfxCertificate -FilePath $certPath -CertStoreLocation Cert:\CurrentUser\My -Password $secPwd
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Remove-Item $certPath
+          Write-Host "Certificate imported: $($cert.Subject) [$($cert.Thumbprint)]"
+
+      # ── Windows: Inject certificate thumbprint into tauri.conf.json ───────
+      # Only runs when the previous step exported a thumbprint.
+      # Tauri's bundler reads certificateThumbprint from config to call signtool.
+      - name: Set Windows certificate thumbprint
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE_THUMBPRINT != ''
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            const tc = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            tc.bundle.windows.certificateThumbprint = process.env.WINDOWS_CERTIFICATE_THUMBPRINT;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(tc, null, 2) + '\n');
+            console.log('Windows certificate thumbprint set to:', process.env.WINDOWS_CERTIFICATE_THUMBPRINT);
+          "
+
       # ── Build & Upload ───────────────────────────────────────────────────
       - name: Build Tauri app and upload release assets
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # ── macOS code signing (uncomment when ready) ────────────────────
-          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # ── macOS notarization (uncomment when ready) ────────────────────
-          # APPLE_ID: ${{ secrets.APPLE_ID }}
-          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          # ── Windows code signing (uncomment when ready) ──────────────────
-          # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # ── macOS code signing + notarization ────────────────────────────
+          # Safe when secrets are not set:
+          #   APPLE_SIGNING_IDENTITY falls back to "-" (ad-hoc) if secret is empty
+          #   APPLE_ID/PASSWORD/TEAM_ID empty = tauri-action skips notarization
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           tagName:   ${{ needs.create-release.outputs.tag-name }}
