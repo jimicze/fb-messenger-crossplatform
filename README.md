@@ -287,7 +287,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-This triggers builds for **all 7 targets** in parallel, signs update artifacts, and creates a **draft GitHub Release** with all installers + updater manifest attached. Review the draft and publish when ready.
+This triggers builds for **6 parallel jobs** (macOS arm64 + x64, Windows x64 + arm64, Linux x64 + arm64), signs update artifacts, publishes `latest.json` for auto-updates, bumps the Homebrew tap, and submits a winget PR — all automatically.
 
 ## 🛡️ Security & Privacy
 

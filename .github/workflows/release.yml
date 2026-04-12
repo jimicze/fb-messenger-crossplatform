@@ -435,11 +435,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           # ── macOS code signing + notarization ────────────────────────────
+          # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD are intentionally
+          # NOT passed here — the "Import Apple Developer Certificate" step
+          # above already imported the cert into build.keychain.  Passing them
+          # to tauri-action (even as empty strings) triggers its own internal
+          # `security import` call, which fails when no cert is present.
+          #
           # Safe when secrets are not set:
           #   APPLE_SIGNING_IDENTITY falls back to "-" (ad-hoc) if secret is empty
           #   APPLE_ID/PASSWORD/TEAM_ID empty = tauri-action skips notarization
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY || '-' }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
