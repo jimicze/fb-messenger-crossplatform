@@ -650,6 +650,19 @@ jobs:
           $VERSION = $TAG.TrimStart('v')
           $BASE    = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$TAG"
 
+          # Check whether the package already exists in the winget-pkgs registry.
+          # Until the initial PR (submitted manually for v1.3.1) is merged, the
+          # package folder does not exist and wingetcreate update would exit 1.
+          $pkgApi = "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/j/jimicze/MessengerX"
+          try {
+            $null = Invoke-RestMethod -Uri $pkgApi `
+              -Headers @{ Authorization = "Bearer $env:WINGET_PAT"; "User-Agent" = "github-actions" } `
+              -ErrorAction Stop
+          } catch {
+            Write-Host "Package jimicze.MessengerX not yet in winget registry (initial PR pending merge) — skipping update"
+            exit 0
+          }
+
           # Download wingetcreate
           Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" `
             -OutFile wingetcreate.exe -UseBasicParsing
