@@ -786,6 +786,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = services::notification::show_notification(
                                             &h, "Messenger X", &msg, "update", false,
                                         );
+                                        // macOS: auto-install blocked by Gatekeeper until
+                                        // the app is notarized (FEAT-003). Skip install
+                                        // to avoid a misleading "Update check failed" error.
+                                        #[cfg(not(target_os = "macos"))]
                                         match update
                                             .download_and_install(|_, _| {}, || {})
                                             .await
@@ -815,6 +819,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                     );
                                             }
                                         }
+                                        // Suppress unused-variable warning on macOS.
+                                        #[cfg(target_os = "macos")]
+                                        let _ = (tr_ready, tr_err);
                                     }
                                     Ok(None) => {
                                         let _ = services::notification::show_notification(
