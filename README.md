@@ -54,13 +54,13 @@ Pick the right installer for your platform:
   <tr>
     <td>🪟 <strong>Windows</strong></td>
     <td>x64</td>
-    <td><code>.exe</code> / <code>.msi</code></td>
+    <td><code>.exe</code> (NSIS installer)</td>
     <td rowspan="2"><a href="https://github.com/jimicze/fb-messanger-crossplatform/releases/latest"><strong>Latest Release →</strong></a></td>
   </tr>
   <tr>
     <td>🪟 <strong>Windows</strong></td>
     <td>ARM64</td>
-    <td><code>.exe</code> / <code>.msi</code></td>
+    <td><code>.exe</code> (NSIS installer)</td>
   </tr>
   <tr>
     <td>🐧 <strong>Linux</strong></td>
@@ -143,16 +143,15 @@ Facebook/Messenger URLs stay in-app. External links open in your default system 
 │                      │   ├─ Plugin: Opener        │
 │   JS Injection:      │   ├─ Plugin: Window-State  │
 │   ├─ Notifications   │   ├─ Plugin: Updater       │
-│   ├─ Unread Observer │   ├─ Plugin: Process        │
+│   ├─ Unread Observer │   ├─ Plugin: Autostart     │
 │   ├─ Offline Banner  │   │                       │
 │   └─ Zoom Control    │   Services:               │
 │                      │   ├─ auth.rs    (session) │
-│   Settings Window:   │   ├─ cache.rs   (offline) │
-│   ├─ Preferences     │   ├─ locale.rs  (i18n)    │
-│   ├─ Updates         │   ├─ network.rs (monitor) │
-│   └─ Zoom            │   └─ notification.rs      │
-│                      │                           │
-│        invoke()      │   11 IPC Commands          │
+│   All settings live  │   ├─ cache.rs   (offline) │
+│   in the native      │   ├─ locale.rs  (i18n)    │
+│   tray context menu  │   ├─ network.rs (monitor) │
+│                      │   └─ notification.rs      │
+│        invoke()      │   10 IPC Commands          │
 │   ─────────────────► │   ├─ send_notification    │
 │                      │   ├─ update_unread_count  │
 │   ◄───────────────── │   ├─ get/save_settings    │
@@ -160,7 +159,7 @@ Facebook/Messenger URLs stay in-app. External links open in your default system 
 │                      │   ├─ clear_all_data       │
 │                      │   ├─ open_external        │
 │                      │   ├─ set/get_zoom         │
-│                      │   └─ get_translations     │
+│                      │   └─ check/install_update │
 ├──────────────────────┴──────────────────────────┤
 │             System WebView                       │
 │   macOS: WebKit · Windows: WebView2              │
@@ -240,16 +239,12 @@ cargo test            # from src-tauri/
 fb-messanger-crossplatform/
 ├── src/                          # TypeScript frontend
 │   ├── index.html                #   Loading splash screen
-│   ├── scripts/                  #   JS injection stubs (actual JS in lib.rs)
-│   │   ├── main.ts
-│   │   ├── bridge.ts
-│   │   ├── notifications.ts
-│   │   ├── unread.ts
-│   │   └── offline.ts
-│   └── settings/                 #   Settings window
-│       ├── index.html
-│       ├── settings.ts
-│       └── settings.css
+│   └── scripts/                  #   JS injection stubs (actual JS in lib.rs)
+│       ├── main.ts
+│       ├── bridge.ts
+│       ├── notifications.ts
+│       ├── unread.ts
+│       └── offline.ts
 ├── src-tauri/                    # Rust backend
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
@@ -258,7 +253,7 @@ fb-messanger-crossplatform/
 │   └── src/
 │       ├── main.rs               #   Entry point
 │       ├── lib.rs                #   App setup, JS injection, navigation
-│       ├── commands.rs           #   11 IPC command handlers
+│       ├── commands.rs           #   10 IPC command handlers
 │       └── services/
 │           ├── auth.rs           #   Session & settings persistence
 │           ├── cache.rs          #   HTML snapshot management
@@ -288,6 +283,7 @@ This triggers builds for **all 7 targets** in parallel, signs update artifacts, 
 - **Local persistence only** — sessions, settings, and cached snapshots are stored in your OS app data directory
 - **Navigation allowlist** — only `messenger.com`, `facebook.com`, `fbcdn.net`, and `fbsbx.com` are loaded in-app; everything else opens in your system browser
 - **Hardened runtime** (macOS) enabled for Gatekeeper compatibility
+- **Windows code signing** — provided by [SignPath Foundation](https://signpath.org) (free code signing for open-source projects)
 
 ## 🗺️ Roadmap
 
@@ -295,7 +291,7 @@ This triggers builds for **all 7 targets** in parallel, signs update artifacts, 
 - [x] **i18n** — System language detection, English + Czech localization
 - [x] **Enhanced notifications** — Platform-specific sounds, silent mode, tray click handler
 - [x] **Auto-updates** — Built-in update checker & installer via Tauri updater plugin
-- [ ] Code signing — SignPath.io (Windows) + Apple notarization (macOS)
+- [ ] Code signing — [SignPath Foundation](https://signpath.org) (Windows) + Apple notarization (macOS)
 - [ ] Package managers — winget, Homebrew, APT repository
 - [ ] Cross-platform testing (Windows, Linux Mint, Fedora, Arch)
 - [ ] Keyboard shortcuts customization
