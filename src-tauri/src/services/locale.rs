@@ -87,6 +87,16 @@ pub struct Translations {
     pub settings_start_minimized: String,
     /// "View Logs" menu item label (opens log file for GitHub issue reporting).
     pub settings_view_logs: String,
+    /// "Auto-update" toggle label.
+    pub settings_auto_update: String,
+    /// Dialog title shown when an update is available.
+    pub settings_update_dialog_title: String,
+    /// Dialog body shown when an update is available; `{}` is replaced with the version string.
+    pub settings_update_dialog_body: String,
+    /// "Install now" button label in the update confirmation dialog.
+    pub settings_update_install_btn: String,
+    /// "Later" button label in the update confirmation dialog.
+    pub settings_update_later_btn: String,
 }
 
 /// Returns the translation strings for the given locale code.
@@ -120,6 +130,11 @@ fn english() -> Translations {
         settings_autostart: "Start at login".to_string(),
         settings_start_minimized: "Start minimized to tray".to_string(),
         settings_view_logs: "View Logs\u{2026}".to_string(),
+        settings_auto_update: "Auto-update".to_string(),
+        settings_update_dialog_title: "Update Available".to_string(),
+        settings_update_dialog_body: "Messenger X v{} is available. Install now?".to_string(),
+        settings_update_install_btn: "Install".to_string(),
+        settings_update_later_btn: "Later".to_string(),
     }
 }
 
@@ -146,6 +161,11 @@ fn czech() -> Translations {
         settings_autostart: "Spustit p\u{0159}i p\u{0159}ihl\u{00e1}\u{0161}en\u{00ed}".to_string(),
         settings_start_minimized: "Spustit minimalizovan\u{011b}".to_string(),
         settings_view_logs: "Zobrazit logy\u{2026}".to_string(),
+        settings_auto_update: "Automatick\u{00e9} aktualizace".to_string(),
+        settings_update_dialog_title: "Dostupn\u{00e1} aktualizace".to_string(),
+        settings_update_dialog_body: "Messenger X v{} je k dispozici. Nainstalovat nyn\u{00ed}?".to_string(),
+        settings_update_install_btn: "Nainstalovat".to_string(),
+        settings_update_later_btn: "Pozd\u{011b}ji".to_string(),
     }
 }
 
@@ -211,6 +231,11 @@ mod tests {
                 &t.settings_autostart,
                 &t.settings_start_minimized,
                 &t.settings_view_logs,
+                &t.settings_auto_update,
+                &t.settings_update_dialog_title,
+                &t.settings_update_dialog_body,
+                &t.settings_update_install_btn,
+                &t.settings_update_later_btn,
             ];
             for (i, field) in fields.iter().enumerate() {
                 assert!(
@@ -228,6 +253,10 @@ mod tests {
             assert!(
                 t.settings_update_available.contains("{}"),
                 "Locale '{lang}': settings_update_available missing {{}} placeholder"
+            );
+            assert!(
+                t.settings_update_dialog_body.contains("{}"),
+                "Locale '{lang}': settings_update_dialog_body missing {{}} placeholder"
             );
         }
     }

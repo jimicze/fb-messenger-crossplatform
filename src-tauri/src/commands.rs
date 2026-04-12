@@ -25,6 +25,10 @@ pub struct AppSettings {
     pub autostart: bool,
     /// Whether the app starts minimized to the system tray.
     pub start_minimized: bool,
+    /// Whether to automatically check for updates in the background (once per month).
+    pub auto_update: bool,
+    /// Unix timestamp (seconds) of the last update check; `None` if never checked.
+    pub last_update_check_secs: Option<u64>,
 }
 
 impl Default for AppSettings {
@@ -36,6 +40,8 @@ impl Default for AppSettings {
             notification_sound: true,
             autostart: false,
             start_minimized: false,
+            auto_update: true,
+            last_update_check_secs: None,
         }
     }
 }
@@ -271,6 +277,8 @@ mod tests {
             notification_sound: false,
             autostart: true,
             start_minimized: true,
+            auto_update: false,
+            last_update_check_secs: Some(1_000_000),
         };
         let json = serde_json::to_string(&settings).expect("serialize");
         let deserialized: AppSettings = serde_json::from_str(&json).expect("deserialize");

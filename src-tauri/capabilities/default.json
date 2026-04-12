@@ -19,6 +19,7 @@
     "opener:default",
     "window-state:default",
     "updater:default",
+    "dialog:default",
     "process:default",
     "autostart:default"
   ]

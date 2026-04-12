@@ -293,6 +293,26 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 "#;
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Persists the current Unix timestamp (seconds) as `last_update_check_secs`
+/// in the user's settings file.
+///
+/// Called after every update check (manual or automatic) so that the
+/// 30-day automatic-check window is correctly tracked.
+fn save_check_timestamp(handle: &tauri::AppHandle) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut s = services::auth::load_settings(handle).unwrap_or_default();
+    s.last_update_check_secs = Some(now);
+    let _ = services::auth::save_settings(handle, &s);
+}
+
+// ---------------------------------------------------------------------------
 // Application entry point
 // ---------------------------------------------------------------------------
 
@@ -316,6 +336,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -651,6 +672,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .checked(settings.start_minimized)
         .build(app)?;
 
+        let auto_update_item = CheckMenuItemBuilder::with_id(
+            "auto_update",
+            &tr.settings_auto_update,
+        )
+        .checked(settings.auto_update)
+        .build(app)?;
+
         // Action items
         let check_update_item = MenuItemBuilder::with_id(
             "check_update",
@@ -687,6 +715,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             .item(&sep3)
             .item(&autostart_item)
             .item(&start_minimized_item)
+            .item(&auto_update_item)
             .item(&sep4)
             .item(&check_update_item)
             .item(&view_logs_item)
@@ -705,6 +734,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let notification_sound_c = notification_sound_item.clone();
         let autostart_c = autostart_item.clone();
         let start_minimized_c = start_minimized_item.clone();
+        let auto_update_c = auto_update_item.clone();
         let zoom_checks_c = zoom_checks.clone();
 
         // Translated strings for update-check notifications.
@@ -712,6 +742,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let tr_no_update = tr.settings_no_update.clone();
         let tr_update_error = tr.settings_update_error.clone();
         let tr_update_ready = tr.settings_update_ready.clone();
+        // Translated strings for the update confirmation dialog.
+        let tr_update_dialog_title = tr.settings_update_dialog_title.clone();
+        let tr_update_dialog_body = tr.settings_update_dialog_body.clone();
+        let tr_update_install_btn = tr.settings_update_install_btn.clone();
+        let tr_update_later_btn = tr.settings_update_later_btn.clone();
 
         match tauri::tray::TrayIconBuilder::with_id("messengerx-tray")
             .icon(icon.clone())
@@ -804,6 +839,16 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // ---- Toggle: auto-update ----
+                    "auto_update" => {
+                        if let Ok(checked) = auto_update_c.is_checked() {
+                            let mut s =
+                                services::auth::load_settings(handle).unwrap_or_default();
+                            s.auto_update = checked;
+                            let _ = services::auth::save_settings(handle, &s);
+                        }
+                    }
+
                     // ---- Zoom (radio-like behaviour) ----
                     _ if id.starts_with("zoom_") => {
                         if let Ok(pct) = id[5..].parse::<u32>() {
@@ -831,47 +876,75 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         let tr_none = tr_no_update.clone();
                         let tr_err = tr_update_error.clone();
                         let tr_ready = tr_update_ready.clone();
+                        let tr_dlg_title = tr_update_dialog_title.clone();
+                        let tr_dlg_body = tr_update_dialog_body.clone();
+                        let tr_install = tr_update_install_btn.clone();
+                        let tr_later = tr_update_later_btn.clone();
                         tauri::async_runtime::spawn(async move {
                             use tauri_plugin_updater::UpdaterExt;
                             match h.updater() {
                                 Ok(updater) => match updater.check().await {
                                     Ok(Some(update)) => {
                                         let ver = update.version.clone();
-                                        let msg = tr_avail.replace("{}", &ver);
-                                        let _ = services::notification::show_notification(
-                                            &h, "Messenger X", &msg, "update", false,
-                                        );
-                                        match update
-                                            .download_and_install(|_, _| {}, || {})
-                                            .await
-                                        {
-                                            Ok(()) => {
-                                                let _ =
-                                                    services::notification::show_notification(
-                                                        &h,
-                                                        "Messenger X",
-                                                        &tr_ready,
-                                                        "update",
-                                                        false,
+                                        let body = tr_dlg_body.replace("{}", &ver);
+                                        save_check_timestamp(&h);
+                                        // Show confirmation dialog before installing.
+                                        use tauri_plugin_dialog::{
+                                            DialogExt, MessageDialogButtons,
+                                        };
+                                        let h2 = h.clone();
+                                        let tr_ready2 = tr_ready.clone();
+                                        let tr_err2 = tr_err.clone();
+                                        h.dialog()
+                                            .message(&body)
+                                            .title(&tr_dlg_title)
+                                            .buttons(MessageDialogButtons::OkCancelCustom(
+                                                tr_install,
+                                                tr_later,
+                                            ))
+                                            .show(move |confirmed| {
+                                                if confirmed {
+                                                    tauri::async_runtime::spawn(async move {
+                                                        match update
+                                                            .download_and_install(
+                                                                |_, _| {},
+                                                                || {},
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(()) => {
+                                                                let _ = services::notification::show_notification(
+                                                                    &h2,
+                                                                    "Messenger X",
+                                                                    &tr_ready2,
+                                                                    "update",
+                                                                    false,
+                                                                );
+                                                                h2.restart();
+                                                            }
+                                                            Err(e) => {
+                                                                log::warn!(
+                                                                    "[MessengerX] Update install failed: {e}"
+                                                                );
+                                                                let _ = services::notification::show_notification(
+                                                                    &h2,
+                                                                    "Messenger X",
+                                                                    &tr_err2,
+                                                                    "update",
+                                                                    false,
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                } else {
+                                                    log::info!(
+                                                        "[MessengerX] Update v{ver} deferred by user"
                                                     );
-                                                h.restart();
-                                            }
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "[MessengerX] Update install failed: {e}"
-                                                );
-                                                let _ =
-                                                    services::notification::show_notification(
-                                                        &h,
-                                                        "Messenger X",
-                                                        &tr_err,
-                                                        "update",
-                                                        false,
-                                                    );
-                                            }
-                                        }
+                                                }
+                                            });
                                     }
                                     Ok(None) => {
+                                        save_check_timestamp(&h);
                                         let _ = services::notification::show_notification(
                                             &h, "Messenger X", &tr_none, "update", false,
                                         );
@@ -926,6 +999,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = notifications_c.set_checked(defaults.notifications_enabled);
                         let _ = notification_sound_c.set_checked(defaults.notification_sound);
                         let _ = start_minimized_c.set_checked(defaults.start_minimized);
+                        let _ = auto_update_c.set_checked(defaults.auto_update);
 
                         // Reset zoom to 100 %.
                         for zitem in &zoom_checks_c {
@@ -1050,6 +1124,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .checked(settings.start_minimized)
         .build(app)?;
 
+        let auto_update_item = CheckMenuItemBuilder::with_id(
+            "auto_update",
+            &tr.settings_auto_update,
+        )
+        .checked(settings.auto_update)
+        .build(app)?;
+
         let check_update_item =
             MenuItemBuilder::with_id("check_update", &tr.settings_check_update).build(app)?;
 
@@ -1079,6 +1160,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             .item(&sep3)
             .item(&autostart_item)
             .item(&start_minimized_item)
+            .item(&auto_update_item)
             .item(&sep4)
             .item(&check_update_item)
             .item(&view_logs_item)
@@ -1111,12 +1193,17 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let notification_sound_c = notification_sound_item.clone();
         let autostart_c = autostart_item.clone();
         let start_minimized_c = start_minimized_item.clone();
+        let auto_update_c = auto_update_item.clone();
         let zoom_checks_c = zoom_checks.clone();
 
-        // Translated strings for update-check notifications.
-        let tr_update_available = tr.settings_update_available.clone();
+        // Translated strings for update-check notifications and dialog.
         let tr_no_update = tr.settings_no_update.clone();
         let tr_update_error = tr.settings_update_error.clone();
+        // Translated strings for the update confirmation dialog.
+        let tr_update_dialog_title = tr.settings_update_dialog_title.clone();
+        let tr_update_dialog_body = tr.settings_update_dialog_body.clone();
+        let tr_update_install_btn = tr.settings_update_install_btn.clone();
+        let tr_update_later_btn = tr.settings_update_later_btn.clone();
 
         app.on_menu_event(move |_app, event| {
             let id = event.id().as_ref();
@@ -1183,6 +1270,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // ---- Toggle: auto-update ----
+                "auto_update" => {
+                    if let Ok(checked) = auto_update_c.is_checked() {
+                        let mut s = services::auth::load_settings(&h).unwrap_or_default();
+                        s.auto_update = checked;
+                        let _ = services::auth::save_settings(&h, &s);
+                    }
+                }
+
                 // ---- Zoom (radio-like behaviour) ----
                 _ if id.starts_with("zoom_") => {
                     if let Ok(pct) = id[5..].parse::<u32>() {
@@ -1205,24 +1301,51 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // ---- Check for updates ----
                 "check_update" => {
                     let h2 = h.clone();
-                    let tr_avail = tr_update_available.clone();
                     let tr_none = tr_no_update.clone();
                     let tr_err = tr_update_error.clone();
+                    let tr_dlg_title = tr_update_dialog_title.clone();
+                    let tr_dlg_body = tr_update_dialog_body.clone();
+                    let tr_install = tr_update_install_btn.clone();
+                    let tr_later = tr_update_later_btn.clone();
                     tauri::async_runtime::spawn(async move {
                         use tauri_plugin_updater::UpdaterExt;
                         match h2.updater() {
                             Ok(updater) => match updater.check().await {
                                 Ok(Some(update)) => {
                                     let ver = update.version.clone();
-                                    let msg = tr_avail.replace("{}", &ver);
-                                    let _ = services::notification::show_notification(
-                                        &h2, "Messenger X", &msg, "update", false,
-                                    );
-                                    // Auto-install blocked by Gatekeeper until notarization
-                                    // is implemented (FEAT-003). Notification is sufficient.
-                                    let _ = update;
+                                    let body = tr_dlg_body.replace("{}", &ver);
+                                    save_check_timestamp(&h2);
+                                    // Show confirmation dialog.
+                                    // On macOS, auto-install is blocked by Gatekeeper until
+                                    // notarization is implemented (FEAT-003); the dialog
+                                    // informs the user and the install branch is a no-op.
+                                    use tauri_plugin_dialog::{
+                                        DialogExt, MessageDialogButtons,
+                                    };
+                                    h2.dialog()
+                                        .message(&body)
+                                        .title(&tr_dlg_title)
+                                        .buttons(MessageDialogButtons::OkCancelCustom(
+                                            tr_install,
+                                            tr_later,
+                                        ))
+                                        .show(move |confirmed| {
+                                            if confirmed {
+                                                // Gatekeeper blocks install without notarization.
+                                                log::info!(
+                                                    "[MessengerX] Update v{ver} \
+                                                     acknowledged (macOS — install \
+                                                     requires notarization, FEAT-003)"
+                                                );
+                                            } else {
+                                                log::info!(
+                                                    "[MessengerX] Update v{ver} deferred by user"
+                                                );
+                                            }
+                                        });
                                 }
                                 Ok(None) => {
+                                    save_check_timestamp(&h2);
                                     let _ = services::notification::show_notification(
                                         &h2, "Messenger X", &tr_none, "update", false,
                                     );
@@ -1275,6 +1398,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = notifications_c.set_checked(defaults.notifications_enabled);
                     let _ = notification_sound_c.set_checked(defaults.notification_sound);
                     let _ = start_minimized_c.set_checked(defaults.start_minimized);
+                    let _ = auto_update_c.set_checked(defaults.auto_update);
 
                     // Reset zoom to 100 %.
                     for zitem in &zoom_checks_c {
@@ -1318,6 +1442,146 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             log::warn!("[MessengerX] Failed to trigger snapshot: {e}");
         }
     });
+
+    // ------------------------------------------------------------------
+    // 8. Startup auto-update check (once every ≥ 30 days).
+    //    Only runs if `auto_update` is enabled in user settings.
+    //    A 5-second startup delay ensures the main window is fully
+    //    initialised before the dialog may appear.
+    // ------------------------------------------------------------------
+    if settings.auto_update {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let should_check = match settings.last_update_check_secs {
+            None => true,
+            Some(last) => now_secs.saturating_sub(last) >= 30 * 24 * 3600,
+        };
+        if should_check {
+            let startup_handle = app.handle().clone();
+            let tr_dlg_title_su = tr.settings_update_dialog_title.clone();
+            let tr_dlg_body_su = tr.settings_update_dialog_body.clone();
+            let tr_install_su = tr.settings_update_install_btn.clone();
+            let tr_later_su = tr.settings_update_later_btn.clone();
+            // Install-path strings — only needed on non-macOS where
+            // `download_and_install` is actually called.
+            #[cfg(not(target_os = "macos"))]
+            let tr_ready_su = tr.settings_update_ready.clone();
+            #[cfg(not(target_os = "macos"))]
+            let tr_err_su = tr.settings_update_error.clone();
+            std::thread::spawn(move || {
+                // Give the app time to finish initialising.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                tauri::async_runtime::spawn(async move {
+                    use tauri_plugin_updater::UpdaterExt;
+                    match startup_handle.updater() {
+                        Ok(updater) => match updater.check().await {
+                            Ok(Some(update)) => {
+                                let ver = update.version.clone();
+                                let body = tr_dlg_body_su.replace("{}", &ver);
+                                save_check_timestamp(&startup_handle);
+                                use tauri_plugin_dialog::{
+                                    DialogExt, MessageDialogButtons,
+                                };
+                                // Windows / Linux: show dialog and install if confirmed.
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    let h_install = startup_handle.clone();
+                                    let tr_ready_c = tr_ready_su;
+                                    let tr_err_c = tr_err_su;
+                                    startup_handle
+                                        .dialog()
+                                        .message(&body)
+                                        .title(&tr_dlg_title_su)
+                                        .buttons(MessageDialogButtons::OkCancelCustom(
+                                            tr_install_su,
+                                            tr_later_su,
+                                        ))
+                                        .show(move |confirmed| {
+                                            if confirmed {
+                                                tauri::async_runtime::spawn(async move {
+                                                    match update
+                                                        .download_and_install(|_, _| {}, || {})
+                                                        .await
+                                                    {
+                                                        Ok(()) => {
+                                                            let _ = services::notification::show_notification(
+                                                                &h_install,
+                                                                "Messenger X",
+                                                                &tr_ready_c,
+                                                                "update",
+                                                                false,
+                                                            );
+                                                            h_install.restart();
+                                                        }
+                                                        Err(e) => {
+                                                            log::warn!(
+                                                                "[MessengerX] Startup update install failed: {e}"
+                                                            );
+                                                            let _ = services::notification::show_notification(
+                                                                &h_install,
+                                                                "Messenger X",
+                                                                &tr_err_c,
+                                                                "update",
+                                                                false,
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                            } else {
+                                                log::info!(
+                                                    "[MessengerX] Startup update v{ver} \
+                                                     deferred by user"
+                                                );
+                                            }
+                                        });
+                                }
+                                // macOS: show informational dialog only — auto-install
+                                // is blocked by Gatekeeper until notarization (FEAT-003).
+                                #[cfg(target_os = "macos")]
+                                startup_handle
+                                    .dialog()
+                                    .message(&body)
+                                    .title(&tr_dlg_title_su)
+                                    .buttons(MessageDialogButtons::OkCancelCustom(
+                                        tr_install_su,
+                                        tr_later_su,
+                                    ))
+                                    .show(move |confirmed| {
+                                        if confirmed {
+                                            log::info!(
+                                                "[MessengerX] Startup update v{ver} \
+                                                 acknowledged (macOS — install requires \
+                                                 notarization, FEAT-003)"
+                                            );
+                                        } else {
+                                            log::info!(
+                                                "[MessengerX] Startup update v{ver} \
+                                                 deferred by user"
+                                            );
+                                        }
+                                    });
+                            }
+                            Ok(None) => {
+                                save_check_timestamp(&startup_handle);
+                                log::debug!("[MessengerX] Startup check: no update available");
+                            }
+                            Err(e) => {
+                                log::warn!("[MessengerX] Startup update check failed: {e}");
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!(
+                                "[MessengerX] Startup updater init failed: {e}"
+                            );
+                        }
+                    }
+                });
+            });
+        }
+    }
 
     Ok(())
 }
