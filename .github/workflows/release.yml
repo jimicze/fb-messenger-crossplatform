@@ -3,7 +3,8 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.0'   # minor/major releases only (e.g. v1.2.0, v2.0.0)
+                   # patch releases (v1.2.3) must be triggered via workflow_dispatch
   workflow_dispatch:
     inputs:
       bump_type:
@@ -29,7 +30,8 @@ env:
 #
 # Triggering a release:
 #   • From GitHub UI / gh cli: Actions → Release → Run workflow → pick bump type
-#   • From terminal (manual): git tag vX.Y.Z && git push origin vX.Y.Z
+#   • From terminal (minor/major only): git tag vX.Y.0 && git push origin vX.Y.0
+#   • Patch releases: use workflow_dispatch (patch tag push does NOT trigger CI)
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
