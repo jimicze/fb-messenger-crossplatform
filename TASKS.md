@@ -138,22 +138,8 @@
 ### [DIST-001] Flathub (Linux Flatpak)
 - **Priority:** High
 - **Effort:** M (2–4 h)
-- **Status:** 🔄 In Progress — manifesty hotové, čeká na podání PR do flathub/flathub
-- **Description:** Publikovat Messenger X na Flathub — standardní distribuce Flatpak balíčků pro Linux.
-- **Hotovo:**
-  - `flatpak/com.lasakondrej.MessengerX.yml` — Flatpak manifest (source build, `org.gnome.Platform//46`, Rust SDK extension)
-  - `flatpak/com.lasakondrej.MessengerX.desktop` — .desktop soubor
-  - `flatpak/com.lasakondrej.MessengerX.metainfo.xml` — AppStream metainfo (Flathub vyžaduje)
-  - `flatpak/cargo-sources.json` — pre-fetchnuté Cargo závislosti (offline build, 7911 řádků)
-  - CI Phase 6 (`update-flathub`) — auto-update Flathub manifestu po každém releasu
-- **Zbývá:**
-  1. Přidat screenshot do `flatpak/screenshot-main.png` (Flathub vyžaduje alespoň jeden)
-  2. Fork `flathub/flathub` → branch `new-pr/com.lasakondrej.MessengerX`
-  3. Zkopírovat `flatpak/*.yml`, `flatpak/*.desktop`, `flatpak/*.xml`, `flatpak/cargo-sources.json` do rootu forku
-  4. Podat PR do `flathub/flathub`
-  5. Po schválení: přidat `FLATHUB_PAT` secret (fine-grained PAT, Contents R/W na `flathub/com.lasakondrej.MessengerX`)
-- **Install (po schválení):** `flatpak install flathub com.lasakondrej.MessengerX`
-- **Prerekvizity:** Screenshot nutný pro PR submission
+- **Status:** ❌ Zrušeno
+- **Description:** Zrušeno — `flatpak/` adresář odstraněn z repozitáře.
 
 ### [DIST-002] Snap Store (Ubuntu/Snapcraft)
 - **Priority:** Low

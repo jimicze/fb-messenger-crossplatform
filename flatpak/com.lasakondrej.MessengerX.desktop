@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=Messenger X
-Comment=Cross-platform Facebook Messenger desktop client
-Exec=messenger-x
-Icon=com.lasakondrej.MessengerX
-Type=Application
-Categories=Network;InstantMessaging;Chat;
-Keywords=messenger;facebook;chat;messaging;
-StartupWMClass=messenger-x

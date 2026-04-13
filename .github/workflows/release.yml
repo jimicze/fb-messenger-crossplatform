@@ -29,7 +29,6 @@ env:
 #   3. publish-updater — generate one complete latest.json after all builds
 #   4. update-homebrew — patch Casks/messenger-x.rb in jimicze/homebrew-tap
 #   5. update-winget   — submit updated manifest PR to microsoft/winget-pkgs
-#   6. update-flathub  — patch tag+commit, regenerate cargo-sources in flathub repo
 #
 # Triggering a release:
 #   • From GitHub UI / gh cli: Actions → Release → Run workflow → pick bump type
@@ -680,84 +679,5 @@ jobs:
 
           Write-Host "winget manifest submitted for ${VERSION}"
 
-  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Phase 6: Update Flathub manifest (flathub/com.lasakondrej.MessengerX).
-  # Regenerates cargo-sources.json and patches tag + commit in the manifest.
-  # Requires: FLATHUB_PAT secret (fine-grained PAT, write to the Flathub repo)
-  # Note: only works after the initial Flathub PR is accepted and the
-  #       dedicated repo flathub/com.lasakondrej.MessengerX is created.
-  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  update-flathub:
-    needs: [create-release, publish-updater]
-    if: always() && needs.publish-updater.result == 'success'
-    runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repository at release tag
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.create-release.outputs.tag-name }}
 
-      - name: Update Flathub manifest
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FLATHUB_PAT: ${{ secrets.FLATHUB_PAT }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${FLATHUB_PAT}" ]]; then
-            echo "FLATHUB_PAT secret not set — skipping Flathub manifest update"
-            exit 0
-          fi
-
-          TAG="${{ needs.create-release.outputs.tag-name }}"
-          VERSION="${TAG#v}"
-          FLATHUB_REPO="flathub/com.lasakondrej.MessengerX"
-
-          # Check whether the Flathub repo exists (app accepted into Flathub).
-          # Until the initial PR is reviewed and the dedicated repo is created,
-          # this job is a no-op.
-          if ! gh api "repos/${FLATHUB_REPO}" --silent 2>/dev/null; then
-            echo "Flathub repo ${FLATHUB_REPO} not yet created (initial submission pending) — skipping"
-            exit 0
-          fi
-
-          # Resolve the commit hash for the tag (handles lightweight + annotated tags)
-          OBJ_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" -q '.object.sha')
-          OBJ_TYPE=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" -q '.object.type')
-          if [[ "$OBJ_TYPE" == "tag" ]]; then
-            COMMIT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${OBJ_SHA}" -q '.object.sha')
-          else
-            COMMIT="$OBJ_SHA"
-          fi
-          echo "Tag ${TAG} → commit ${COMMIT}"
-
-          # Install flatpak-cargo-generator dependencies
-          pip3 install --quiet aiohttp tomlkit
-          curl -fsSL \
-            "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py" \
-            -o /tmp/flatpak-cargo-generator.py
-
-          # Regenerate cargo-sources.json from the Cargo.lock at this tag
-          python3 /tmp/flatpak-cargo-generator.py src-tauri/Cargo.lock -o /tmp/cargo-sources.json
-
-          # Clone the Flathub repo
-          git clone \
-            "https://x-access-token:${FLATHUB_PAT}@github.com/${FLATHUB_REPO}.git" \
-            /tmp/flathub-repo
-          cd /tmp/flathub-repo
-
-          # Update tag and commit hash in the manifest
-          sed -i "s|tag: v[0-9][0-9.]*|tag: ${TAG}|"         com.lasakondrej.MessengerX.yml
-          sed -i "s|commit: [0-9a-f]\{40\}|commit: ${COMMIT}|" com.lasakondrej.MessengerX.yml
-
-          # Replace cargo-sources.json
-          cp /tmp/cargo-sources.json cargo-sources.json
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet && echo "No changes (version already up to date)" && exit 0
-          git commit -m "Update to ${VERSION}"
-          git push
-          echo "Flathub manifest updated to ${VERSION}"
