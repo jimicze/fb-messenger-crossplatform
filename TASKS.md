@@ -207,6 +207,16 @@
 - **Možné akce:** "Mark all as read" (JS inject do WebView), "Open last conversation"
 - **Prerekvizity:** Žádné
 
+### [FEAT-011] Verze v menu + Clear Logs
+- **Priority:** Low
+- **Status:** ✅ Done
+- **Description:** Verze aplikace (disabled label) zobrazena jako první položka v tray/app menu. Nová položka "Clear Logs" / "Vymazat logy" smaže log soubory.
+
+### [BUG-010] Externí linky v chatu nejdou otevřít na single click
+- **Priority:** High
+- **Status:** ✅ Fixed
+- **Description:** Messenger otevírá externí linky přes `window.open()` (ne navigací) — Tauri `on_navigation` callback to nezachytí. Fix: `WINDOW_OPEN_OVERRIDE_SCRIPT` přepisuje `window.open()`, pro non-facebook/messenger URL volá `invoke('open_external')`. Debug log přidán (`console.log` pro každé volání).
+
 ---
 
 ## 🏗️ Infrastruktura

@@ -274,6 +274,54 @@ fn build_scrollbar_fix_script(is_macos: bool) -> String {
     )
 }
 
+/// Overrides `window.open()` to intercept external links that Messenger opens
+/// in a new tab/window.  Messenger is a React SPA that calls `window.open()`
+/// for external URLs rather than navigating the main frame, so the Tauri
+/// `on_navigation` callback never fires for those.
+///
+/// For any non-messenger/facebook URL this script calls
+/// `invoke('open_external', …)` to open the link in the system browser.
+/// All calls are logged to the browser console for debugging.
+///
+/// Injected **at document-start** (before the page HTML is parsed).
+const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
+(function() {
+    const ALLOWED_DOMAINS = ['messenger.com', 'facebook.com', 'fbcdn.net', 'fbsbx.com'];
+
+    function isAllowedUrl(url) {
+        try {
+            var host = new URL(url).hostname;
+            return ALLOWED_DOMAINS.some(function(d) {
+                return host === d || host.endsWith('.' + d);
+            });
+        } catch(e) {
+            return true; // non-parseable URL — let it through
+        }
+    }
+
+    var _originalOpen = window.open;
+    window.open = function(url, target, features) {
+        var urlStr = url ? String(url) : '';
+        console.log('[MessengerX] window.open intercepted: url=' + urlStr + ' target=' + target);
+
+        if (urlStr && (urlStr.startsWith('http://') || urlStr.startsWith('https://'))) {
+            if (!isAllowedUrl(urlStr)) {
+                console.log('[MessengerX] External URL — routing to system browser: ' + urlStr);
+                try {
+                    window.__TAURI__.core.invoke('open_external', { url: urlStr });
+                } catch(e) {
+                    console.error('[MessengerX] Failed to open external URL via invoke:', e);
+                }
+                return null;
+            }
+        }
+        return _originalOpen.call(this, url, target, features);
+    };
+
+    console.log('[MessengerX] window.open override installed');
+})();
+"#;
+
 /// JavaScript snippet that triggers snapshot capture and forwards the HTML to
 /// Rust via `invoke('save_snapshot', …)`.  Called from the Rust snapshot timer.
 ///
@@ -460,6 +508,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
         .initialization_script(&scrollbar_fix_script)
+        .initialization_script(WINDOW_OPEN_OVERRIDE_SCRIPT)
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -607,6 +656,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         // --- Build menu items ---
 
+        // Non-interactive version label at the top of the menu.
+        let version_str = format!("v{}", app.package_info().version);
+        let version_item = MenuItemBuilder::with_id("app_version", &version_str)
+            .enabled(false)
+            .build(app)?;
+
         let show_item =
             MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
 
@@ -689,6 +744,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let view_logs_item =
             MenuItemBuilder::with_id("view_logs", &tr.settings_view_logs).build(app)?;
 
+        let clear_logs_item =
+            MenuItemBuilder::with_id("clear_logs", &tr.settings_clear_logs).build(app)?;
+
         let logout_item =
             MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
 
@@ -705,23 +763,26 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         // --- Assemble tray menu ---
         let tray_menu = MenuBuilder::new(app)
-            .item(&show_item)
+            .item(&version_item)
             .item(&sep1)
+            .item(&show_item)
+            .item(&sep2)
             .item(&stay_logged_in_item)
             .item(&notifications_item)
             .item(&notification_sound_item)
-            .item(&sep2)
-            .item(&zoom_submenu)
             .item(&sep3)
+            .item(&zoom_submenu)
+            .item(&sep4)
             .item(&autostart_item)
             .item(&start_minimized_item)
             .item(&auto_update_item)
-            .item(&sep4)
+            .item(&sep5)
             .item(&check_update_item)
             .item(&view_logs_item)
-            .item(&sep5)
-            .item(&logout_item)
+            .item(&clear_logs_item)
             .item(&sep6)
+            .item(&logout_item)
+            .separator()
             .item(&quit_item)
             .build()?;
 
@@ -988,6 +1049,22 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // ---- Clear Logs ----
+                    "clear_logs" => {
+                        if let Ok(log_dir) = handle.path().app_log_dir() {
+                            for name in &["messengerx.log", "messengerx.log.old"] {
+                                let path = log_dir.join(name);
+                                if path.exists() {
+                                    if let Err(e) = std::fs::remove_file(&path) {
+                                        log::warn!("[MessengerX] Failed to delete {}: {e}", path.display());
+                                    } else {
+                                        log::info!("[MessengerX] Deleted log file: {}", path.display());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // ---- Log out & clear data ----
                     "logout" => {
                         let _ = services::cache::clear_snapshots(handle);
@@ -1137,8 +1214,17 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let view_logs_item =
             MenuItemBuilder::with_id("view_logs", &tr.settings_view_logs).build(app)?;
 
+        let clear_logs_item =
+            MenuItemBuilder::with_id("clear_logs", &tr.settings_clear_logs).build(app)?;
+
         let logout_item =
             MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
+
+        // Non-interactive version label shown at the top of the app submenu.
+        let version_str = format!("v{}", app.package_info().version);
+        let version_item = MenuItemBuilder::with_id("app_version_macos", &version_str)
+            .enabled(false)
+            .build(app)?;
 
         // --- Separators ---
         let sep1 = PredefinedMenuItem::separator(app)?;
@@ -1150,23 +1236,26 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         // --- Assemble app submenu ---
         let app_submenu = SubmenuBuilder::new(app, "Messenger X")
-            .item(&show_item)
+            .item(&version_item)
             .item(&sep1)
+            .item(&show_item)
+            .item(&sep2)
             .item(&stay_logged_in_item)
             .item(&notifications_item)
             .item(&notification_sound_item)
-            .item(&sep2)
-            .item(&zoom_submenu)
             .item(&sep3)
+            .item(&zoom_submenu)
+            .item(&sep4)
             .item(&autostart_item)
             .item(&start_minimized_item)
             .item(&auto_update_item)
-            .item(&sep4)
+            .item(&sep5)
             .item(&check_update_item)
             .item(&view_logs_item)
-            .item(&sep5)
-            .item(&logout_item)
+            .item(&clear_logs_item)
             .item(&sep6)
+            .item(&logout_item)
+            .separator()
             .quit()
             .build()?;
 
@@ -1383,6 +1472,22 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 log_dir.to_string_lossy().into_owned(),
                                 None::<&str>,
                             );
+                        }
+                    }
+                }
+
+                // ---- Clear Logs ----
+                "clear_logs" => {
+                    if let Ok(log_dir) = h.path().app_log_dir() {
+                        for name in &["messengerx.log", "messengerx.log.old"] {
+                            let path = log_dir.join(name);
+                            if path.exists() {
+                                if let Err(e) = std::fs::remove_file(&path) {
+                                    log::warn!("[MessengerX] Failed to delete {}: {e}", path.display());
+                                } else {
+                                    log::info!("[MessengerX] Deleted log file: {}", path.display());
+                                }
+                            }
                         }
                     }
                 }

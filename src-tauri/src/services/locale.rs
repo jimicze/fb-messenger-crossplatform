@@ -87,6 +87,8 @@ pub struct Translations {
     pub settings_start_minimized: String,
     /// "View Logs" menu item label (opens log file for GitHub issue reporting).
     pub settings_view_logs: String,
+    /// "Clear Logs" menu item label (deletes the log file).
+    pub settings_clear_logs: String,
     /// "Auto-update" toggle label.
     pub settings_auto_update: String,
     /// Dialog title shown when an update is available.
@@ -130,6 +132,7 @@ fn english() -> Translations {
         settings_autostart: "Start at login".to_string(),
         settings_start_minimized: "Start minimized to tray".to_string(),
         settings_view_logs: "View Logs\u{2026}".to_string(),
+        settings_clear_logs: "Clear Logs".to_string(),
         settings_auto_update: "Auto-update".to_string(),
         settings_update_dialog_title: "Update Available".to_string(),
         settings_update_dialog_body: "Messenger X v{} is available. Install now?".to_string(),
@@ -161,6 +164,7 @@ fn czech() -> Translations {
         settings_autostart: "Spustit p\u{0159}i p\u{0159}ihl\u{00e1}\u{0161}en\u{00ed}".to_string(),
         settings_start_minimized: "Spustit minimalizovan\u{011b}".to_string(),
         settings_view_logs: "Zobrazit logy\u{2026}".to_string(),
+        settings_clear_logs: "Vymazat logy".to_string(),
         settings_auto_update: "Automatick\u{00e9} aktualizace".to_string(),
         settings_update_dialog_title: "Dostupn\u{00e1} aktualizace".to_string(),
         settings_update_dialog_body: "Messenger X v{} je k dispozici. Nainstalovat nyn\u{00ed}?".to_string(),
@@ -231,6 +235,7 @@ mod tests {
                 &t.settings_autostart,
                 &t.settings_start_minimized,
                 &t.settings_view_logs,
+                &t.settings_clear_logs,
                 &t.settings_auto_update,
                 &t.settings_update_dialog_title,
                 &t.settings_update_dialog_body,
