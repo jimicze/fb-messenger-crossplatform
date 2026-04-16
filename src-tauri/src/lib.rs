@@ -1134,8 +1134,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
                     // ---- Log out & clear data ----
                     "logout" => {
-                        let _ = services::cache::clear_snapshots(handle);
-                        let defaults = commands::AppSettings::default();
                         let _ = services::auth::save_settings(handle, &defaults);
 
                         // Reset all checkbox states to defaults.
