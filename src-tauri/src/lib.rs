@@ -427,8 +427,7 @@ fn build_visibility_override_script(start_minimized: bool) -> String {
         document.dispatchEvent(new Event('visibilitychange'));
     }};
 }})();
-"#,
-        initial_hidden = initial_hidden
+"#
     )
 }
 
@@ -605,9 +604,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // app starts minimised so that Messenger treats the page as non-visible
     // right from the first page load (no Focused event fires in that case).
     #[cfg(target_os = "linux")]
-    let visibility_override_script = build_visibility_override_script(settings.start_minimized);
-    #[cfg(target_os = "linux")]
-    let builder = builder.initialization_script(&visibility_override_script);
+    let builder = {
+        let visibility_override_script =
+            build_visibility_override_script(settings.start_minimized);
+        builder.initialization_script(&visibility_override_script)
+    };
 
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
