@@ -85,6 +85,8 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app (debug)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: npm run tauri build -- --debug ${{ matrix.args }}
 
       - name: Upload Linux artifacts
