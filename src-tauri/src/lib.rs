@@ -400,36 +400,32 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 /// via `window.__messengerx_set_visible(bool)`.  The Rust side calls this from
 /// a `WindowEvent::Focused` handler so the state tracks real OS focus.
 ///
-/// The `start_minimized` parameter controls the **initial** value of `_hidden`.
-/// When the app starts with the window hidden (tray-only / start-minimized mode),
-/// we must set `_hidden = true` from the outset because the window never goes
-/// through a focus-out event and so the Rust `Focused(false)` handler never
-/// fires to correct the default `false` value.
+/// On **every main-frame page load** the script also calls `get_window_focused`
+/// via the Tauri IPC bridge to immediately resync `_hidden` from the actual OS
+/// window state.  This is necessary because `initialization_script` runs on
+/// every navigation (not just the first load), so baking a startup preference
+/// into the initial value would corrupt the flag after any re-navigation (e.g.
+/// a logout that loads the login page) when the window is already focused.
 #[cfg(target_os = "linux")]
-fn build_visibility_override_script(start_minimized: bool) -> String {
-    // "true" when the window starts hidden so Messenger treats the page as not
-    // visible right away; "false" for a normal foreground startup.
-    let initial_hidden = if start_minimized { "true" } else { "false" };
-    format!(
-        r#"(function() {{
-    var _hidden = {initial_hidden};
-    Object.defineProperty(document, 'visibilityState', {{
-        get: function() {{ return _hidden ? 'hidden' : 'visible'; }},
+const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
+    var _hidden = false;
+    Object.defineProperty(document, 'visibilityState', {
+        get: function() { return _hidden ? 'hidden' : 'visible'; },
         configurable: true
-    }});
-    Object.defineProperty(document, 'hidden', {{
-        get: function() {{ return _hidden; }},
+    });
+    Object.defineProperty(document, 'hidden', {
+        get: function() { return _hidden; },
         configurable: true
-    }});
-    window.__messengerx_set_visible = function(visible) {{
+    });
+    window.__messengerx_set_visible = function(visible) {
         if (_hidden === !visible) return;
         _hidden = !visible;
         document.dispatchEvent(new Event('visibilitychange'));
-    }};
-}})();
-"#
-    )
-}
+    };
+    window.__TAURI__.core.invoke('get_window_focused')
+        .then(function(focused) { window.__messengerx_set_visible(focused); })
+        .catch(function() {});
+})();"#;
 
 /// Persists the current Unix timestamp (seconds) as `last_update_check_secs`
 /// in the user's settings file.
@@ -499,6 +495,7 @@ pub fn run() {
             commands::set_autostart,
             commands::is_autostart_enabled,
             commands::js_log,
+            commands::get_window_focused,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -600,15 +597,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // On Linux, inject the Visibility API shim so that Rust can push the real
     // focus state and Messenger correctly fires desktop notifications when the
-    // window is not active.  The initial hidden flag is set to `true` when the
-    // app starts minimised so that Messenger treats the page as non-visible
-    // right from the first page load (no Focused event fires in that case).
+    // window is not active.  On each page load the shim immediately resyncs
+    // _hidden from the actual OS window-focus state via IPC (get_window_focused)
+    // so that re-navigations (e.g. logout) never inherit a stale startup value.
     #[cfg(target_os = "linux")]
-    let builder = {
-        let visibility_override_script =
-            build_visibility_override_script(settings.start_minimized);
-        builder.initialization_script(&visibility_override_script)
-    };
+    let builder = builder.initialization_script(VISIBILITY_OVERRIDE_SCRIPT);
 
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
@@ -1862,35 +1855,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    // The visibility-override builder is Linux-only; gate the tests accordingly.
+    // The visibility-override script is Linux-only; gate the tests accordingly.
     #[cfg(target_os = "linux")]
     mod visibility_script {
-        use super::super::build_visibility_override_script;
+        use super::super::VISIBILITY_OVERRIDE_SCRIPT;
 
-        /// When the app starts normally (window visible), the script must
-        /// initialise `_hidden` to `false` so that `visibilityState` reports
-        /// `'visible'` on first load and Messenger can show its own in-app UI
-        /// for messages while the window is focused.
+        /// The script must default `_hidden` to `false` so that a normal
+        /// foreground load has the correct state immediately, without waiting
+        /// for the async IPC round-trip to complete.
         #[test]
-        fn initial_visible_when_not_start_minimized() {
-            let script = build_visibility_override_script(false);
+        fn default_state_is_visible() {
             assert!(
-                script.contains("var _hidden = false"),
-                "script should initialise _hidden to false when start_minimized=false"
-            );
-        }
-
-        /// When `start_minimized = true` the window is never shown at launch,
-        /// so no `Focused(false)` window event fires.  The script must
-        /// initialise `_hidden = true` so that Messenger treats the page as
-        /// hidden from the very first page load and fires desktop notifications
-        /// for incoming messages.
-        #[test]
-        fn initial_hidden_when_start_minimized() {
-            let script = build_visibility_override_script(true);
-            assert!(
-                script.contains("var _hidden = true"),
-                "script should initialise _hidden to true when start_minimized=true"
+                VISIBILITY_OVERRIDE_SCRIPT.contains("var _hidden = false"),
+                "script must default _hidden to false (safe for foreground startup)"
             );
         }
 
@@ -1898,29 +1875,36 @@ mod tests {
         /// the Rust `WindowEvent::Focused` handler can update the flag at runtime.
         #[test]
         fn exposes_set_visible_function() {
-            for &start_minimized in &[false, true] {
-                let script = build_visibility_override_script(start_minimized);
-                assert!(
-                    script.contains("__messengerx_set_visible"),
-                    "script must define __messengerx_set_visible (start_minimized={start_minimized})"
-                );
-            }
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("__messengerx_set_visible"),
+                "script must define __messengerx_set_visible"
+            );
         }
 
-        /// The `visibilityState` property getter must be present in the script.
+        /// The `visibilityState` property getter and the `visibilitychange` event
+        /// dispatch must be present in the script.
         #[test]
-        fn overrides_visibility_state_property() {
-            for &start_minimized in &[false, true] {
-                let script = build_visibility_override_script(start_minimized);
-                assert!(
-                    script.contains("visibilityState"),
-                    "script must override visibilityState (start_minimized={start_minimized})"
-                );
-                assert!(
-                    script.contains("visibilitychange"),
-                    "script must dispatch visibilitychange event (start_minimized={start_minimized})"
-                );
-            }
+        fn overrides_visibility_api_properties() {
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("visibilityState"),
+                "script must override visibilityState"
+            );
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("visibilitychange"),
+                "script must dispatch visibilitychange event"
+            );
+        }
+
+        /// On every page load the script must invoke `get_window_focused` via
+        /// the Tauri IPC bridge to resync `_hidden` from the real OS window
+        /// state.  This prevents re-navigations (e.g. logout → login page)
+        /// from inheriting a stale start-up preference.
+        #[test]
+        fn resyncs_from_ipc_on_page_load() {
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("get_window_focused"),
+                "script must invoke get_window_focused to resync state on each navigation"
+            );
         }
     }
 }

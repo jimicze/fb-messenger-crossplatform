@@ -245,6 +245,21 @@ pub fn js_log(message: String) {
     log::info!("[MessengerX][JS] {}", message);
 }
 
+/// Return whether the main window currently has OS input focus.
+///
+/// Called from the Linux Visibility API shim on every main-frame page load
+/// so that the JS `document.visibilityState` override is synchronised from
+/// the real OS window state instead of from a baked-in start-up preference.
+/// Without this resync, re-navigations (e.g. a logout that loads the login
+/// page) would reinitialise `_hidden` from the startup setting even if the
+/// window is currently visible and focused.
+#[tauri::command]
+pub fn get_window_focused(app: AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|w| w.is_focused().ok())
+        .unwrap_or(false)
+}
+
 /// Enable or disable auto-start at system login.
 ///
 /// Wraps the autostart plugin so the settings window can call it via `invoke`.
