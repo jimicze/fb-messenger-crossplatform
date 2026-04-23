@@ -396,9 +396,15 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 /// coupled to window iconification.  As a result, Messenger never fires
 /// `new Notification()` – it assumes the user is watching the UI.
 ///
-/// This script overrides the Visibility API with a flag that Rust can control
-/// via `window.__messengerx_set_visible(bool)`.  The Rust side calls this from
-/// a `WindowEvent::Focused` handler so the state tracks real OS focus.
+/// This script overrides the Visibility API with a flag that Rust controls
+/// via `window.__messengerx_set_visible(bool)`.  Two Rust-side paths drive
+/// the flag at runtime (see section 4d of `setup_webview`):
+///
+/// * **`WindowEvent::Focused`** – fast path, works on most WMs (GNOME/Mutter,
+///   KDE/KWin) that emit a focus-lost event when the window is iconified.
+/// * **`is_minimized()` poll** – 500 ms background thread that catches WMs
+///   (e.g. Linux Mint/Muffin) that do NOT emit a `Focused(false)` event on
+///   iconification.  The setter is idempotent, so double-calling is harmless.
 ///
 /// On **every main-frame page load** the script also calls `get_window_focused`
 /// via the Tauri IPC bridge to immediately resync `_hidden` from the actual OS
@@ -718,11 +724,20 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 4d. Linux: push real OS-focus state into the Visibility API shim.
     //     WebKitGTK does not update document.visibilityState when the GTK
     //     window is iconified, so Messenger never fires notifications.
-    //     We listen for WindowEvent::Focused and call the JS helper that
-    //     was injected by VISIBILITY_OVERRIDE_SCRIPT.
+    //
+    //     Two complementary paths cover different WM behaviours:
+    //     (a) WindowEvent::Focused – fires immediately on WMs that emit a
+    //         focus-change event when the window loses or gains focus (e.g.
+    //         GNOME/Mutter, KDE/KWin).
+    //     (b) is_minimized() poll – a 500 ms background thread that detects
+    //         iconify/deiconify for WMs (e.g. Linux Mint/Muffin) that do
+    //         NOT reliably emit a Focused(false) event on iconification.
+    //         __messengerx_set_visible is idempotent, so double-calling
+    //         from both paths is harmless.
     // ------------------------------------------------------------------
     #[cfg(target_os = "linux")]
     {
+        // Path (a): focus events (fast path, most WMs).
         let vis_webview = webview.clone();
         webview.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(focused) = event {
@@ -732,6 +747,29 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     "window.__messengerx_set_visible?.(false)"
                 };
                 let _ = vis_webview.eval(js);
+            }
+        });
+
+        // Path (b): is_minimized() poll – covers WMs that skip Focused events
+        // on iconify (e.g. Linux Mint / Muffin).  The loop exits automatically
+        // when the window is destroyed (is_minimized returns Err).
+        let poll_webview = webview.clone();
+        std::thread::spawn(move || {
+            let mut was_minimized = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let Ok(is_min) = poll_webview.is_minimized() else {
+                    break;
+                };
+                if is_min != was_minimized {
+                    was_minimized = is_min;
+                    let js = if is_min {
+                        "window.__messengerx_set_visible?.(false)"
+                    } else {
+                        "window.__messengerx_set_visible?.(true)"
+                    };
+                    let _ = poll_webview.eval(js);
+                }
             }
         });
     }
