@@ -1,6 +1,6 @@
 [package]
 name = "messengerx"
-version = "1.3.10"
+version = "1.3.11"
 description = "Cross-platform Messenger desktop client (Tauri)"
 authors = ["lasakondrej"]
 license = "MIT"
