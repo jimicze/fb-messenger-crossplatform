@@ -399,25 +399,38 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 /// This script overrides the Visibility API with a flag that Rust can control
 /// via `window.__messengerx_set_visible(bool)`.  The Rust side calls this from
 /// a `WindowEvent::Focused` handler so the state tracks real OS focus.
+///
+/// The `start_minimized` parameter controls the **initial** value of `_hidden`.
+/// When the app starts with the window hidden (tray-only / start-minimized mode),
+/// we must set `_hidden = true` from the outset because the window never goes
+/// through a focus-out event and so the Rust `Focused(false)` handler never
+/// fires to correct the default `false` value.
 #[cfg(target_os = "linux")]
-const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"
-(function() {
-    var _hidden = false;
-    Object.defineProperty(document, 'visibilityState', {
-        get: function() { return _hidden ? 'hidden' : 'visible'; },
+fn build_visibility_override_script(start_minimized: bool) -> String {
+    // "true" when the window starts hidden so Messenger treats the page as not
+    // visible right away; "false" for a normal foreground startup.
+    let initial_hidden = if start_minimized { "true" } else { "false" };
+    format!(
+        r#"(function() {{
+    var _hidden = {initial_hidden};
+    Object.defineProperty(document, 'visibilityState', {{
+        get: function() {{ return _hidden ? 'hidden' : 'visible'; }},
         configurable: true
-    });
-    Object.defineProperty(document, 'hidden', {
-        get: function() { return _hidden; },
+    }});
+    Object.defineProperty(document, 'hidden', {{
+        get: function() {{ return _hidden; }},
         configurable: true
-    });
-    window.__messengerx_set_visible = function(visible) {
+    }});
+    window.__messengerx_set_visible = function(visible) {{
         if (_hidden === !visible) return;
         _hidden = !visible;
         document.dispatchEvent(new Event('visibilitychange'));
-    };
-})();
-"#;
+    }};
+}})();
+"#,
+        initial_hidden = initial_hidden
+    )
+}
 
 /// Persists the current Unix timestamp (seconds) as `last_update_check_secs`
 /// in the user's settings file.
@@ -588,9 +601,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // On Linux, inject the Visibility API shim so that Rust can push the real
     // focus state and Messenger correctly fires desktop notifications when the
-    // window is not active.
+    // window is not active.  The initial hidden flag is set to `true` when the
+    // app starts minimised so that Messenger treats the page as non-visible
+    // right from the first page load (no Focused event fires in that case).
     #[cfg(target_os = "linux")]
-    let builder = builder.initialization_script(VISIBILITY_OVERRIDE_SCRIPT);
+    let visibility_override_script = build_visibility_override_script(settings.start_minimized);
+    #[cfg(target_os = "linux")]
+    let builder = builder.initialization_script(&visibility_override_script);
 
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
@@ -1836,4 +1853,73 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    // The visibility-override builder is Linux-only; gate the tests accordingly.
+    #[cfg(target_os = "linux")]
+    mod visibility_script {
+        use super::super::build_visibility_override_script;
+
+        /// When the app starts normally (window visible), the script must
+        /// initialise `_hidden` to `false` so that `visibilityState` reports
+        /// `'visible'` on first load and Messenger can show its own in-app UI
+        /// for messages while the window is focused.
+        #[test]
+        fn initial_visible_when_not_start_minimized() {
+            let script = build_visibility_override_script(false);
+            assert!(
+                script.contains("var _hidden = false"),
+                "script should initialise _hidden to false when start_minimized=false"
+            );
+        }
+
+        /// When `start_minimized = true` the window is never shown at launch,
+        /// so no `Focused(false)` window event fires.  The script must
+        /// initialise `_hidden = true` so that Messenger treats the page as
+        /// hidden from the very first page load and fires desktop notifications
+        /// for incoming messages.
+        #[test]
+        fn initial_hidden_when_start_minimized() {
+            let script = build_visibility_override_script(true);
+            assert!(
+                script.contains("var _hidden = true"),
+                "script should initialise _hidden to true when start_minimized=true"
+            );
+        }
+
+        /// The script must expose the `__messengerx_set_visible` setter so that
+        /// the Rust `WindowEvent::Focused` handler can update the flag at runtime.
+        #[test]
+        fn exposes_set_visible_function() {
+            for &start_minimized in &[false, true] {
+                let script = build_visibility_override_script(start_minimized);
+                assert!(
+                    script.contains("__messengerx_set_visible"),
+                    "script must define __messengerx_set_visible (start_minimized={start_minimized})"
+                );
+            }
+        }
+
+        /// The `visibilityState` property getter must be present in the script.
+        #[test]
+        fn overrides_visibility_state_property() {
+            for &start_minimized in &[false, true] {
+                let script = build_visibility_override_script(start_minimized);
+                assert!(
+                    script.contains("visibilityState"),
+                    "script must override visibilityState (start_minimized={start_minimized})"
+                );
+                assert!(
+                    script.contains("visibilitychange"),
+                    "script must dispatch visibilitychange event (start_minimized={start_minimized})"
+                );
+            }
+        }
+    }
 }
