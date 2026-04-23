@@ -412,6 +412,13 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 /// every navigation (not just the first load), so baking a startup preference
 /// into the initial value would corrupt the flag after any re-navigation (e.g.
 /// a logout that loads the login page) when the window is already focused.
+
+/// Poll interval (ms) for the `is_minimized()` background thread.
+/// 500 ms gives a worst-case detection latency that is imperceptible to users
+/// while keeping CPU overhead negligible (one Tauri IPC call per half-second).
+#[cfg(target_os = "linux")]
+const MINIMIZE_POLL_INTERVAL_MS: u64 = 500;
+
 #[cfg(target_os = "linux")]
 const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
     var _hidden = false;
@@ -752,12 +759,17 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         // Path (b): is_minimized() poll – covers WMs that skip Focused events
         // on iconify (e.g. Linux Mint / Muffin).  The loop exits automatically
-        // when the window is destroyed (is_minimized returns Err).
+        // when the window is destroyed (is_minimized returns Err), which Tauri
+        // guarantees on app shutdown before the process exits, so no JoinHandle
+        // or explicit cancellation token is needed: the thread is always
+        // given a chance to observe the Err and exit cleanly.
         let poll_webview = webview.clone();
         std::thread::spawn(move || {
             let mut was_minimized = false;
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    MINIMIZE_POLL_INTERVAL_MS,
+                ));
                 let Ok(is_min) = poll_webview.is_minimized() else {
                     break;
                 };
