@@ -1,0 +1,116 @@
+name: Test Build
+
+# Builds the app from any branch and uploads artifacts for manual testing.
+# Does NOT bump the version, commit, push tags, or create a GitHub Release.
+# Intended for validating PR branches before merging.
+#
+# Trigger: Actions → Test Build → Run workflow → pick branch
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64 — primary target for the notification fix (Issue #4)
+          - platform: 'ubuntu-22.04'
+            args: ''
+            rust-targets: ''
+            label: 'Linux-x64'
+
+          # Linux arm64
+          - platform: 'ubuntu-22.04-arm'
+            args: ''
+            rust-targets: ''
+            label: 'Linux-arm64'
+
+          # macOS Apple Silicon
+          - platform: 'macos-latest'
+            args: '--target aarch64-apple-darwin'
+            rust-targets: 'aarch64-apple-darwin'
+            label: 'macOS-arm64'
+
+          # Windows x64
+          - platform: 'windows-latest'
+            args: ''
+            rust-targets: ''
+            label: 'Windows-x64'
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Linux system dependencies
+        if: contains(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            xdg-utils
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: test-${{ matrix.label }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app (debug)
+        run: npm run tauri build -- --debug ${{ matrix.args }}
+
+      - name: Upload Linux artifacts
+        if: contains(matrix.platform, 'ubuntu')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-debug
+          retention-days: 7
+          path: |
+            src-tauri/target/**/release/bundle/deb/*.deb
+            src-tauri/target/**/release/bundle/appimage/*.AppImage
+
+      - name: Upload macOS artifacts
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-debug
+          retention-days: 7
+          path: |
+            src-tauri/target/**/release/bundle/dmg/*.dmg
+
+      - name: Upload Windows artifacts
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-debug
+          retention-days: 7
+          path: |
+            src-tauri/target/**/release/bundle/nsis/*.exe
