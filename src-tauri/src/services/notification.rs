@@ -5,7 +5,7 @@
 //! On Linux we first attempt to dispatch via the `notify-send` CLI tool (from
 //! `libnotify-bin`), which is pre-installed on Linux Mint and Ubuntu and works
 //! reliably with both Cinnamon and GNOME session managers regardless of whether
-//! the application has a registered `.desktop` file.  If `notify-send` is not
+//! the application has a registered `.desktop` file. If `notify-send` is not
 //! available or returns a non-zero exit code we fall back to
 //! `tauri-plugin-notification` (direct D-Bus).
 //!
@@ -17,6 +17,7 @@
 //! presentation as a banner.
 
 use tauri::AppHandle;
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(target_os = "macos")]
@@ -114,21 +115,39 @@ pub fn show_notification(
     tag: &str,
     silent: bool,
 ) -> Result<(), String> {
+    log::info!(
+        "[MessengerX][Notification] show_notification start: title={title:?} body_len={} tag={tag:?} silent={silent}",
+        body.chars().count()
+    );
+
     #[cfg(target_os = "macos")]
     {
         let _ = app;
-        show_via_user_notifications(title, body, tag, silent)
+        let result = show_via_user_notifications(title, body, tag, silent);
+        match &result {
+            Ok(()) => log::info!(
+                "[MessengerX][Notification] macOS notification enqueued successfully"
+            ),
+            Err(e) => log::warn!(
+                "[MessengerX][Notification] macOS notification failed: {e}"
+            ),
+        }
+        result
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        // On Linux try notify-send first; fall back to tauri-plugin-notification.
         #[cfg(target_os = "linux")]
         match show_via_notify_send(title, body, silent) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                log::info!(
+                    "[MessengerX][Notification] Linux notification delivered via notify-send"
+                );
+                return Ok(());
+            }
             Err(e) => {
                 log::warn!(
-                    "notify-send unavailable or failed ({e}); \
+                    "[MessengerX][Notification] notify-send unavailable or failed ({e}); \
                      falling back to tauri-plugin-notification"
                 );
             }
@@ -177,6 +196,11 @@ fn show_via_user_notifications(
     tag: &str,
     silent: bool,
 ) -> Result<(), String> {
+    log::info!(
+        "[MessengerX][Notification] Trying macOS UNUserNotificationCenter: title={title:?} body_len={} tag={tag:?} silent={silent}",
+        body.chars().count()
+    );
+
     initialize()?;
 
     let center = UNUserNotificationCenter::currentNotificationCenter();
@@ -200,7 +224,11 @@ fn show_via_user_notifications(
     let enqueue_handler = RcBlock::new(move |error: *mut NSError| {
         if let Some(error) = format_nserror(error) {
             log::warn!(
-                "[MessengerX] Failed to enqueue macOS notification {enqueue_identifier}: {error}"
+                "[MessengerX][Notification] Failed to enqueue macOS notification {enqueue_identifier}: {error}"
+            );
+        } else {
+            log::info!(
+                "[MessengerX][Notification] macOS notification enqueued: {enqueue_identifier}"
             );
         }
     });
@@ -225,6 +253,11 @@ fn show_via_tauri_plugin(
     tag: &str,
     silent: bool,
 ) -> Result<(), String> {
+    log::info!(
+        "[MessengerX][Notification] Trying tauri-plugin-notification: title={title:?} body_len={} tag={tag:?} silent={silent}",
+        body.chars().count()
+    );
+
     let mut builder = app
         .notification()
         .builder()
@@ -244,7 +277,21 @@ fn show_via_tauri_plugin(
         builder = builder.silent();
     }
 
-    builder.show().map_err(|e| e.to_string())
+    match builder.show() {
+        Ok(()) => {
+            log::info!(
+                "[MessengerX][Notification] tauri-plugin-notification delivered successfully"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            log::warn!(
+                "[MessengerX][Notification] tauri-plugin-notification failed: {msg}"
+            );
+            Err(msg)
+        }
+    }
 }
 
 /// Dispatch a notification via the `notify-send` CLI tool (Linux only).
@@ -263,6 +310,11 @@ fn show_via_tauri_plugin(
 fn show_via_notify_send(title: &str, body: &str, silent: bool) -> Result<(), String> {
     use std::process::Command;
 
+    log::info!(
+        "[MessengerX][Notification] Trying notify-send: title={title:?} body_len={} silent={silent}",
+        body.chars().count()
+    );
+
     let mut cmd = Command::new("notify-send");
     cmd.arg("--app-name=Messenger X")
         .arg("--urgency=normal")
@@ -279,6 +331,9 @@ fn show_via_notify_send(title: &str, body: &str, silent: bool) -> Result<(), Str
     let status = cmd.status().map_err(|e| format!("failed to spawn notify-send: {e}"))?;
 
     if status.success() {
+        log::info!(
+            "[MessengerX][Notification] notify-send exited successfully"
+        );
         Ok(())
     } else {
         Err(format!(

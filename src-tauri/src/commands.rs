@@ -89,12 +89,40 @@ pub fn send_notification(
     app: AppHandle,
 ) -> Result<(), String> {
     let settings = crate::services::auth::load_settings(&app).unwrap_or_default();
+    log::info!(
+        "[MessengerX][Notification] send_notification called: title={title:?} body_len={} tag={tag:?} silent={} notifications_enabled={} notification_sound={}",
+        body.chars().count(),
+        silent,
+        settings.notifications_enabled,
+        settings.notification_sound
+    );
     if !settings.notifications_enabled {
+        log::info!(
+            "[MessengerX][Notification] send_notification skipped: notifications disabled in settings"
+        );
         return Ok(());
     }
     // Force silent if user disabled notification sounds.
     let effective_silent = silent || !settings.notification_sound;
-    crate::services::notification::show_notification(&app, &title, &body, &tag, effective_silent)
+    log::info!(
+        "[MessengerX][Notification] effective_silent={effective_silent}"
+    );
+    let result = crate::services::notification::show_notification(
+        &app,
+        &title,
+        &body,
+        &tag,
+        effective_silent,
+    );
+    match &result {
+        Ok(()) => log::info!(
+            "[MessengerX][Notification] send_notification finished successfully"
+        ),
+        Err(e) => log::warn!(
+            "[MessengerX][Notification] send_notification failed: {e}"
+        ),
+    }
+    result
 }
 
 /// Update the unread-message count badge / tray tooltip.
@@ -243,6 +271,44 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn js_log(message: String) {
     log::info!("[MessengerX][JS] {}", message);
+}
+
+/// Return whether the main window should be treated as visible by Messenger.
+///
+/// On Linux this is stricter than plain OS focus: the window must be focused
+/// and not minimized. The Visibility API shim calls this on every main-frame
+/// page load so that the JS `document.visibilityState` / `document.hasFocus()`
+/// overrides are synchronised from the real OS window state instead of from a
+/// baked-in start-up preference. Without this resync, re-navigations (e.g.
+/// logout -> login page) could reinitialise the shim with a stale state.
+#[tauri::command]
+pub fn get_window_focused(app: AppHandle) -> bool {
+    let Some(window) = app.get_webview_window("main") else {
+        log::warn!(
+            "[MessengerX][Visibility] get_window_focused: main window missing"
+        );
+        return false;
+    };
+    let Ok(is_focused) = window.is_focused() else {
+        log::warn!(
+            "[MessengerX][Visibility] get_window_focused: is_focused() failed"
+        );
+        return false;
+    };
+    let Ok(is_minimized) = window.is_minimized() else {
+        log::warn!(
+            "[MessengerX][Visibility] get_window_focused: is_minimized() failed"
+        );
+        return false;
+    };
+    let effective_visible = is_focused && !is_minimized;
+    log::info!(
+        "[MessengerX][Visibility] get_window_focused -> focused={} minimized={} visible={}",
+        is_focused,
+        is_minimized,
+        effective_visible
+    );
+    effective_visible
 }
 
 /// Enable or disable auto-start at system login.

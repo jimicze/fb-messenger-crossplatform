@@ -20,16 +20,56 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 /// Injected **at document-start** (before the page HTML is parsed).
 const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
 (function() {
-    const OriginalNotification = window.Notification;
+    function jlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[NotificationJS] ' + msg });
+        } catch(_) {}
+    }
+
+    function preview(value) {
+        var text = String(value == null ? '' : value);
+        return text.length > 120 ? text.slice(0, 117) + '...' : text;
+    }
+
+    function safeHasFocus() {
+        try {
+            return typeof document.hasFocus === 'function' ? document.hasFocus() : 'unknown';
+        } catch(_) {
+            return 'error';
+        }
+    }
+
     window.Notification = function(title, options) {
         try {
+            var body = options?.body || '';
+            var tag = options?.tag || '';
+            var silent = options?.silent || false;
+
+            jlog(
+                'constructor called: title=' + JSON.stringify(preview(title)) +
+                ' body=' + JSON.stringify(preview(body)) +
+                ' tag=' + JSON.stringify(preview(tag)) +
+                ' silent=' + String(silent) +
+                ' visibility=' + String(document.visibilityState) +
+                ' hidden=' + String(document.hidden) +
+                ' hasFocus=' + String(safeHasFocus())
+            );
+
             window.__TAURI__.core.invoke('send_notification', {
                 title: title,
-                body: options?.body || '',
-                tag: options?.tag || '',
-                silent: options?.silent || false
+                body: body,
+                tag: tag,
+                silent: silent
+            }).then(function() {
+                jlog('send_notification resolved');
+            }).catch(function(e) {
+                jlog('send_notification rejected: ' + e);
+                console.error('[MessengerX] Failed to send notification:', e);
             });
-        } catch(e) { console.error('[MessengerX] Failed to send notification:', e); }
+        } catch(e) {
+            jlog('constructor failed: ' + e);
+            console.error('[MessengerX] Failed to send notification:', e);
+        }
         return {
             close: function() {},
             addEventListener: function() {},
@@ -39,10 +79,12 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
     };
     window.Notification.permission = 'granted';
     window.Notification.requestPermission = function(callback) {
+        jlog('requestPermission called');
         if (callback) callback('granted');
         return Promise.resolve('granted');
     };
     window.Notification.__native__ = true;
+    jlog('window.Notification override installed');
 })();
 "#;
 
@@ -396,13 +438,68 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 /// coupled to window iconification.  As a result, Messenger never fires
 /// `new Notification()` – it assumes the user is watching the UI.
 ///
-/// This script overrides the Visibility API with a flag that Rust can control
-/// via `window.__messengerx_set_visible(bool)`.  The Rust side calls this from
-/// a `WindowEvent::Focused` handler so the state tracks real OS focus.
+/// This script overrides the Visibility API and `document.hasFocus()` with a
+/// flag that Rust controls via `window.__messengerx_set_visible(bool)`.
+/// Two Rust-side paths drive the flag at runtime (see section 4d of
+/// `setup_webview`):
+///
+/// * **`WindowEvent::Focused`** – fast path, works on most WMs (GNOME/Mutter,
+///   KDE/KWin) that emit a focus-lost event when the window is iconified.
+/// * **`is_minimized()` poll** – 500 ms background thread that catches WMs
+///   (e.g. Linux Mint/Muffin) that do NOT emit a `Focused(false)` event on
+///   iconification.  The setter is idempotent, so double-calling is harmless.
+///
+/// The setter also dispatches synthetic `focus` / `blur` events alongside
+/// `visibilitychange` because Messenger's notification gate appears to consult
+/// both focus and visibility signals on Linux.
+///
+/// On **every main-frame page load** the script also calls `get_window_focused`
+/// via the Tauri IPC bridge to immediately resync `_hidden` from the actual OS
+/// window state. This is necessary because `initialization_script` runs on
+/// every navigation (not just the first load), so baking a startup preference
+/// into the initial value would corrupt the flag after any re-navigation (e.g.
+/// a logout that loads the login page) when the window is already focused.
+
+/// Poll interval (ms) for the Linux background thread that derives Messenger's
+/// effective visibility from `is_focused()` + `is_minimized()`.
+/// 500 ms gives a worst-case detection latency that is imperceptible to users
+/// while keeping CPU overhead negligible (two Tauri window-state queries per
+/// half-second).
 #[cfg(target_os = "linux")]
-const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"
-(function() {
+const WINDOW_STATE_POLL_INTERVAL_MS: u64 = 500;
+
+#[cfg(target_os = "linux")]
+const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
     var _hidden = false;
+
+    function jlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[VisibilityJS] ' + msg });
+        } catch(_) {}
+    }
+
+    function dispatchFocusChange(visible) {
+        var type = visible ? 'focus' : 'blur';
+        window.dispatchEvent(new Event(type));
+        document.dispatchEvent(new Event(type));
+    }
+
+    function setVisible(visible, source) {
+        source = source || 'unknown';
+        if (_hidden === !visible) {
+            jlog('setVisible no-op: source=' + source + ' visible=' + String(visible));
+            return;
+        }
+        _hidden = !visible;
+        jlog(
+            'setVisible changed: source=' + source +
+            ' visible=' + String(visible) +
+            ' hidden=' + String(_hidden)
+        );
+        document.dispatchEvent(new Event('visibilitychange'));
+        dispatchFocusChange(visible);
+    }
+
     Object.defineProperty(document, 'visibilityState', {
         get: function() { return _hidden ? 'hidden' : 'visible'; },
         configurable: true
@@ -411,13 +508,27 @@ const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"
         get: function() { return _hidden; },
         configurable: true
     });
-    window.__messengerx_set_visible = function(visible) {
-        if (_hidden === !visible) return;
-        _hidden = !visible;
-        document.dispatchEvent(new Event('visibilitychange'));
-    };
-})();
-"#;
+
+    try {
+        Object.defineProperty(document, 'hasFocus', {
+            value: function() { return !_hidden; },
+            configurable: true
+        });
+    } catch(_) {
+        document.hasFocus = function() { return !_hidden; };
+    }
+
+    window.__messengerx_set_visible = setVisible;
+    window.__TAURI__.core.invoke('get_window_focused')
+        .then(function(focused) {
+            jlog('initial get_window_focused=' + String(focused));
+            setVisible(focused, 'ipc-resync');
+        })
+        .catch(function(e) {
+            jlog('get_window_focused failed: ' + e);
+        });
+    jlog('visibility override installed');
+})();"#;
 
 /// Persists the current Unix timestamp (seconds) as `last_update_check_secs`
 /// in the user's settings file.
@@ -487,6 +598,7 @@ pub fn run() {
             commands::set_autostart,
             commands::is_autostart_enabled,
             commands::js_log,
+            commands::get_window_focused,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -592,7 +704,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // On Linux, inject the Visibility API shim so that Rust can push the real
     // focus state and Messenger correctly fires desktop notifications when the
-    // window is not active.
+    // window is not active.  On each page load the shim immediately resyncs
+    // _hidden from the actual OS window-focus state via IPC (get_window_focused)
+    // so that re-navigations (e.g. logout) never inherit a stale startup value.
     #[cfg(target_os = "linux")]
     let builder = builder.initialization_script(VISIBILITY_OVERRIDE_SCRIPT);
 
@@ -711,20 +825,104 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 4d. Linux: push real OS-focus state into the Visibility API shim.
     //     WebKitGTK does not update document.visibilityState when the GTK
     //     window is iconified, so Messenger never fires notifications.
-    //     We listen for WindowEvent::Focused and call the JS helper that
-    //     was injected by VISIBILITY_OVERRIDE_SCRIPT.
+    //
+    //     Two complementary paths cover different WM behaviours:
+    //     (a) WindowEvent::Focused – fires immediately on WMs that emit a
+    //         focus-change event when the window loses or gains focus (e.g.
+    //         GNOME/Mutter, KDE/KWin).
+    //     (b) window-state poll – a 500 ms background thread that derives the
+    //         effective notification-visible state from `is_focused()` AND
+    //         `!is_minimized()`. This covers WMs (e.g. Linux Mint / Muffin)
+    //         that do NOT reliably emit a Focused(false) event on iconify.
+    //         __messengerx_set_visible is idempotent, so double-calling from
+    //         both paths is harmless.
     // ------------------------------------------------------------------
     #[cfg(target_os = "linux")]
     {
+        // Path (a): focus events (fast path, most WMs).
         let vis_webview = webview.clone();
         webview.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(focused) = event {
+                log::info!(
+                    "[MessengerX][Visibility] WindowEvent::Focused({focused})"
+                );
                 let js = if *focused {
-                    "window.__messengerx_set_visible?.(true)"
+                    "window.__messengerx_set_visible?.(true, 'window-event-focused')"
                 } else {
-                    "window.__messengerx_set_visible?.(false)"
+                    "window.__messengerx_set_visible?.(false, 'window-event-blurred')"
                 };
-                let _ = vis_webview.eval(js);
+                if let Err(e) = vis_webview.eval(js) {
+                    log::warn!(
+                        "[MessengerX][Visibility] Failed to eval focus-event visibility sync: {e}"
+                    );
+                }
+            }
+        });
+
+        // Path (b): derive effective visibility from focused + minimized state.
+        // This covers WMs that skip Focused events on iconify/backgrounding
+        // (e.g. Linux Mint / Muffin). The loop exits automatically when the
+        // window is destroyed (window-state query returns Err), which Tauri
+        // guarantees on app shutdown before the process exits, so no JoinHandle
+        // or explicit cancellation token is needed.
+        let poll_webview = webview.clone();
+        std::thread::spawn(move || {
+            let Ok(initially_focused) = poll_webview.is_focused() else {
+                log::info!(
+                    "[MessengerX][Visibility] Poll thread exiting before start: is_focused() unavailable"
+                );
+                return;
+            };
+            let Ok(initially_minimized) = poll_webview.is_minimized() else {
+                log::info!(
+                    "[MessengerX][Visibility] Poll thread exiting before start: is_minimized() unavailable"
+                );
+                return;
+            };
+            let mut was_visible = initially_focused && !initially_minimized;
+            log::info!(
+                "[MessengerX][Visibility] Poll thread started: focused={} minimized={} visible={}",
+                initially_focused,
+                initially_minimized,
+                was_visible
+            );
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    WINDOW_STATE_POLL_INTERVAL_MS,
+                ));
+                let Ok(is_focused) = poll_webview.is_focused() else {
+                    log::info!(
+                        "[MessengerX][Visibility] Poll thread exiting: is_focused() unavailable"
+                    );
+                    break;
+                };
+                let Ok(is_minimized) = poll_webview.is_minimized() else {
+                    log::info!(
+                        "[MessengerX][Visibility] Poll thread exiting: is_minimized() unavailable"
+                    );
+                    break;
+                };
+                let is_visible = is_focused && !is_minimized;
+                if is_visible != was_visible {
+                    was_visible = is_visible;
+                    log::info!(
+                        "[MessengerX][Visibility] Poll state changed: focused={} minimized={} visible={}",
+                        is_focused,
+                        is_minimized,
+                        is_visible
+                    );
+                    let js = if is_visible {
+                        "window.__messengerx_set_visible?.(true, 'poll-focused-unminimized')"
+                    } else {
+                        "window.__messengerx_set_visible?.(false, 'poll-unfocused-or-minimized')"
+                    };
+                    if let Err(e) = poll_webview.eval(js) {
+                        log::warn!(
+                            "[MessengerX][Visibility] Failed to eval poll-based visibility sync: {e}"
+                        );
+                    }
+                }
             }
         });
     }
@@ -1840,4 +2038,83 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    // The visibility-override script is Linux-only; gate the tests accordingly.
+    #[cfg(target_os = "linux")]
+    mod visibility_script {
+        use super::super::VISIBILITY_OVERRIDE_SCRIPT;
+
+        /// The script must default `_hidden` to `false` so that a normal
+        /// foreground load has the correct state immediately, without waiting
+        /// for the async IPC round-trip to complete.
+        #[test]
+        fn default_state_is_visible() {
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("var _hidden = false"),
+                "script must default _hidden to false (safe for foreground startup)"
+            );
+        }
+
+        /// The script must expose the `__messengerx_set_visible` setter so that
+        /// the Rust `WindowEvent::Focused` handler can update the flag at runtime.
+        #[test]
+        fn exposes_set_visible_function() {
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("__messengerx_set_visible"),
+                "script must define __messengerx_set_visible"
+            );
+        }
+
+        /// The `visibilityState` property getter and the `visibilitychange` event
+        /// dispatch must be present in the script.
+        #[test]
+        fn overrides_visibility_api_properties() {
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("visibilityState"),
+                "script must override visibilityState"
+            );
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("visibilitychange"),
+                "script must dispatch visibilitychange event"
+            );
+        }
+
+        /// Messenger may consult focus signals in addition to visibility,
+        /// so the script must override `document.hasFocus()` and dispatch
+        /// synthetic `focus` / `blur` events when the state changes.
+        #[test]
+        fn overrides_focus_api_properties() {
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("hasFocus"),
+                "script must override document.hasFocus"
+            );
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("'focus'"),
+                "script must dispatch a synthetic focus event"
+            );
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("'blur'"),
+                "script must dispatch a synthetic blur event"
+            );
+        }
+
+        /// On every page load the script must invoke `get_window_focused` via
+        /// the Tauri IPC bridge to resync `_hidden` from the real OS window
+        /// state.  This prevents re-navigations (e.g. logout → login page)
+        /// from inheriting a stale start-up preference.
+        #[test]
+        fn resyncs_from_ipc_on_page_load() {
+            assert!(
+                VISIBILITY_OVERRIDE_SCRIPT.contains("get_window_focused"),
+                "script must invoke get_window_focused to resync state on each navigation"
+            );
+        }
+    }
 }
