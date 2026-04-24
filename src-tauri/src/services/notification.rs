@@ -30,13 +30,23 @@ pub fn show_notification(
     tag: &str,
     silent: bool,
 ) -> Result<(), String> {
+    log::info!(
+        "[MessengerX][Notification] show_notification start: title={title:?} body_len={} tag={tag:?} silent={silent}",
+        body.chars().count()
+    );
+
     // On Linux try notify-send first; fall back to tauri-plugin-notification.
     #[cfg(target_os = "linux")]
     match show_via_notify_send(title, body, silent) {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            log::info!(
+                "[MessengerX][Notification] Linux notification delivered via notify-send"
+            );
+            return Ok(());
+        }
         Err(e) => {
             log::warn!(
-                "notify-send unavailable or failed ({e}); \
+                "[MessengerX][Notification] notify-send unavailable or failed ({e}); \
                  falling back to tauri-plugin-notification"
             );
         }
@@ -53,6 +63,11 @@ fn show_via_tauri_plugin(
     tag: &str,
     silent: bool,
 ) -> Result<(), String> {
+    log::info!(
+        "[MessengerX][Notification] Trying tauri-plugin-notification: title={title:?} body_len={} tag={tag:?} silent={silent}",
+        body.chars().count()
+    );
+
     let mut builder = app
         .notification()
         .builder()
@@ -72,7 +87,21 @@ fn show_via_tauri_plugin(
         builder = builder.silent();
     }
 
-    builder.show().map_err(|e| e.to_string())
+    match builder.show() {
+        Ok(()) => {
+            log::info!(
+                "[MessengerX][Notification] tauri-plugin-notification delivered successfully"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            log::warn!(
+                "[MessengerX][Notification] tauri-plugin-notification failed: {msg}"
+            );
+            Err(msg)
+        }
+    }
 }
 
 /// Dispatch a notification via the `notify-send` CLI tool (Linux only).
@@ -91,6 +120,11 @@ fn show_via_tauri_plugin(
 fn show_via_notify_send(title: &str, body: &str, silent: bool) -> Result<(), String> {
     use std::process::Command;
 
+    log::info!(
+        "[MessengerX][Notification] Trying notify-send: title={title:?} body_len={} silent={silent}",
+        body.chars().count()
+    );
+
     let mut cmd = Command::new("notify-send");
     cmd.arg("--app-name=Messenger X")
         .arg("--urgency=normal")
@@ -107,6 +141,9 @@ fn show_via_notify_send(title: &str, body: &str, silent: bool) -> Result<(), Str
     let status = cmd.status().map_err(|e| format!("failed to spawn notify-send: {e}"))?;
 
     if status.success() {
+        log::info!(
+            "[MessengerX][Notification] notify-send exited successfully"
+        );
         Ok(())
     } else {
         Err(format!(

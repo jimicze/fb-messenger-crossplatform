@@ -20,16 +20,56 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 /// Injected **at document-start** (before the page HTML is parsed).
 const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
 (function() {
-    const OriginalNotification = window.Notification;
+    function jlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[NotificationJS] ' + msg });
+        } catch(_) {}
+    }
+
+    function preview(value) {
+        var text = String(value == null ? '' : value);
+        return text.length > 120 ? text.slice(0, 117) + '...' : text;
+    }
+
+    function safeHasFocus() {
+        try {
+            return typeof document.hasFocus === 'function' ? document.hasFocus() : 'unknown';
+        } catch(_) {
+            return 'error';
+        }
+    }
+
     window.Notification = function(title, options) {
         try {
+            var body = options?.body || '';
+            var tag = options?.tag || '';
+            var silent = options?.silent || false;
+
+            jlog(
+                'constructor called: title=' + JSON.stringify(preview(title)) +
+                ' body=' + JSON.stringify(preview(body)) +
+                ' tag=' + JSON.stringify(preview(tag)) +
+                ' silent=' + String(silent) +
+                ' visibility=' + String(document.visibilityState) +
+                ' hidden=' + String(document.hidden) +
+                ' hasFocus=' + String(safeHasFocus())
+            );
+
             window.__TAURI__.core.invoke('send_notification', {
                 title: title,
-                body: options?.body || '',
-                tag: options?.tag || '',
-                silent: options?.silent || false
+                body: body,
+                tag: tag,
+                silent: silent
+            }).then(function() {
+                jlog('send_notification resolved');
+            }).catch(function(e) {
+                jlog('send_notification rejected: ' + e);
+                console.error('[MessengerX] Failed to send notification:', e);
             });
-        } catch(e) { console.error('[MessengerX] Failed to send notification:', e); }
+        } catch(e) {
+            jlog('constructor failed: ' + e);
+            console.error('[MessengerX] Failed to send notification:', e);
+        }
         return {
             close: function() {},
             addEventListener: function() {},
@@ -39,10 +79,12 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
     };
     window.Notification.permission = 'granted';
     window.Notification.requestPermission = function(callback) {
+        jlog('requestPermission called');
         if (callback) callback('granted');
         return Promise.resolve('granted');
     };
     window.Notification.__native__ = true;
+    jlog('window.Notification override installed');
 })();
 "#;
 
@@ -430,15 +472,30 @@ const WINDOW_STATE_POLL_INTERVAL_MS: u64 = 500;
 const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
     var _hidden = false;
 
+    function jlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[VisibilityJS] ' + msg });
+        } catch(_) {}
+    }
+
     function dispatchFocusChange(visible) {
         var type = visible ? 'focus' : 'blur';
         window.dispatchEvent(new Event(type));
         document.dispatchEvent(new Event(type));
     }
 
-    function setVisible(visible) {
-        if (_hidden === !visible) return;
+    function setVisible(visible, source) {
+        source = source || 'unknown';
+        if (_hidden === !visible) {
+            jlog('setVisible no-op: source=' + source + ' visible=' + String(visible));
+            return;
+        }
         _hidden = !visible;
+        jlog(
+            'setVisible changed: source=' + source +
+            ' visible=' + String(visible) +
+            ' hidden=' + String(_hidden)
+        );
         document.dispatchEvent(new Event('visibilitychange'));
         dispatchFocusChange(visible);
     }
@@ -463,8 +520,14 @@ const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
 
     window.__messengerx_set_visible = setVisible;
     window.__TAURI__.core.invoke('get_window_focused')
-        .then(function(focused) { setVisible(focused); })
-        .catch(function() {});
+        .then(function(focused) {
+            jlog('initial get_window_focused=' + String(focused));
+            setVisible(focused, 'ipc-resync');
+        })
+        .catch(function(e) {
+            jlog('get_window_focused failed: ' + e);
+        });
+    jlog('visibility override installed');
 })();"#;
 
 /// Persists the current Unix timestamp (seconds) as `last_update_check_secs`
@@ -776,12 +839,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let vis_webview = webview.clone();
         webview.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(focused) = event {
+                log::info!(
+                    "[MessengerX][Visibility] WindowEvent::Focused({focused})"
+                );
                 let js = if *focused {
-                    "window.__messengerx_set_visible?.(true)"
+                    "window.__messengerx_set_visible?.(true, 'window-event-focused')"
                 } else {
-                    "window.__messengerx_set_visible?.(false)"
+                    "window.__messengerx_set_visible?.(false, 'window-event-blurred')"
                 };
-                let _ = vis_webview.eval(js);
+                if let Err(e) = vis_webview.eval(js) {
+                    log::warn!(
+                        "[MessengerX][Visibility] Failed to eval focus-event visibility sync: {e}"
+                    );
+                }
             }
         });
 
@@ -794,32 +864,60 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let poll_webview = webview.clone();
         std::thread::spawn(move || {
             let Ok(initially_focused) = poll_webview.is_focused() else {
+                log::info!(
+                    "[MessengerX][Visibility] Poll thread exiting before start: is_focused() unavailable"
+                );
                 return;
             };
             let Ok(initially_minimized) = poll_webview.is_minimized() else {
+                log::info!(
+                    "[MessengerX][Visibility] Poll thread exiting before start: is_minimized() unavailable"
+                );
                 return;
             };
             let mut was_visible = initially_focused && !initially_minimized;
+            log::info!(
+                "[MessengerX][Visibility] Poll thread started: focused={} minimized={} visible={}",
+                initially_focused,
+                initially_minimized,
+                was_visible
+            );
 
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(
                     WINDOW_STATE_POLL_INTERVAL_MS,
                 ));
                 let Ok(is_focused) = poll_webview.is_focused() else {
+                    log::info!(
+                        "[MessengerX][Visibility] Poll thread exiting: is_focused() unavailable"
+                    );
                     break;
                 };
                 let Ok(is_minimized) = poll_webview.is_minimized() else {
+                    log::info!(
+                        "[MessengerX][Visibility] Poll thread exiting: is_minimized() unavailable"
+                    );
                     break;
                 };
                 let is_visible = is_focused && !is_minimized;
                 if is_visible != was_visible {
                     was_visible = is_visible;
+                    log::info!(
+                        "[MessengerX][Visibility] Poll state changed: focused={} minimized={} visible={}",
+                        is_focused,
+                        is_minimized,
+                        is_visible
+                    );
                     let js = if is_visible {
-                        "window.__messengerx_set_visible?.(true)"
+                        "window.__messengerx_set_visible?.(true, 'poll-focused-unminimized')"
                     } else {
-                        "window.__messengerx_set_visible?.(false)"
+                        "window.__messengerx_set_visible?.(false, 'poll-unfocused-or-minimized')"
                     };
-                    let _ = poll_webview.eval(js);
+                    if let Err(e) = poll_webview.eval(js) {
+                        log::warn!(
+                            "[MessengerX][Visibility] Failed to eval poll-based visibility sync: {e}"
+                        );
+                    }
                 }
             }
         });
