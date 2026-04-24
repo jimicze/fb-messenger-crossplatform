@@ -85,9 +85,9 @@ impl MessengerNotificationDelegate {
 pub fn initialize() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        return MACOS_NOTIFICATION_INIT
+        MACOS_NOTIFICATION_INIT
             .get_or_init(initialize_macos_notification_center)
-            .clone();
+            .clone()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -217,6 +217,7 @@ fn format_nserror(error: *mut NSError) -> Option<String> {
 }
 
 /// Dispatch a notification through `tauri-plugin-notification` (cross-platform).
+#[cfg(not(target_os = "macos"))]
 fn show_via_tauri_plugin(
     app: &AppHandle,
     title: &str,
@@ -295,11 +296,8 @@ fn show_via_notify_send(title: &str, body: &str, silent: bool) -> Result<(), Str
 /// - **macOS**: `"default"` plays the system notification sound.
 /// - **Linux**: `"message-new-instant"` uses the XDG sound theme.
 /// - **Windows**: `"Default"` plays the default Windows notification sound.
+#[cfg(not(target_os = "macos"))]
 fn default_sound() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "default"
-    }
     #[cfg(target_os = "linux")]
     {
         "message-new-instant"
@@ -324,6 +322,7 @@ fn build_macos_notification_identifier(tag: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_default_sound_returns_non_empty() {
         let sound = default_sound();
@@ -333,6 +332,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_default_sound_is_known_value() {
         let sound = default_sound();
