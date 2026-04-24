@@ -32,7 +32,7 @@ use block2::RcBlock;
 use objc2::{
     define_class, msg_send,
     rc::Retained,
-    runtime::{NSObject, ProtocolObject},
+    runtime::{Bool, NSObject, ProtocolObject},
     MainThreadOnly,
 };
 #[cfg(target_os = "macos")]
@@ -77,7 +77,7 @@ define_class!(
 impl MessengerNotificationDelegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm);
-        unsafe { msg_send![super(this), init] }
+        unsafe { msg_send![this, init] }
     }
 }
 
@@ -145,13 +145,9 @@ fn initialize_macos_notification_center() -> Result<(), String> {
     // so we intentionally leak the process-global delegate for the app lifetime.
     std::mem::forget(delegate);
 
-    let request_permission = RcBlock::new(|granted, error| {
-        if let Some(error) = NonNull::new(error) {
-            let error: &NSError = unsafe { error.as_ref() };
-            log::warn!(
-                "[MessengerX] macOS notification authorization request failed: {}",
-                error.localizedDescription()
-            );
+    let permission_handler = RcBlock::new(|granted: Bool, error: *mut NSError| {
+        if let Some(error) = format_nserror(error) {
+            log::warn!("[MessengerX] macOS notification authorization request failed: {error}");
         } else if !granted.as_bool() {
             log::warn!(
                 "[MessengerX] macOS notifications were denied in system settings; \
@@ -164,7 +160,7 @@ fn initialize_macos_notification_center() -> Result<(), String> {
         UNAuthorizationOptions::Alert
             | UNAuthorizationOptions::Sound
             | UNAuthorizationOptions::Badge,
-        &request_permission,
+        &permission_handler,
     );
 
     Ok(())
@@ -196,8 +192,24 @@ fn show_via_user_notifications(
     let identifier = NSString::from_str(&build_macos_notification_identifier(tag));
     let request =
         UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
-    center.addNotificationRequest_withCompletionHandler(&request, None);
+    let enqueue_identifier = identifier.to_string();
+    let enqueue_handler = RcBlock::new(move |error: *mut NSError| {
+        if let Some(error) = format_nserror(error) {
+            log::warn!(
+                "[MessengerX] Failed to enqueue macOS notification {enqueue_identifier}: {error}"
+            );
+        }
+    });
+    center.addNotificationRequest_withCompletionHandler(&request, Some(&enqueue_handler));
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn format_nserror(error: *mut NSError) -> Option<String> {
+    NonNull::new(error).map(|error| {
+        let error: &NSError = unsafe { error.as_ref() };
+        error.localizedDescription().to_string()
+    })
 }
 
 /// Dispatch a notification through `tauri-plugin-notification` (cross-platform).
