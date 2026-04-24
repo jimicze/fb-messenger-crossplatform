@@ -116,22 +116,26 @@ pub fn show_notification(
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        return show_via_user_notifications(title, body, tag, silent);
+        let _ = app;
+        show_via_user_notifications(title, body, tag, silent)
     }
 
-    // On Linux try notify-send first; fall back to tauri-plugin-notification.
-    #[cfg(target_os = "linux")]
-    match show_via_notify_send(title, body, silent) {
-        Ok(()) => return Ok(()),
-        Err(e) => {
-            log::warn!(
-                "notify-send unavailable or failed ({e}); \
-                 falling back to tauri-plugin-notification"
-            );
+    #[cfg(not(target_os = "macos"))]
+    {
+        // On Linux try notify-send first; fall back to tauri-plugin-notification.
+        #[cfg(target_os = "linux")]
+        match show_via_notify_send(title, body, silent) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                log::warn!(
+                    "notify-send unavailable or failed ({e}); \
+                     falling back to tauri-plugin-notification"
+                );
+            }
         }
-    }
 
-    show_via_tauri_plugin(app, title, body, tag, silent)
+        show_via_tauri_plugin(app, title, body, tag, silent)
+    }
 }
 
 #[cfg(target_os = "macos")]
