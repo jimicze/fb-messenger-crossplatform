@@ -76,6 +76,10 @@ const MAX_ZOOM: f64 = 1.2;
 /// Last known unread count; `u32::MAX` forces an update on first call.
 static LAST_UNREAD_COUNT: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// Last unread count for which we already sent a notification.
+/// Prevents duplicate notifications when the count stays the same across multiple calls.
+static LAST_NOTIFIED_COUNT: AtomicU32 = AtomicU32::new(0);
+
 // ---------------------------------------------------------------------------
 // IPC command implementations
 // ---------------------------------------------------------------------------
@@ -132,13 +136,65 @@ pub fn send_notification(
 ///
 /// Guards against redundant updates: if `count` equals the last-known value
 /// the function returns immediately to avoid tray-icon flicker (B5).
+///
+/// When the count **increases** and the main window is not focused a generic
+/// "New message" native notification is sent so the user is alerted even when
+/// Messenger's own JS `Notification` API is never triggered by WKWebView.
 #[tauri::command]
 pub fn update_unread_count(count: u32, app: AppHandle) -> Result<(), String> {
+    // Read old count BEFORE updating so we can detect an increase.
+    let old_count = LAST_UNREAD_COUNT.load(Ordering::SeqCst);
+
     // Early-exit if count is unchanged.
-    if LAST_UNREAD_COUNT.load(Ordering::SeqCst) == count {
+    if old_count == count {
         return Ok(());
     }
     LAST_UNREAD_COUNT.store(count, Ordering::SeqCst);
+
+    // -----------------------------------------------------------------------
+    // Fire a native notification when unread count increases while the window
+    // is not focused.  This is our primary notification path because Messenger
+    // on WKWebView never calls window.Notification() (confirmed v1.3.15).
+    // -----------------------------------------------------------------------
+    // Treat u32::MAX sentinel (initial value) as "no previous messages".
+    let real_old = if old_count == u32::MAX { 0 } else { old_count };
+    if count > real_old {
+        let settings = crate::services::auth::load_settings(&app).unwrap_or_default();
+        if settings.notifications_enabled {
+            let is_focused = app
+                .get_webview_window("main")
+                .and_then(|w| w.is_focused().ok())
+                .unwrap_or(false);
+            let last_notified = LAST_NOTIFIED_COUNT.load(Ordering::SeqCst);
+            if !is_focused && count > last_notified {
+                LAST_NOTIFIED_COUNT.store(count, Ordering::SeqCst);
+                let effective_silent = !settings.notification_sound;
+                let locale = crate::services::locale::detect_locale();
+                let tr = crate::services::locale::get_translations(&locale);
+                log::info!(
+                    "[MessengerX][Notification] unread count increased {} → {}; sending notification (silent={})",
+                    real_old,
+                    count,
+                    effective_silent,
+                );
+                if let Err(e) = crate::services::notification::show_notification(
+                    &app,
+                    &tr.notification_new_message,
+                    "",
+                    "messenger-unread",
+                    effective_silent,
+                ) {
+                    log::warn!("[MessengerX][Notification] unread-count notification failed: {e}");
+                }
+            }
+        }
+    }
+
+    // When the user reads messages (count drops to 0) reset the notified counter
+    // so the next increase fires again.
+    if count == 0 {
+        LAST_NOTIFIED_COUNT.store(0, Ordering::SeqCst);
+    }
 
     // Update tray tooltip.
     if let Some(tray) = app.tray_by_id("messengerx-tray") {

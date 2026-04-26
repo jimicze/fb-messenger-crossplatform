@@ -109,6 +109,10 @@ pub struct Translations {
     pub settings_appearance_dark: String,
     /// "Light" appearance option.
     pub settings_appearance_light: String,
+
+    // Unread-count triggered notifications
+    /// Title for the "new message" notification fired when unread count increases.
+    pub notification_new_message: String,
 }
 
 /// Returns the translation strings for the given locale code.
@@ -152,6 +156,7 @@ fn english() -> Translations {
         settings_appearance_system: "System".to_string(),
         settings_appearance_dark: "Dark".to_string(),
         settings_appearance_light: "Light".to_string(),
+        notification_new_message: "New message".to_string(),
     }
 }
 
@@ -188,6 +193,7 @@ fn czech() -> Translations {
         settings_appearance_system: "Syst\u{00e9}m".to_string(),
         settings_appearance_dark: "Tmav\u{00fd}".to_string(),
         settings_appearance_light: "Sv\u{011b}tl\u{00fd}".to_string(),
+        notification_new_message: "Nov\u{00e1} zpr\u{00e1}va".to_string(),
     }
 }
 
@@ -263,6 +269,7 @@ mod tests {
                 &t.settings_appearance_system,
                 &t.settings_appearance_dark,
                 &t.settings_appearance_light,
+                &t.notification_new_message,
             ];
             for (i, field) in fields.iter().enumerate() {
                 assert!(
