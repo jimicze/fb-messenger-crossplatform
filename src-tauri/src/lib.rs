@@ -14,12 +14,29 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 // JavaScript injection scripts
 // ---------------------------------------------------------------------------
 
-/// Overrides `window.Notification` so that browser notification calls are
-/// forwarded to Rust via `invoke('send_notification', …)`.
+/// Overrides `window.Notification` and `ServiceWorkerRegistration.showNotification`
+/// so that ALL browser notification calls (main-thread and SW-registration-based)
+/// are forwarded to Rust via `invoke('send_notification', …)`.
+///
+/// **Cesta A+B (v1.3.13):**
+/// - Cesta A (diagnostika): periodic 30s health-check, SW-register hook, controllerchange
+///   listener, prototype-level override logging — generates detailed diagnostics in
+///   `messengerx.log` so we can pinpoint whether Messenger uses `new Notification()`,
+///   `registration.showNotification()`, or a pure SW push that bypasses both.
+/// - Cesta B (spekulativní fix): intercepts `ServiceWorkerRegistration.prototype.showNotification`
+///   at document-start (before any Messenger JS executes) so calls from the main thread
+///   via `navigator.serviceWorker.ready.then(reg => reg.showNotification(…))` are
+///   forwarded to Rust instead of the browser's notification stack (which is unsupported
+///   in Tauri WebViews).
 ///
 /// Injected **at document-start** (before the page HTML is parsed).
 const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
 (function() {
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
     function jlog(msg) {
         try {
             window.__TAURI__.core.invoke('js_log', { message: '[NotificationJS] ' + msg });
@@ -34,42 +51,41 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
     function safeHasFocus() {
         try {
             return typeof document.hasFocus === 'function' ? document.hasFocus() : 'unknown';
-        } catch(_) {
-            return 'error';
+        } catch(_) { return 'error'; }
+    }
+
+    // Core: forward any notification to Rust over IPC.
+    // `source` is a short string that identifies which code path fired
+    // (e.g. '[window.Notification]' or '[SW.proto]') so logs are easy to grep.
+    function forwardToRust(title, options, source) {
+        try {
+            var body   = (options && options.body)   ? String(options.body)   : '';
+            var tag    = (options && options.tag)    ? String(options.tag)    : '';
+            var silent = (options && options.silent) ? Boolean(options.silent) : false;
+            jlog(
+                source + ' title='      + JSON.stringify(preview(title)) +
+                ' body='       + JSON.stringify(preview(body)) +
+                ' tag='        + JSON.stringify(preview(tag)) +
+                ' silent='     + String(silent) +
+                ' visibility=' + String(document.visibilityState) +
+                ' hidden='     + String(document.hidden) +
+                ' hasFocus='   + String(safeHasFocus())
+            );
+            window.__TAURI__.core.invoke('send_notification', {
+                title: title, body: body, tag: tag, silent: silent
+            }).then(function()  { jlog(source + ' IPC resolved'); })
+              .catch(function(e){ jlog(source + ' IPC rejected: ' + String(e)); });
+        } catch(e) {
+            jlog(source + ' forwardToRust error: ' + String(e));
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 1. window.Notification override
+    //    Catches `new Notification(title, options)` calls from main-thread JS.
+    // -----------------------------------------------------------------------
     window.Notification = function(title, options) {
-        try {
-            var body = options?.body || '';
-            var tag = options?.tag || '';
-            var silent = options?.silent || false;
-
-            jlog(
-                'constructor called: title=' + JSON.stringify(preview(title)) +
-                ' body=' + JSON.stringify(preview(body)) +
-                ' tag=' + JSON.stringify(preview(tag)) +
-                ' silent=' + String(silent) +
-                ' visibility=' + String(document.visibilityState) +
-                ' hidden=' + String(document.hidden) +
-                ' hasFocus=' + String(safeHasFocus())
-            );
-
-            window.__TAURI__.core.invoke('send_notification', {
-                title: title,
-                body: body,
-                tag: tag,
-                silent: silent
-            }).then(function() {
-                jlog('send_notification resolved');
-            }).catch(function(e) {
-                jlog('send_notification rejected: ' + e);
-                console.error('[MessengerX] Failed to send notification:', e);
-            });
-        } catch(e) {
-            jlog('constructor failed: ' + e);
-            console.error('[MessengerX] Failed to send notification:', e);
-        }
+        forwardToRust(title, options || {}, '[window.Notification]');
         return {
             close: function() {},
             addEventListener: function() {},
@@ -85,6 +101,122 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
     };
     window.Notification.__native__ = true;
     jlog('window.Notification override installed');
+
+    // -----------------------------------------------------------------------
+    // 2. ServiceWorkerRegistration.prototype.showNotification hook  [Cesta B]
+    //    Messenger may call `registration.showNotification()` from the main
+    //    thread (e.g. via `navigator.serviceWorker.ready.then(reg => …)`)
+    //    instead of `new Notification()`.  Hooking the prototype at
+    //    document-start ensures all current and future registration instances
+    //    are intercepted before any Messenger JS executes.
+    // -----------------------------------------------------------------------
+    try {
+        if (typeof ServiceWorkerRegistration !== 'undefined') {
+            var _origProtoShow = ServiceWorkerRegistration.prototype.showNotification;
+            ServiceWorkerRegistration.prototype.showNotification = function(title, options) {
+                jlog('[SW.proto] showNotification intercepted: title=' + JSON.stringify(preview(title)));
+                forwardToRust(title, options || {}, '[SW.proto]');
+                // Return a resolved Promise (matches the original API contract).
+                // We do NOT call _origProtoShow because Tauri WebViews lack a
+                // push-subscription endpoint, so the native call would silently
+                // fail — and calling it would attempt a double-notification on
+                // platforms where push notifications are partially supported.
+                return Promise.resolve();
+            };
+            jlog('ServiceWorkerRegistration.prototype.showNotification hooked');
+        } else {
+            jlog('ServiceWorkerRegistration not available (no SW support in this WebView)');
+        }
+    } catch(e) {
+        jlog('SW proto hook failed: ' + String(e));
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. navigator.serviceWorker.register hook  [Cesta A — diagnostika]
+    //    Logs every SW registration attempt (URL, scope) and fires when the
+    //    active SW changes controller so we can see which SW script Messenger
+    //    loads and whether it installs itself as the page controller.
+    // -----------------------------------------------------------------------
+    try {
+        if (navigator.serviceWorker) {
+            // Log already-registered SWs from previous page load (persisted).
+            navigator.serviceWorker.getRegistrations().then(function(regs) {
+                jlog(
+                    '[SW.existing] count=' + regs.length +
+                    (regs.length ? ' scope[0]=' + regs[0].scope : '')
+                );
+            }).catch(function(e) { jlog('[SW.existing] getRegistrations error: ' + String(e)); });
+
+            // Wrap register() to log every new SW registration.
+            var _origRegister = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+            navigator.serviceWorker.register = function(scriptURL, options) {
+                jlog('[SW.register] called: scriptURL=' + String(scriptURL));
+                var p = _origRegister(scriptURL, options);
+                p.then(function(reg) {
+                    jlog('[SW.register] resolved: scope=' + reg.scope + ' state=' + reg.active ? reg.active.state : 'no-active');
+                }).catch(function(e) { jlog('[SW.register] rejected: ' + String(e)); });
+                return p;
+            };
+            jlog('navigator.serviceWorker.register hooked');
+
+            // Log whenever a new SW takes control of this page.
+            navigator.serviceWorker.addEventListener('controllerchange', function() {
+                var ctrl = navigator.serviceWorker.controller;
+                jlog('[SW.controllerchange] new controller: ' + (ctrl ? ctrl.scriptURL : 'null') +
+                     ' state=' + (ctrl ? ctrl.state : 'n/a'));
+            });
+
+            // Log current controller at startup.
+            var ctrl0 = navigator.serviceWorker.controller;
+            jlog('[SW.controller@init] ' + (ctrl0 ? ctrl0.scriptURL + ' state=' + ctrl0.state : 'none'));
+
+        } else {
+            jlog('navigator.serviceWorker not available');
+        }
+    } catch(e) {
+        jlog('SW register hook failed: ' + String(e));
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Periodic health-check every 30 s  [Cesta A — diagnostika]
+    //    Emits a snapshot of all key notification signals to the Rust log so
+    //    that even if no notification fires we can verify the override is still
+    //    active and track SW state across the session.
+    // -----------------------------------------------------------------------
+    setInterval(function() {
+        try {
+            var notifPerm  = 'unknown';
+            var nativeFlag = 'unknown';
+            try {
+                notifPerm  = window.Notification ? window.Notification.permission : 'Notification-undef';
+                nativeFlag = window.Notification ? String(window.Notification.__native__) : 'Notification-undef';
+            } catch(_) {}
+
+            if (navigator.serviceWorker) {
+                navigator.serviceWorker.getRegistrations().then(function(regs) {
+                    var ctrl = navigator.serviceWorker.controller;
+                    jlog(
+                        '[health] permission='  + notifPerm +
+                        ' __native__='  + nativeFlag +
+                        ' visibility=' + String(document.visibilityState) +
+                        ' hasFocus='   + String(safeHasFocus()) +
+                        ' sw_regs='    + regs.length +
+                        ' sw_ctrl='    + (ctrl ? ctrl.scriptURL : 'none')
+                    );
+                }).catch(function(e) { jlog('[health] getRegistrations error: ' + String(e)); });
+            } else {
+                jlog(
+                    '[health] permission='  + notifPerm +
+                    ' __native__='  + nativeFlag +
+                    ' visibility=' + String(document.visibilityState) +
+                    ' hasFocus='   + String(safeHasFocus()) +
+                    ' sw=unavailable'
+                );
+            }
+        } catch(e) { jlog('[health] error: ' + String(e)); }
+    }, 30000);
+
+    jlog('init complete (v1.3.13 A+B)');
 })();
 "#;
 
