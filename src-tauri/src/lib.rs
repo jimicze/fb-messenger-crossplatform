@@ -2621,31 +2621,102 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     #[cfg(target_os = "linux")]
     mod linux_runtime {
-        use super::super::LINUX_APPIMAGE_ENV_OVERRIDES;
+        use super::super::{configure_linux_runtime_env, LINUX_APPIMAGE_ENV_OVERRIDES};
+        use std::env;
+        use std::sync::{Mutex, OnceLock};
 
-        #[test]
-        fn appimage_runtime_overrides_include_gio_guardrails() {
-            let keys: Vec<&str> = LINUX_APPIMAGE_ENV_OVERRIDES
+        fn env_lock() -> &'static Mutex<()> {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            ENV_LOCK.get_or_init(|| Mutex::new(()))
+        }
+
+        fn managed_env_keys() -> Vec<&'static str> {
+            let mut keys: Vec<&'static str> = LINUX_APPIMAGE_ENV_OVERRIDES
                 .iter()
                 .map(|(key, _)| *key)
                 .collect();
+            keys.push("APPIMAGE");
+            keys
+        }
 
-            assert!(
-                keys.contains(&"GIO_USE_VFS"),
-                "Linux AppImage runtime overrides must set GIO_USE_VFS"
-            );
-            assert!(
-                keys.contains(&"GSETTINGS_BACKEND"),
-                "Linux AppImage runtime overrides must set GSETTINGS_BACKEND"
-            );
-            assert!(
-                keys.contains(&"GIO_MODULE_DIR"),
-                "Linux AppImage runtime overrides must set GIO_MODULE_DIR"
-            );
-            assert!(
-                keys.contains(&"GIO_EXTRA_MODULES"),
-                "Linux AppImage runtime overrides must set GIO_EXTRA_MODULES"
-            );
+        struct EnvRestoreGuard {
+            original: Vec<(&'static str, Option<String>)>,
+        }
+
+        impl EnvRestoreGuard {
+            fn capture(keys: &[&'static str]) -> Self {
+                Self {
+                    original: keys
+                        .iter()
+                        .map(|key| (*key, env::var(key).ok()))
+                        .collect(),
+                }
+            }
+        }
+
+        impl Drop for EnvRestoreGuard {
+            fn drop(&mut self) {
+                for (key, value) in &self.original {
+                    match value {
+                        Some(value) => unsafe { env::set_var(key, value) },
+                        None => unsafe { env::remove_var(key) },
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn appimage_runtime_overrides_are_skipped_outside_appimage() {
+            let _guard = env_lock().lock().unwrap();
+            let keys = managed_env_keys();
+            let _restore = EnvRestoreGuard::capture(&keys);
+
+            for key in &keys {
+                unsafe { env::remove_var(key) };
+            }
+
+            configure_linux_runtime_env();
+
+            for (key, _) in LINUX_APPIMAGE_ENV_OVERRIDES.iter() {
+                assert!(
+                    env::var(key).is_err(),
+                    "configure_linux_runtime_env() must not set {key} outside AppImage"
+                );
+            }
+        }
+
+        #[test]
+        fn appimage_runtime_overrides_preserve_existing_operator_values() {
+            let _guard = env_lock().lock().unwrap();
+            let keys = managed_env_keys();
+            let _restore = EnvRestoreGuard::capture(&keys);
+
+            for key in &keys {
+                unsafe { env::remove_var(key) };
+            }
+            unsafe { env::set_var("APPIMAGE", "/tmp/MessengerX.AppImage") };
+
+            let preserved_key = LINUX_APPIMAGE_ENV_OVERRIDES[0].0;
+            unsafe { env::set_var(preserved_key, "operator-provided-value") };
+
+            configure_linux_runtime_env();
+
+            for (key, expected_value) in LINUX_APPIMAGE_ENV_OVERRIDES.iter() {
+                let actual_value =
+                    env::var(key).unwrap_or_else(|_| panic!("expected {key} to be set in AppImage"));
+
+                if *key == preserved_key {
+                    assert_eq!(
+                        actual_value, "operator-provided-value",
+                        "configure_linux_runtime_env() must preserve an existing {key} value"
+                    );
+                } else {
+                    assert_eq!(
+                        actual_value, *expected_value,
+                        "configure_linux_runtime_env() must populate {key} from LINUX_APPIMAGE_ENV_OVERRIDES when it is unset"
+                    );
+                }
+            }
         }
     }
 
