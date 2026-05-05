@@ -1152,6 +1152,17 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         .build()?;
 
+    // Windows 11 (notably on some ARM devices) may leave a freshly created
+    // WebView window in a non-activated state until the first user click.
+    // Explicitly foreground the main window on startup when we are not in
+    // "start minimized" mode.
+    #[cfg(target_os = "windows")]
+    if !settings.start_minimized {
+        let _ = webview.show();
+        let _ = webview.unminimize();
+        let _ = webview.set_focus();
+    }
+
     // ------------------------------------------------------------------
     // 4b. Apply persisted zoom level via the native WebView API.
     //     This scales the entire viewport (not just body content), so the
