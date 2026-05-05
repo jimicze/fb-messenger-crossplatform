@@ -1002,18 +1002,6 @@ pub fn run() {
                         let _ = window.unminimize();
                         let _ = window.set_focus();
                     }
-
-                    // A short delayed retry helps devices where activation is
-                    // still ignored on the first attempt.
-                    let delayed_handle = app_handle.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(350));
-                        if let Some(window) = delayed_handle.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
-                    });
                 }
             }
 
