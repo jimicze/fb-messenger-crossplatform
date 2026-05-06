@@ -47,7 +47,8 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 ///    time succeeds via IPC because we are now in the allowed origin context.
 ///
 /// Injected **at document-start** (before the page HTML is parsed).
-const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
+const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
+    r#"
 (function() {
 
     // -----------------------------------------------------------------------
@@ -337,9 +338,12 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
         jlog('postMessage listener installed (main frame)');
     }
 
-    if (window === window.top) { jlog('init complete (v1.3.15 A+B+C+D)'); }
+    if (window === window.top) { jlog('init complete (v"#,
+    env!("CARGO_PKG_VERSION"),
+    r#" A+B+C+D)'); }
 })();
-"#;
+"#,
+);
 
 /// Watches the document `<title>` for an unread-count prefix like `(3)` and
 /// forwards changes to Rust via `invoke('update_unread_count', …)`.
@@ -347,92 +351,954 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = r#"
 /// Also attempts to extract the first unread sender's name from the conversation
 /// list so the native notification can show the sender instead of "New message".
 ///
+/// For count > 0, the IPC send is deferred by ~500 ms so that React has time to
+/// update the conversation DOM before `getFirstUnreadSenderName()` runs. Before
+/// the deferred send fires, the title count is re-read; if it dropped to 0 the
+/// send is skipped (stale), and if it changed the latest count is sent instead.
+///
+/// **Activity signature** (`activitySig`): when the unread count stays the same
+/// (e.g. `(1) Messenger` → `(1) Messenger` after a second message in the same
+/// conversation) the title observer alone cannot detect the new message.
+///
+/// `activitySeq` is bumped only when **all** of these hold:
+/// - `count > 0`
+/// - A DOM snapshot of likely unread conversation link candidates
+///   (`getActivitySnapshot`) is non-empty and differs from `lastActivitySnapshot`
+///
+/// This avoids spamming the sequence counter on presence dots, typing indicators,
+/// read receipts, and other high-frequency UI churn that produces characterData /
+/// attribute mutations but does not represent a new message.
+///
+/// The MutationObserver is narrowed to `childList + subtree` only (no
+/// `attributes` / `characterData`) and debounced ~400 ms.  It observes
+/// the sidebar / conversation-list root — not the entire body.
+///
+/// **Unread candidate detection (composite heuristics):**
+/// - `aria-label` contains "unread" (existing)
+/// - numeric badge `<span>` inside container (existing)
+/// - `font-weight >= 600` on a `span[dir="auto"]` inside the link (new)
+/// - small colored dot element as an unread indicator (new)
+///
+/// **Signature format:** `"<count>:<seq>:<snapshot>"`
+/// where `snapshot` is the first 40 chars of `lastActivitySnapshot`.
+/// If `lastActivitySnapshot` is empty (no unread DOM candidates found yet),
+/// `buildSig` returns `''` so Rust treats it the same as count=0 (no new
+/// notification until a real snapshot is available).  This keeps the sig
+/// stable across title oscillations (1→0→1) when the snapshot does not change,
+/// preventing the `zero-bounce-sig-changed` Rust path from firing repeatedly.
+///
+/// **Zero-timer:** when count drops to 0, a ~7 s timer is started.  The
+/// `lastActivitySnapshot` / `lastSentSig` baseline is preserved during that
+/// window so transient title bounces don't erase it.  The state is only fully
+/// reset when zero persists for >7 s **or** when the window is focused while
+/// count=0 (user has seen/read the messages).  The IPC still sends
+/// `activitySig=""` immediately when count=0 (empty snapshot also yields `""`).
+///
+/// Optimistic `lastSentSig` update: set immediately before `setTimeout` fires
+/// to prevent duplicate scheduling for the same sig; cleared/reverted if the
+/// delayed send is skipped because count dropped to 0.
+///
 /// Injected at document-start; waits for DOM via `DOMContentLoaded`.
 const UNREAD_OBSERVER_SCRIPT: &str = r#"
 (function() {
+    function jlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[UnreadJS] ' + msg });
+        } catch(_) {}
+    }
+
     function getUnreadCountFromTitle() {
         var title = document.title;
         var match = title.match(/^\((\d+)\)/);
         return match ? parseInt(match[1], 10) : 0;
     }
-    // Try to read the first unread sender's name from the conversation list.
-    // Best-effort — returns '' on failure; Rust falls back to "New message".
+
+    // ---------------------------------------------------------------------------
+    // Composite unread-signal detection for a single link element.
+    // Returns an object: { isUnread: bool, hasBadge: bool, hasBold: bool, hasDot: bool }
+    // ---------------------------------------------------------------------------
+    function detectUnreadSignals(link) {
+        var ariaLabel = (link.getAttribute('aria-label') || '').trim();
+        var isUnreadViaAria = ariaLabel.toLowerCase().indexOf('unread') !== -1;
+
+        // Signal 2: small numeric badge in parent container.
+        var hasNumericBadge = false;
+        var container = link.parentElement || link;
+        var allSpans = container.querySelectorAll('span');
+        for (var s = 0; s < allSpans.length; s++) {
+            if (/^\d{1,3}$/.test(allSpans[s].textContent.trim())
+                    && allSpans[s].children.length === 0) {
+                hasNumericBadge = true;
+                break;
+            }
+        }
+
+        // Signal 3: font-weight >= 600 on a span[dir="auto"] inside the link.
+        var hasBold = false;
+        var autoSpans = link.querySelectorAll('span[dir="auto"]');
+        for (var b = 0; b < autoSpans.length; b++) {
+            var spanText = autoSpans[b].textContent.trim();
+            if (spanText.length < 1 || /^\d+$/.test(spanText)) continue;
+            try {
+                var fw = parseInt(window.getComputedStyle(autoSpans[b]).fontWeight, 10);
+                if (!isNaN(fw) && fw >= 600) { hasBold = true; break; }
+            } catch(_) {}
+        }
+
+        // Signal 4: small colored dot — look for a sibling/descendant element
+        // that is roughly square (≤16 px), has no text, and has a non-transparent
+        // background color that is not white/black/grey (i.e. accent color dot).
+        var hasDot = false;
+        try {
+            var dotCandidates = container.querySelectorAll('*');
+            for (var d = 0; d < Math.min(dotCandidates.length, 60); d++) {
+                var el = dotCandidates[d];
+                if (el.textContent.trim().length > 0) continue;
+                var rect = el.getBoundingClientRect();
+                if (rect.width < 4 || rect.width > 18 || rect.height < 4 || rect.height > 18) continue;
+                if (Math.abs(rect.width - rect.height) > 6) continue;
+                try {
+                    var bg = window.getComputedStyle(el).backgroundColor;
+                    // Match rgb(r,g,b) or rgba(r,g,b,a) with non-trivial saturation.
+                    var m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                    if (m) {
+                        var r = parseInt(m[1],10), g = parseInt(m[2],10), bv = parseInt(m[3],10);
+                        var mn = Math.min(r,g,bv), mx = Math.max(r,g,bv);
+                        // Saturation proxy: max-min > 40 and not near-white (mx>50).
+                        if (mx > 50 && (mx - mn) > 40) { hasDot = true; break; }
+                    }
+                } catch(_) {}
+            }
+        } catch(_) {}
+
+        return {
+            isUnread: isUnreadViaAria || hasNumericBadge || hasBold || hasDot,
+            hasAria: isUnreadViaAria,
+            hasBadge: hasNumericBadge,
+            hasBold: hasBold,
+            hasDot: hasDot,
+            ariaLabel: ariaLabel
+        };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Extract name from a link that has been deemed unread.
+    // Priority: aria-label first segment, then first plausible span[dir="auto"] text.
+    // ---------------------------------------------------------------------------
+    function extractNameFromLink(link, signals) {
+        // From aria-label first segment.
+        if (signals.hasAria && signals.ariaLabel.length >= 1) {
+            var namePart = signals.ariaLabel.split(',')[0].trim();
+            if (namePart.length >= 1 && namePart.length <= 80
+                    && namePart.toLowerCase().indexOf('messenger') === -1) {
+                return namePart;
+            }
+        }
+        // From first non-numeric span[dir="auto"].
+        var autoSpans = link.querySelectorAll('span[dir="auto"]');
+        for (var j = 0; j < autoSpans.length; j++) {
+            var text = autoSpans[j].textContent.trim();
+            if (text.length >= 1 && text.length <= 80 && !/^\d+$/.test(text)
+                    && text.toLowerCase().indexOf('messenger') === -1) {
+                return text;
+            }
+        }
+        return '';
+    }
+
+    // ---------------------------------------------------------------------------
+    // getAllThreadLinks() — expanded link selector that covers all thread URL patterns.
+    // De-duplicated by href to avoid processing the same link multiple times.
+    // Used in getActivitySnapshot() and getFirstUnreadSenderName().
+    // ---------------------------------------------------------------------------
+    function getAllThreadLinks() {
+        var seen = {};
+        var result = [];
+        var selectors = [
+            'a[href*="/t/"]',
+            'a[href*="/e2ee/"]',
+            'a[href*="thread_fbid"]',
+            '[role="link"][tabindex]'
+        ];
+        for (var si = 0; si < selectors.length; si++) {
+            try {
+                var nodes = document.querySelectorAll(selectors[si]);
+                for (var ni = 0; ni < nodes.length; ni++) {
+                    var node = nodes[ni];
+                    var key = (node.getAttribute('href') || '') + '||' + (node.getAttribute('data-key') || ni);
+                    if (!seen[key]) {
+                        seen[key] = true;
+                        result.push(node);
+                    }
+                }
+            } catch(_) {}
+        }
+        return result;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Sender lookup — only returns a name when a confirmed unread signal exists.
+    // Does NOT fall back to the first conversation; that risks wrong sender name.
+    // Uses expanded link selectors via getAllThreadLinks().
+    // ---------------------------------------------------------------------------
     function getFirstUnreadSenderName() {
         try {
-            var links = document.querySelectorAll('a[href*="/t/"]');
+            var links = getAllThreadLinks();
             for (var i = 0; i < Math.min(links.length, 10); i++) {
-                var link = links[i];
-                // 1) aria-label often includes "unread" and the name
-                var ariaLabel = link.getAttribute('aria-label') || '';
-                if (ariaLabel.toLowerCase().includes('unread')) {
-                    var namePart = ariaLabel.split(',')[0].trim();
-                    if (namePart && namePart.length >= 1 && namePart.length <= 80
-                            && !namePart.toLowerCase().includes('messenger')) {
-                        return namePart;
-                    }
-                }
-                // 2) Look for a small numeric unread badge inside the link's container
-                var parent = link.parentElement || link;
-                var spans = parent.querySelectorAll('span');
-                var hasUnreadBadge = false;
-                for (var s = 0; s < spans.length; s++) {
-                    if (/^\d{1,3}$/.test(spans[s].textContent.trim())
-                            && spans[s].children.length === 0) {
-                        hasUnreadBadge = true;
-                        break;
-                    }
-                }
-                if (hasUnreadBadge) {
-                    var nameSpans = link.querySelectorAll('span[dir="auto"]');
-                    for (var j = 0; j < nameSpans.length; j++) {
-                        var text = nameSpans[j].textContent.trim();
-                        if (text.length >= 1 && text.length <= 80 && !/^\d+$/.test(text)) {
-                            return text;
-                        }
-                    }
-                }
-            }
-            // 3) Fallback: first conversation link name
-            if (links.length > 0) {
-                var nameSpans2 = links[0].querySelectorAll('span[dir="auto"]');
-                for (var k = 0; k < nameSpans2.length; k++) {
-                    var t = nameSpans2[k].textContent.trim();
-                    if (t.length >= 1 && t.length <= 80 && !/^\d+$/.test(t)) {
-                        return t;
-                    }
-                }
+                var sig = detectUnreadSignals(links[i]);
+                if (!sig.isUnread) continue;
+                var name = extractNameFromLink(links[i], sig);
+                if (name.length >= 1) return name;
             }
         } catch(e) {}
         return '';
     }
-    function sendUnreadCount(count) {
+
+    // ---------------------------------------------------------------------------
+    // Activity snapshot — best-effort fingerprint of plausible unread DOM content.
+    //
+    // Returns '' when count === 0 or when no meaningful unread text can be found
+    // (prevents UI-only mutations from bumping the sequence).
+    //
+    // Uses composite unread-signal detection (aria + badge + bold + dot).
+    // Throttled diagnostics when 0 candidates found.
+    // Uses getAllThreadLinks() for expanded selector coverage.
+    // ---------------------------------------------------------------------------
+    var _lastDiagCount = -1;
+    var _lastDiagLinkCount = -1;
+    var _lastDiagTs = 0;
+
+    // ---------------------------------------------------------------------------
+    // Thread mutation sequence — counts meaningful DOM additions in the active
+    // thread area so that follow-up messages from the same author (no sidebar
+    // change) still cause activitySig to change while the app is unfocused.
+    //
+    // Design:
+    //  - threadMutSeq is a monotonically increasing integer, appended as "||M<n>"
+    //    to the activity snapshot when > 0.
+    //  - tryBumpThreadMutSeq() is called from the thread MutationObserver callback
+    //    with the accumulated mutation records.  It bumps only when:
+    //      1. currentCount > 0 (unread messages exist)
+    //      2. cooldown since last bump has passed (THREAD_MUT_COOLDOWN_MS)
+    //      3. session budget not exceeded (THREAD_MUT_MAX_PER_SESSION)
+    //      4. at least one added node has meaningful text/content and is NOT a
+    //         date/time label or system message label (deepHasSubstance check).
+    //  - threadMutSeq and lastThreadMutSeqAt are reset in resetActivityState().
+    //
+    // The old getThreadFingerprint() text snapshot is replaced by this counter.
+    // Date/time labels that previously created a "stable but misleading" snapshot
+    // (e.g. rows=1 last="2:07") can no longer affect activitySig.
+    // ---------------------------------------------------------------------------
+    var THREAD_MUT_COOLDOWN_MS = 1200;
+    var THREAD_MUT_MAX_PER_SESSION = 120;
+    var threadMutSeq = 0;
+    var lastThreadMutSeqAt = 0;
+
+    // Diagnostics for thread root — capped to avoid log spam.
+    var _threadDiagSampleCount = 0;
+    var _threadDiagMaxSamples = 6;
+    var _threadDiagLastTs = 0;
+    var _threadDiagThrottleMs = 15000;
+
+    function emitThreadDiag(threadRoot) {
         try {
-            var sender = count > 0 ? getFirstUnreadSenderName() : '';
-            window.__TAURI__.core.invoke('update_unread_count', { count: count, sender: sender });
-        } catch(e) { console.error('[MessengerX] Failed to send unread count:', e); }
+            var now = Date.now();
+            if (_threadDiagSampleCount >= _threadDiagMaxSamples) return;
+            if ((now - _threadDiagLastTs) < _threadDiagThrottleMs) return;
+            _threadDiagSampleCount++;
+            _threadDiagLastTs = now;
+            var roleMain = document.querySelectorAll('[role="main"]').length;
+            var rolePresentation = document.querySelectorAll('[role="presentation"]').length;
+            var msgTable = document.querySelectorAll('[data-scope="messages_table"]').length;
+            var shadowHosts = 0;
+            try {
+                var all = (threadRoot || document.body).querySelectorAll('*');
+                for (var si2 = 0; si2 < Math.min(all.length, 200); si2++) {
+                    if (all[si2].shadowRoot) shadowHosts++;
+                }
+            } catch(_) {}
+            jlog('[ThreadDiag #' + _threadDiagSampleCount + '] '
+                + 'role=main:' + roleMain
+                + ' role=presentation:' + rolePresentation
+                + ' messages_table:' + msgTable
+                + ' shadowHosts:' + shadowHosts
+                + (threadRoot ? ' root=' + (threadRoot.getAttribute('data-scope') || threadRoot.getAttribute('role') || threadRoot.tagName) : ' root=none'));
+        } catch(_) {}
     }
+
+    // Returns true if text looks like a date, time, or system/event label
+    // rather than an actual chat message.
+    function isDateOrSystemLabelText(txt) {
+        if (!txt || txt.length === 0) return true;
+        // Pure time: "2:07", "8:41 AM", "12:00 PM", "Ne 8:41", "So 12:00"
+        // Day-time prefix: two-letter or three-letter day abbreviation + time
+        if (/^[A-Za-z\u00C0-\u024F]{1,3}\s+\d{1,2}:\d{2}/.test(txt)) return true;
+        if (/^\d{1,2}:\d{2}(\s*(AM|PM))?$/.test(txt)) return true;
+        // Common day/date labels: "Monday", "Yesterday", "Today", short dates
+        if (/^(Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)$/i.test(txt)) return true;
+        // Short numeric date: "1/2", "12.3.", "Apr 2"
+        if (/^\d{1,2}[./]\d{1,2}\.?$/.test(txt)) return true;
+        if (/^[A-Za-z]{3}\s+\d{1,2}$/.test(txt)) return true;
+        // Single emoji or punctuation only
+        if (/^[\u2000-\uFFFF\s.,:!?]{1,3}$/.test(txt)) return true;
+        // Typing indicator patterns
+        if (/^[.\u2026]{1,5}$/.test(txt)) return true;
+        return false;
+    }
+
+    // Returns true if an added DOM node has substantial content:
+    // - Is an element with non-trivial inner text that is not a date/system label.
+    // - OR is a non-empty text node child of such an element.
+    function nodeHasSubstance(node) {
+        try {
+            if (node.nodeType === 3) {
+                // Text node
+                var t = node.textContent.replace(/\s+/g, ' ').trim();
+                return t.length >= 2 && !isDateOrSystemLabelText(t);
+            }
+            if (node.nodeType !== 1) return false;
+            // Element node: check its text content
+            var txt = node.textContent.replace(/\s+/g, ' ').trim();
+            if (txt.length < 2 || txt.length > 600) return false;
+            if (isDateOrSystemLabelText(txt)) return false;
+            // Skip obvious typing indicators
+            if (/^[.\u2026\s]{1,5}$/.test(txt)) return false;
+            return true;
+        } catch(_) { return false; }
+    }
+
+    // deepHasSubstance: like nodeHasSubstance but also checks descendants up to
+    // `depth` levels deep. Allows wrapper nodes to pass if their children have
+    // meaningful content. Skips date/time/system labels and typing indicators.
+    function deepHasSubstance(node, depth) {
+        if (depth === undefined) depth = 3;
+        if (nodeHasSubstance(node)) return true;
+        if (depth <= 0 || node.nodeType !== 1) return false;
+        try {
+            var children = node.childNodes;
+            for (var ci = 0; ci < Math.min(children.length, 12); ci++) {
+                if (deepHasSubstance(children[ci], depth - 1)) return true;
+            }
+        } catch(_) {}
+        return false;
+    }
+
+    // Called from the thread MutationObserver callback (after debounce).
+    // Bumps threadMutSeq if conditions are met, returns true if bumped.
+    function tryBumpThreadMutSeq(mutationsList, currentCount) {
+        if (currentCount <= 0) {
+            // jlog('[ThreadMut] skip: count=0');
+            return false;
+        }
+        var now = Date.now();
+        if ((now - lastThreadMutSeqAt) < THREAD_MUT_COOLDOWN_MS) {
+            jlog('[ThreadMut] skip: cooldown remaining=' + (THREAD_MUT_COOLDOWN_MS - (now - lastThreadMutSeqAt)) + 'ms');
+            return false;
+        }
+        if (threadMutSeq >= THREAD_MUT_MAX_PER_SESSION) {
+            jlog('[ThreadMut] skip: budget exhausted (' + THREAD_MUT_MAX_PER_SESSION + ')');
+            return false;
+        }
+        // Check for at least one meaningful added node using deepHasSubstance
+        var foundSubstantial = false;
+        for (var mi = 0; mi < mutationsList.length && !foundSubstantial; mi++) {
+            var added = mutationsList[mi].addedNodes;
+            for (var ai = 0; ai < added.length && !foundSubstantial; ai++) {
+                if (deepHasSubstance(added[ai], 3)) {
+                    foundSubstantial = true;
+                }
+            }
+        }
+        if (!foundSubstantial) {
+            jlog('[ThreadMut] skip: no substantial added nodes in ' + mutationsList.length + ' mutations');
+            return false;
+        }
+        threadMutSeq++;
+        lastThreadMutSeqAt = now;
+        jlog('[ThreadMut] bumped seq=' + threadMutSeq + ' count=' + currentCount);
+        return true;
+    }
+
+    function getActivitySnapshot(count) {
+        if (count === 0) return '';
+        try {
+            var parts = [];
+            var links = getAllThreadLinks();
+            var checked = 0;
+            for (var i = 0; i < links.length && checked < 5; i++) {
+                var link = links[i];
+                var signals = detectUnreadSignals(link);
+                if (!signals.isUnread) continue;
+                checked++;
+                // Normalise: aria-label if available, else first dir="auto" span text.
+                var label = '';
+                if (signals.hasAria && signals.ariaLabel.length >= 2
+                        && signals.ariaLabel.length <= 200) {
+                    label = signals.ariaLabel;
+                } else {
+                    var autoSpans = link.querySelectorAll('span[dir="auto"]');
+                    for (var j = 0; j < autoSpans.length; j++) {
+                        var t = autoSpans[j].textContent.replace(/\s+/g, ' ').trim();
+                        if (t.length >= 2 && t.length <= 100 && !/^\d+$/.test(t)) {
+                            label = t;
+                            break;
+                        }
+                    }
+                }
+                if (label.length >= 2) {
+                    parts.push(label.slice(0, 100));
+                }
+            }
+            if (parts.length === 0) {
+                // Throttled diagnostics: log only when count/linkCount changes or >5 s elapsed.
+                var now = Date.now();
+                if (count !== _lastDiagCount
+                        || links.length !== _lastDiagLinkCount
+                        || (now - _lastDiagTs) > 5000) {
+                    _lastDiagCount = count;
+                    _lastDiagLinkCount = links.length;
+                    _lastDiagTs = now;
+                    var diagParts = [];
+                    for (var di = 0; di < Math.min(links.length, 5); di++) {
+                        var dl = links[di];
+                        var dhref = (dl.getAttribute('href') || '').slice(0, 40);
+                        var daria = (dl.getAttribute('aria-label') || '').slice(0, 60);
+                        var dspans = dl.querySelectorAll('span[dir="auto"]');
+                        var dspan0 = dspans.length > 0
+                            ? dspans[0].textContent.trim().slice(0, 30) : '';
+                        var dsig = detectUnreadSignals(dl);
+                        var dfw = '';
+                        if (dspans.length > 0) {
+                            try {
+                                dfw = window.getComputedStyle(dspans[0]).fontWeight;
+                            } catch(_) { dfw = '?'; }
+                        }
+                        diagParts.push('[' + di + '] href=' + dhref
+                            + ' aria=' + JSON.stringify(daria)
+                            + ' span0=' + JSON.stringify(dspan0)
+                            + ' fw=' + dfw
+                            + ' badge=' + dsig.hasBadge
+                            + ' bold=' + dsig.hasBold
+                            + ' dot=' + dsig.hasDot);
+                    }
+                    jlog('[Activity] 0 candidates count=' + count
+                        + ' links=' + links.length
+                        + (diagParts.length ? '\n  ' + diagParts.join('\n  ') : ''));
+                }
+                // Append mutation counter (if any) so same-author follow-ups
+                // still change the snapshot even with 0 sidebar candidates.
+                if (threadMutSeq > 0) {
+                    return '||M' + threadMutSeq;
+                }
+                return '';
+            }
+            var joined = parts.join('|').slice(0, 260);
+            // Append thread mutation counter when it has been bumped.
+            if (threadMutSeq > 0) {
+                joined = (joined + '||M' + threadMutSeq).slice(0, 300);
+            }
+            jlog('[Activity] snapshot candidates=' + parts.length
+                + (threadMutSeq > 0 ? ' +M' + threadMutSeq : '')
+                + ' snapshot=' + JSON.stringify(joined.slice(0, 80)));
+            return joined;
+        } catch(e) { jlog('[Activity] getActivitySnapshot failed: ' + String(e)); }
+        return '';
+    }
+
+    // ---------------------------------------------------------------------------
+    // Activity signature tracking.
+    //
+    // `activitySeq` is bumped ONLY when count > 0 AND the DOM snapshot has
+    // changed from `lastActivitySnapshot`.  This prevents high-frequency UI
+    // mutations (presence dots, typing, read-receipts) from spamming the counter.
+    //
+    // Signature format: "<count>:<seq>:<snapshot>"
+    //   - snapshot: first 40 chars of lastActivitySnapshot, or '' when empty.
+    //     An empty snapshot produces an empty sig (same as count=0) so that
+    //     title oscillation (1→0→1) with no snapshot change does not alter
+    //     the sig and cannot trigger repeated notifications.
+    //   - When snapshot is non-empty and changes (new message in same count),
+    //     activitySeq is incremented so the sig changes and Rust will notify.
+    //
+    // Zero-timer: when count drops to 0, preserve baseline for ~7 s so transient
+    // title bounces don't erase it.  Reset fully only after 7 s or when focused.
+    // ---------------------------------------------------------------------------
+    var activitySeq = 0;
+    var lastActivitySnapshot = '';
+    var lastSentSig = '';
+    var activityDebounceTimer = null;
+    var zeroTimer = null;
+    var lastRisingEdgeBucket = 0;   // set on 0→positive transition — logged only, not in sig
+    var prevTitleCount = 0;         // track previous count for rising-edge logging
+
+    function coarseBucket() {
+        return Math.floor(Date.now() / 2000);
+    }
+
+    // Call this whenever count transitions from 0 → positive.
+    function markRisingEdge(newCount) {
+        if (prevTitleCount === 0 && newCount > 0) {
+            lastRisingEdgeBucket = coarseBucket();
+            jlog('[Activity] risingEdge bucket=' + lastRisingEdgeBucket);
+        }
+        prevTitleCount = newCount;
+    }
+
+    // Build sig. Format: "<count>:<seq>:<snapshot>"
+    // Returns '' when count === 0 OR when lastActivitySnapshot is empty
+    // (no unread DOM candidates yet).  An empty sig is stable across title
+    // oscillations so Rust will not fire zero-bounce-sig-changed repeatedly.
+    function buildSig(count) {
+        if (count === 0) return '';
+        if (lastActivitySnapshot.length === 0) return '';
+        var sig = count + ':' + activitySeq + ':' + lastActivitySnapshot.slice(0, 40);
+        return sig;
+    }
+
+    // Soft reset: clear seq/snapshot but keep lastSentSig so Rust doesn't re-notify.
+    // Called after the zero-timer fires or on focused-zero.
+    function resetActivityState() {
+        activitySeq = 0;
+        lastActivitySnapshot = '';
+        lastSentSig = '';
+        lastRisingEdgeBucket = 0;
+        prevTitleCount = 0;
+        threadMutSeq = 0;
+        lastThreadMutSeqAt = 0;
+        _threadDiagSampleCount = 0;
+        _threadDiagLastTs = 0;
+        if (activityDebounceTimer !== null) {
+            clearTimeout(activityDebounceTimer);
+            activityDebounceTimer = null;
+        }
+        if (zeroTimer !== null) {
+            clearTimeout(zeroTimer);
+            zeroTimer = null;
+        }
+        jlog('[Activity] resetActivityState — seq/snapshot/sig/threadMut cleared');
+    }
+
+    // Called when count becomes 0. Starts zero-timer but does NOT immediately
+    // clear baseline so transient bounces don't lose it.
+    function scheduleZeroReset() {
+        if (zeroTimer !== null) return; // already pending
+        zeroTimer = setTimeout(function() {
+            zeroTimer = null;
+            var currentCount = getUnreadCountFromTitle();
+            if (currentCount === 0) {
+                jlog('[Activity] zeroTimer fired — resetting baseline (zero persisted)');
+                resetActivityState();
+            } else {
+                jlog('[Activity] zeroTimer fired but count=' + currentCount + ' — keeping baseline');
+            }
+        }, 7000);
+        jlog('[Activity] zeroTimer scheduled (7 s)');
+    }
+
+    // Cancel the zero-timer when count goes back positive (bounce recovery).
+    function cancelZeroTimer() {
+        if (zeroTimer !== null) {
+            clearTimeout(zeroTimer);
+            zeroTimer = null;
+            jlog('[Activity] zeroTimer cancelled (count went positive)');
+        }
+    }
+
+    function refreshActivitySnapshot() {
+        var currentCount = getUnreadCountFromTitle();
+        if (currentCount === 0) return;
+        var snap = getActivitySnapshot(currentCount);
+        if (snap.length === 0) return;
+        if (snap !== lastActivitySnapshot) {
+            if (lastActivitySnapshot.length === 0) {
+                // Establish a baseline only. The first non-empty snapshot often
+                // appears after the count-triggered notification already fired;
+                // treating that as new activity would duplicate the first alert.
+                lastActivitySnapshot = snap;
+                // Update lastSentSig to the baseline sig so the polling fallback
+                // does not immediately fire a duplicate because sig became non-empty
+                // after the count-increase notification already went out.
+                lastSentSig = buildSig(currentCount);
+                jlog('[Activity] baseline established count=' + currentCount
+                    + ' snapshot=' + JSON.stringify(snap.slice(0, 60))
+                    + ' baselineSig=' + JSON.stringify(lastSentSig));
+                return;
+            }
+            lastActivitySnapshot = snap;
+            activitySeq++;
+            jlog('[Activity] activitySeq=' + activitySeq
+                + ' count=' + currentCount
+                + ' snapshot=' + JSON.stringify(snap.slice(0, 60)));
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Shared mutation callback path for all observers (sidebar, thread, body
+    // fallback, shadow DOM).  Accumulates mutations into _pendingThreadMutations
+    // and drives the debounce+bump path.
+    // ---------------------------------------------------------------------------
+    var _pendingThreadMutations = [];
+    var _threadMutDebounceTimer = null;
+
+    // Pre-filter for body-level fallback observer: only pass mutations that
+    // are plausibly relevant (ancestors include thread/main/messages_table/
+    // presentation roles, or the target itself is a thread-related role).
+    function _isRelevantMutation(mutation) {
+        try {
+            var node = mutation.target;
+            for (var depth = 0; depth < 8 && node && node !== document.body; depth++) {
+                var role = node.getAttribute ? (node.getAttribute('role') || '') : '';
+                var ds = node.getAttribute ? (node.getAttribute('data-scope') || '') : '';
+                if (role === 'main' || role === 'presentation' || role === 'complementary'
+                        || role === 'navigation' || ds === 'messages_table') {
+                    return true;
+                }
+                node = node.parentElement;
+            }
+        } catch(_) {}
+        return false;
+    }
+
+    function _processMutationBatch(mutationsList, fromSource) {
+        // Accumulate mutations for the debounce window.
+        for (var i = 0; i < mutationsList.length; i++) {
+            _pendingThreadMutations.push(mutationsList[i]);
+        }
+        // Debounce: wait THREAD_MUT_COOLDOWN_MS before processing.
+        if (_threadMutDebounceTimer !== null) {
+            clearTimeout(_threadMutDebounceTimer);
+        }
+        _threadMutDebounceTimer = setTimeout(function() {
+            _threadMutDebounceTimer = null;
+            var batch = _pendingThreadMutations;
+            _pendingThreadMutations = [];
+            var currentCount = getUnreadCountFromTitle();
+            jlog('[ThreadMut] batch size=' + batch.length + ' source=' + fromSource + ' count=' + currentCount);
+            var bumped = tryBumpThreadMutSeq(batch, currentCount);
+            if (bumped) {
+                refreshActivitySnapshot();
+            }
+        }, THREAD_MUT_COOLDOWN_MS);
+    }
+
+    // Bump activitySeq when conversation-list or active-thread childList changes
+    // while count > 0. Narrowed to childList+subtree only — avoids attribute /
+    // characterData churn from presence dots, typing indicators, read receipts.
+    // Debounced 400 ms so that a burst of React reconciliation mutations only
+    // triggers one snapshot comparison.
+    //
+    // Observers installed:
+    //  1. Sidebar (navigation/complementary) — existing conversation-list watcher.
+    //  2. Thread area ([data-scope="messages_table"] or [role="main"]) — so that
+    //     follow-up messages from the same author change the fingerprint even when
+    //     the sidebar does not update.
+    //  3. Body-level fallback observer — catches mutations outside thread/sidebar
+    //     with pre-filter for relevant ancestors.
+    //  4. Shadow DOM observer chaining — observes shadow roots under thread/body.
+    //
+    // Guards: we tag observed nodes with a JS property so we never install
+    // multiple observers on the same node. The thread observer uses retry
+    // (via setInterval) because Messenger SPA may mount the thread root later.
+
+    var _threadObserverInstalled = false;
+    var _threadObserverRetryTimer = null;
+    var _bodyFallbackInstalled = false;
+    var _installedShadowRoots = [];
+
+    function _makeDebounced() {
+        return function() {
+            if (activityDebounceTimer !== null) {
+                clearTimeout(activityDebounceTimer);
+            }
+            activityDebounceTimer = setTimeout(function() {
+                activityDebounceTimer = null;
+                refreshActivitySnapshot();
+            }, 400);
+        };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Shadow DOM observer chaining
+    // Detect shadowRoot hosts under threadRoot/body and observe them with the
+    // same mutation path. Avoid duplicate installs via _installedShadowRoots set.
+    // ---------------------------------------------------------------------------
+    function tryObserveShadowRoots(scopeEl) {
+        if (!scopeEl) return;
+        try {
+            var all = scopeEl.querySelectorAll('*');
+            for (var si3 = 0; si3 < Math.min(all.length, 300); si3++) {
+                var host = all[si3];
+                if (host.shadowRoot && _installedShadowRoots.indexOf(host) === -1) {
+                    _installedShadowRoots.push(host);
+                    var shadowObs = new MutationObserver(function(muts) {
+                        _processMutationBatch(muts, 'shadow');
+                    });
+                    shadowObs.observe(host.shadowRoot, { childList: true, subtree: true });
+                    jlog('[Activity] shadow observer installed on ' + (host.tagName || 'unknown'));
+                }
+            }
+        } catch(_) {}
+    }
+
+    function tryInstallThreadObserver() {
+        if (_threadObserverInstalled) return;
+        try {
+            var threadRoot = document.querySelector('[data-scope="messages_table"]')
+                           || document.querySelector('[role="main"]');
+            if (!threadRoot) return; // not mounted yet — retry will fire again
+            if (threadRoot._mxThreadObserverInstalled) return; // already tagged
+            threadRoot._mxThreadObserverInstalled = true;
+            _threadObserverInstalled = true;
+            if (_threadObserverRetryTimer !== null) {
+                clearInterval(_threadObserverRetryTimer);
+                _threadObserverRetryTimer = null;
+            }
+            emitThreadDiag(threadRoot);
+            var threadObserver = new MutationObserver(function(mutationsList) {
+                _processMutationBatch(mutationsList, 'thread');
+            });
+            threadObserver.observe(threadRoot, {
+                childList: true,
+                subtree: true
+            });
+            jlog('[Activity] thread observer installed on '
+                + (threadRoot.getAttribute('data-scope') || threadRoot.getAttribute('role') || 'main'));
+            // Also chain shadow DOM observers under the thread root.
+            tryObserveShadowRoots(threadRoot);
+        } catch(e) {
+            jlog('[Activity] tryInstallThreadObserver failed: ' + String(e));
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Body-level fallback observer
+    // Observes document.body childList+subtree with a pre-filter for relevant
+    // thread/main/messages_table/presentation ancestors. Feeds the same pending
+    // mutation/debounce path as the thread observer.
+    // ---------------------------------------------------------------------------
+    function tryInstallBodyFallbackObserver() {
+        if (_bodyFallbackInstalled) return;
+        if (!document.body) return;
+        if (document.body._mxBodyFallbackInstalled) return;
+        document.body._mxBodyFallbackInstalled = true;
+        _bodyFallbackInstalled = true;
+        var bodyObs = new MutationObserver(function(mutationsList) {
+            var relevant = [];
+            for (var i = 0; i < mutationsList.length; i++) {
+                if (_isRelevantMutation(mutationsList[i])) {
+                    relevant.push(mutationsList[i]);
+                }
+            }
+            if (relevant.length > 0) {
+                _processMutationBatch(relevant, 'body-fallback');
+            }
+        });
+        bodyObs.observe(document.body, { childList: true, subtree: true });
+        jlog('[Activity] body-level fallback observer installed');
+        // Chain shadow DOM observers under body too.
+        tryObserveShadowRoots(document.body);
+    }
+
+    function setupActivityObserver() {
+        try {
+            var listRoot = document.querySelector('[role="navigation"]')
+                        || document.querySelector('[role="complementary"]')
+                        || document.querySelector('nav')
+                        || document.body;
+            if (!listRoot) return;
+            if (!listRoot._mxSidebarObserverInstalled) {
+                listRoot._mxSidebarObserverInstalled = true;
+                var convObserver = new MutationObserver(_makeDebounced());
+                // childList + subtree only — no attributes/characterData.
+                convObserver.observe(listRoot, {
+                    childList: true,
+                    subtree: true
+                });
+                jlog('[Activity] sidebar observer installed on '
+                    + (listRoot.getAttribute('role') || listRoot.tagName));
+            }
+        } catch(e) {
+            jlog('[Activity] Failed to set up sidebar activity observer: ' + String(e));
+        }
+
+        // Thread observer — attempt immediately, then retry every 2 s until mounted.
+        tryInstallThreadObserver();
+        if (!_threadObserverInstalled) {
+            _threadObserverRetryTimer = setInterval(function() {
+                tryInstallThreadObserver();
+                // Also retry shadow root scan periodically.
+                if (_threadObserverInstalled) {
+                    tryObserveShadowRoots(document.querySelector('[data-scope="messages_table"]')
+                        || document.querySelector('[role="main"]') || document.body);
+                }
+            }, 2000);
+        }
+
+        // Body-level fallback observer — always install in addition to thread observer.
+        tryInstallBodyFallbackObserver();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Iframe postMessage bridge for __mx_thread_bump__
+    // In non-top frames: when threadMutSeq bumps, post {type:'__mx_thread_bump__', seq}
+    // to top. In top frame: receive and merge the seq then refreshActivitySnapshot.
+    // Preserves existing __mx_notif__ bridge behavior.
+    // ---------------------------------------------------------------------------
+    if (window !== window.top) {
+        // Non-top frame: hook threadMutSeq bumps by wrapping tryBumpThreadMutSeq.
+        var _origTryBump = tryBumpThreadMutSeq;
+        tryBumpThreadMutSeq = function(mutationsList, currentCount) {
+            var bumped = _origTryBump(mutationsList, currentCount);
+            if (bumped) {
+                try {
+                    window.top.postMessage({
+                        type: '__mx_thread_bump__',
+                        seq: threadMutSeq
+                    }, '*');
+                } catch(_) {}
+            }
+            return bumped;
+        };
+    }
+    if (window === window.top) {
+        window.addEventListener('message', function(e) {
+            if (!e.data || typeof e.data !== 'object') return;
+            if (e.data.type === '__mx_thread_bump__') {
+                var remoteSeq = parseInt(e.data.seq, 10) || 0;
+                if (remoteSeq > threadMutSeq) {
+                    threadMutSeq = remoteSeq;
+                    lastThreadMutSeqAt = Date.now();
+                    jlog('[ThreadMut] iframe bump received seq=' + threadMutSeq + ' from=' + String(e.origin));
+                    refreshActivitySnapshot();
+                }
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------------------
+    // Send helpers
+    // ---------------------------------------------------------------------------
+
+    // Dispatch count + sender + activitySig to Rust immediately (used for count === 0).
+    // For count=0: send activitySig="" immediately, but preserve baseline (zero-timer
+    // will clean up after 7 s if zero persists, or on window focus).
+    function sendUnreadCountNow(count) {
+        try {
+            var sender = '';
+            var activitySig = '';
+            if (count === 0) {
+                // Send empty sig immediately, but keep baseline alive (zero-timer).
+                // Focused zero: reset baseline right away (user saw messages).
+                var focused = false;
+                try { focused = typeof document.hasFocus === 'function' && document.hasFocus(); } catch(_) {}
+                if (focused) {
+                    resetActivityState();
+                } else {
+                    scheduleZeroReset();
+                }
+            } else {
+                sender = getFirstUnreadSenderName();
+                activitySig = buildSig(count);
+            }
+            jlog('[Unread] immediate count=' + count
+                + ' sender=' + JSON.stringify(sender)
+                + ' activitySig=' + JSON.stringify(activitySig));
+            window.__TAURI__.core.invoke('update_unread_count',
+                { count: count, sender: sender, activitySig: activitySig });
+            if (count > 0) {
+                lastSentSig = activitySig;
+            }
+        } catch(e) { jlog('[Unread] Failed to send unread count: ' + String(e)); }
+    }
+
+    // For count > 0, defer ~500 ms so React DOM has time to render the sender.
+    // Optimistically records lastSentSig before setTimeout to prevent duplicate
+    // scheduling for the same sig.  Reverts lastSentSig if the send is skipped.
+    function sendUnreadCount(count) {
+        if (count === 0) {
+            sendUnreadCountNow(0);
+            return;
+        }
+        // Cancel any pending zero-timer since count went positive again.
+        cancelZeroTimer();
+        // Refresh snapshot now (count > 0) so seq is up-to-date before we
+        // build the optimistic sig.
+        refreshActivitySnapshot();
+        var optimisticSig = buildSig(count);
+        // Optimistic update — prevents duplicate scheduling for same sig.
+        var prevLastSentSig = lastSentSig;
+        lastSentSig = optimisticSig;
+        setTimeout(function() {
+            var currentCount = getUnreadCountFromTitle();
+            if (currentCount === 0) {
+                // Count dropped — revert optimistic sig so next real event fires.
+                lastSentSig = prevLastSentSig;
+                jlog('[Unread] delayed send skipped (count now 0, was '
+                    + count + ')');
+                return;
+            }
+            var effectiveCount = currentCount;
+            // Re-read snapshot in case more DOM settled during the 500 ms wait.
+            refreshActivitySnapshot();
+            var sender = getFirstUnreadSenderName();
+            var activitySig = buildSig(effectiveCount);
+            // Update lastSentSig to the final sig (may differ from optimistic if
+            // snapshot changed during the delay).
+            lastSentSig = activitySig;
+            jlog('[Unread] delayed count=' + effectiveCount
+                + ' sender=' + JSON.stringify(sender)
+                + ' activitySig=' + JSON.stringify(activitySig)
+                + (effectiveCount !== count ? ' (count changed from ' + count + ')' : ''));
+            try {
+                window.__TAURI__.core.invoke('update_unread_count',
+                    { count: effectiveCount, sender: sender, activitySig: activitySig });
+            } catch(e) { jlog('[Unread] Failed to send unread count: ' + String(e)); }
+        }, 500);
+    }
+
     function setupObserver() {
         var lastCount = getUnreadCountFromTitle();
+        prevTitleCount = lastCount;
         sendUnreadCount(lastCount);
+        setupActivityObserver();
         var titleElement = document.querySelector('title');
         if (titleElement) {
             var observer = new MutationObserver(function() {
                 var newCount = getUnreadCountFromTitle();
                 if (newCount !== lastCount) {
+                    // Track rising edge BEFORE updating lastCount.
+                    markRisingEdge(newCount);
                     lastCount = newCount;
                     sendUnreadCount(newCount);
                 }
             });
             observer.observe(titleElement, { childList: true, characterData: true, subtree: true });
         }
+        // Polling fallback: also catches sig changes (new message, same count).
         setInterval(function() {
             var newCount = getUnreadCountFromTitle();
-            if (newCount !== lastCount) {
+            if (newCount > 0) {
+                refreshActivitySnapshot();
+            }
+            var currentSig = buildSig(newCount);
+            if (newCount !== lastCount || (newCount > 0 && currentSig !== lastSentSig)) {
+                markRisingEdge(newCount);
                 lastCount = newCount;
                 sendUnreadCount(newCount);
             }
         }, 2000);
+
+        // When window gains focus and count=0, immediately reset baseline so
+        // the next new message starts fresh.
+        window.addEventListener('focus', function() {
+            var fc = getUnreadCountFromTitle();
+            if (fc === 0 && (lastActivitySnapshot.length > 0 || zeroTimer !== null)) {
+                jlog('[Activity] window focused with count=0 — resetting baseline');
+                resetActivityState();
+            }
+        });
     }
+
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', setupObserver);
     } else {
@@ -931,6 +1797,33 @@ fn configure_linux_runtime_env() {
 }
 
 // ---------------------------------------------------------------------------
+// Public helper: macOS notification dispatch from inside .app bundle
+// (used by the CLI `--notify` path in main.rs)
+// ---------------------------------------------------------------------------
+
+/// Dispatch a native notification using `UNUserNotificationCenter`.
+///
+/// This is a **macOS-only** public entry-point intended for the CLI helper mode
+/// (`messengerx --notify <title> <body> [silent]`) where the binary runs inside
+/// the debug `.app` bundle and therefore has a valid bundle context.
+///
+/// It calls `services::notification::dispatch_bundle_notification` directly —
+/// **without** going through the osascript / subprocess delegation paths — so
+/// the helper process does not recursively spawn itself.
+///
+/// # Errors
+/// Returns `Err` if `UNUserNotificationCenter` initialisation fails or the
+/// enqueue call returns an error.
+#[cfg(target_os = "macos")]
+pub fn dispatch_notification_from_bundle(
+    title: &str,
+    body: &str,
+    silent: bool,
+) -> Result<(), String> {
+    services::notification::dispatch_bundle_notification(title, body, silent)
+}
+
+// ---------------------------------------------------------------------------
 // Application entry point
 // ---------------------------------------------------------------------------
 
@@ -990,6 +1883,22 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // Windows 11 (especially on some ARM devices) can ignore a focus
+            // request if it happens too early during setup. Apply the
+            // startup foreground workaround after the runtime reports Ready,
+            // but only for a window that setup has already decided should be
+            // visible.
+            #[cfg(target_os = "windows")]
+            if let tauri::RunEvent::Ready = event {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    if matches!(window.is_visible(), Ok(true)) {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+
             // macOS: clicking the Dock icon while all windows are hidden should
             // bring the main window back (applicationShouldHandleReopen).
             #[cfg(target_os = "macos")]
@@ -1036,8 +1945,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // handled via the native webview.set_zoom() API, see below).
     // NOTE: We no longer use CSS body.style.zoom because it causes layout
     // issues — the page content doesn't fill the viewport at zoom < 100%.
-    let zoom_init_script = "(function() { window.__messenger_setZoom = function() {}; })();"
-        .to_string();
+    let zoom_init_script =
+        "(function() { window.__messenger_setZoom = function() {}; })();".to_string();
 
     // Build the offline banner script with the translated banner text.
     let offline_banner_script = build_offline_banner_script(&tr.offline_banner);
@@ -1125,9 +2034,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             // Messenger wraps all external links in this shim — so `on_navigation`
             // sees a facebook.com URL instead of the real destination.  We extract
             // the actual URL from the `u` query param and open it in the system browser.
-            if (host == "l.facebook.com" || host == "l.messenger.com")
-                && url.path() == "/l.php"
-            {
+            if (host == "l.facebook.com" || host == "l.messenger.com") && url.path() == "/l.php" {
                 if let Some(actual_url) = url
                     .query_pairs()
                     .find(|(k, _)| k == "u")
@@ -1184,17 +2091,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         .build()?;
 
-    // Windows 11 (notably on some ARM devices) may leave a freshly created
-    // WebView window in a non-activated state until the first user click.
-    // Explicitly foreground the main window on startup when we are not in
-    // "start minimized" mode.
-    #[cfg(target_os = "windows")]
-    if !settings.start_minimized {
-        let _ = webview.show();
-        let _ = webview.unminimize();
-        let _ = webview.set_focus();
-    }
-
     // ------------------------------------------------------------------
     // 4b. Apply persisted zoom level via the native WebView API.
     //     This scales the entire viewport (not just body content), so the
@@ -1241,18 +2137,18 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 4c-2. Cross-platform: reset notification guard when the window gains
     //       focus so that the NEXT new message always triggers a notification.
     //
-    //       Without this, once a notification fires (LAST_NOTIFIED_COUNT = N)
-    //       and the user opens the app without the count hitting 0 (or while
-    //       the title oscillates), the guard would stay at N and suppress all
-    //       future notifications until a hard reset.
+    //       Without this, once a notification fires and the user opens the app
+    //       without a sustained count=0 period, the dedupe state could remain
+    //       in Notified/ZeroPending and suppress future messages.
     // ------------------------------------------------------------------
     {
         webview.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(true) = event {
-                crate::commands::LAST_NOTIFIED_COUNT
-                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut state) = crate::commands::NOTIF_STATE.lock() {
+                    *state = crate::commands::NotifState::Idle;
+                }
                 log::info!(
-                    "[MessengerX][Notification] Window gained focus — LAST_NOTIFIED_COUNT reset"
+                    "[MessengerX][Notification] Window gained focus — notification state reset to Idle"
                 );
             }
         });
@@ -1280,9 +2176,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let vis_webview = webview.clone();
         webview.on_window_event(move |event| {
             if let tauri::WindowEvent::Focused(focused) = event {
-                log::info!(
-                    "[MessengerX][Visibility] WindowEvent::Focused({focused})"
-                );
+                log::info!("[MessengerX][Visibility] WindowEvent::Focused({focused})");
                 let js = if *focused {
                     "window.__messengerx_set_visible?.(true, 'window-event-focused')"
                 } else {
@@ -1436,9 +2330,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // Load current autostart state from the OS (may differ from saved).
         let autostart_checked = {
             use tauri_plugin_autostart::ManagerExt;
-            app.autolaunch()
-                .is_enabled()
-                .unwrap_or(settings.autostart)
+            app.autolaunch().is_enabled().unwrap_or(settings.autostart)
         };
 
         // --- Build menu items ---
@@ -1449,16 +2341,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             .enabled(false)
             .build(app)?;
 
-        let show_item =
-            MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
+        let show_item = MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
 
         // Toggles
-        let stay_logged_in_item = CheckMenuItemBuilder::with_id(
-            "stay_logged_in",
-            &tr.settings_stay_logged_in,
-        )
-        .checked(settings.stay_logged_in)
-        .build(app)?;
+        let stay_logged_in_item =
+            CheckMenuItemBuilder::with_id("stay_logged_in", &tr.settings_stay_logged_in)
+                .checked(settings.stay_logged_in)
+                .build(app)?;
 
         let notifications_item = CheckMenuItemBuilder::with_id(
             "notifications_enabled",
@@ -1467,34 +2356,26 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .checked(settings.notifications_enabled)
         .build(app)?;
 
-        let notification_sound_item = CheckMenuItemBuilder::with_id(
-            "notification_sound",
-            &tr.settings_notification_sound,
-        )
-        .checked(settings.notification_sound)
-        .build(app)?;
+        let notification_sound_item =
+            CheckMenuItemBuilder::with_id("notification_sound", &tr.settings_notification_sound)
+                .checked(settings.notification_sound)
+                .build(app)?;
 
         // Appearance submenu with radio-like CheckMenuItems (System/Dark/Light)
-        let appearance_system_item = CheckMenuItemBuilder::with_id(
-            "appearance_system",
-            &tr.settings_appearance_system,
-        )
-        .checked(settings.appearance == "system")
-        .build(app)?;
+        let appearance_system_item =
+            CheckMenuItemBuilder::with_id("appearance_system", &tr.settings_appearance_system)
+                .checked(settings.appearance == "system")
+                .build(app)?;
 
-        let appearance_dark_item = CheckMenuItemBuilder::with_id(
-            "appearance_dark",
-            &tr.settings_appearance_dark,
-        )
-        .checked(settings.appearance == "dark")
-        .build(app)?;
+        let appearance_dark_item =
+            CheckMenuItemBuilder::with_id("appearance_dark", &tr.settings_appearance_dark)
+                .checked(settings.appearance == "dark")
+                .build(app)?;
 
-        let appearance_light_item = CheckMenuItemBuilder::with_id(
-            "appearance_light",
-            &tr.settings_appearance_light,
-        )
-        .checked(settings.appearance == "light")
-        .build(app)?;
+        let appearance_light_item =
+            CheckMenuItemBuilder::with_id("appearance_light", &tr.settings_appearance_light)
+                .checked(settings.appearance == "light")
+                .build(app)?;
 
         let appearance_submenu = SubmenuBuilder::new(app, &tr.settings_appearance)
             .item(&appearance_system_item)
@@ -1528,33 +2409,23 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let zoom_submenu = zoom_builder.build()?;
 
         // Startup toggles
-        let autostart_item = CheckMenuItemBuilder::with_id(
-            "autostart",
-            &tr.settings_autostart,
-        )
-        .checked(autostart_checked)
-        .build(app)?;
+        let autostart_item = CheckMenuItemBuilder::with_id("autostart", &tr.settings_autostart)
+            .checked(autostart_checked)
+            .build(app)?;
 
-        let start_minimized_item = CheckMenuItemBuilder::with_id(
-            "start_minimized",
-            &tr.settings_start_minimized,
-        )
-        .checked(settings.start_minimized)
-        .build(app)?;
+        let start_minimized_item =
+            CheckMenuItemBuilder::with_id("start_minimized", &tr.settings_start_minimized)
+                .checked(settings.start_minimized)
+                .build(app)?;
 
-        let auto_update_item = CheckMenuItemBuilder::with_id(
-            "auto_update",
-            &tr.settings_auto_update,
-        )
-        .checked(settings.auto_update)
-        .build(app)?;
+        let auto_update_item =
+            CheckMenuItemBuilder::with_id("auto_update", &tr.settings_auto_update)
+                .checked(settings.auto_update)
+                .build(app)?;
 
         // Action items
-        let check_update_item = MenuItemBuilder::with_id(
-            "check_update",
-            &tr.settings_check_update,
-        )
-        .build(app)?;
+        let check_update_item =
+            MenuItemBuilder::with_id("check_update", &tr.settings_check_update).build(app)?;
 
         let view_logs_item =
             MenuItemBuilder::with_id("view_logs", &tr.settings_view_logs).build(app)?;
@@ -1562,11 +2433,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let clear_logs_item =
             MenuItemBuilder::with_id("clear_logs", &tr.settings_clear_logs).build(app)?;
 
-        let logout_item =
-            MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
+        let logout_item = MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
 
-        let quit_item =
-            MenuItemBuilder::with_id("tray_quit", &tr.tray_quit).build(app)?;
+        let quit_item = MenuItemBuilder::with_id("tray_quit", &tr.tray_quit).build(app)?;
 
         // --- Separators ---
         let sep1 = PredefinedMenuItem::separator(app)?;
@@ -1991,22 +2860,17 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // Load current autostart state from the OS (may differ from saved).
         let autostart_checked = {
             use tauri_plugin_autostart::ManagerExt;
-            app.autolaunch()
-                .is_enabled()
-                .unwrap_or(settings.autostart)
+            app.autolaunch().is_enabled().unwrap_or(settings.autostart)
         };
 
         // --- Build all menu items ---
 
-        let show_item =
-            MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
+        let show_item = MenuItemBuilder::with_id("tray_show", &tr.tray_show).build(app)?;
 
-        let stay_logged_in_item = CheckMenuItemBuilder::with_id(
-            "stay_logged_in",
-            &tr.settings_stay_logged_in,
-        )
-        .checked(settings.stay_logged_in)
-        .build(app)?;
+        let stay_logged_in_item =
+            CheckMenuItemBuilder::with_id("stay_logged_in", &tr.settings_stay_logged_in)
+                .checked(settings.stay_logged_in)
+                .build(app)?;
 
         let notifications_item = CheckMenuItemBuilder::with_id(
             "notifications_enabled",
@@ -2015,34 +2879,26 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .checked(settings.notifications_enabled)
         .build(app)?;
 
-        let notification_sound_item = CheckMenuItemBuilder::with_id(
-            "notification_sound",
-            &tr.settings_notification_sound,
-        )
-        .checked(settings.notification_sound)
-        .build(app)?;
+        let notification_sound_item =
+            CheckMenuItemBuilder::with_id("notification_sound", &tr.settings_notification_sound)
+                .checked(settings.notification_sound)
+                .build(app)?;
 
         // Appearance submenu with radio-like CheckMenuItems (System/Dark/Light)
-        let appearance_system_item = CheckMenuItemBuilder::with_id(
-            "appearance_system",
-            &tr.settings_appearance_system,
-        )
-        .checked(settings.appearance == "system")
-        .build(app)?;
+        let appearance_system_item =
+            CheckMenuItemBuilder::with_id("appearance_system", &tr.settings_appearance_system)
+                .checked(settings.appearance == "system")
+                .build(app)?;
 
-        let appearance_dark_item = CheckMenuItemBuilder::with_id(
-            "appearance_dark",
-            &tr.settings_appearance_dark,
-        )
-        .checked(settings.appearance == "dark")
-        .build(app)?;
+        let appearance_dark_item =
+            CheckMenuItemBuilder::with_id("appearance_dark", &tr.settings_appearance_dark)
+                .checked(settings.appearance == "dark")
+                .build(app)?;
 
-        let appearance_light_item = CheckMenuItemBuilder::with_id(
-            "appearance_light",
-            &tr.settings_appearance_light,
-        )
-        .checked(settings.appearance == "light")
-        .build(app)?;
+        let appearance_light_item =
+            CheckMenuItemBuilder::with_id("appearance_light", &tr.settings_appearance_light)
+                .checked(settings.appearance == "light")
+                .build(app)?;
 
         let appearance_submenu = SubmenuBuilder::new(app, &tr.settings_appearance)
             .item(&appearance_system_item)
@@ -2075,26 +2931,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
         let zoom_submenu = zoom_builder.build()?;
 
-        let autostart_item = CheckMenuItemBuilder::with_id(
-            "autostart",
-            &tr.settings_autostart,
-        )
-        .checked(autostart_checked)
-        .build(app)?;
+        let autostart_item = CheckMenuItemBuilder::with_id("autostart", &tr.settings_autostart)
+            .checked(autostart_checked)
+            .build(app)?;
 
-        let start_minimized_item = CheckMenuItemBuilder::with_id(
-            "start_minimized",
-            &tr.settings_start_minimized,
-        )
-        .checked(settings.start_minimized)
-        .build(app)?;
+        let start_minimized_item =
+            CheckMenuItemBuilder::with_id("start_minimized", &tr.settings_start_minimized)
+                .checked(settings.start_minimized)
+                .build(app)?;
 
-        let auto_update_item = CheckMenuItemBuilder::with_id(
-            "auto_update",
-            &tr.settings_auto_update,
-        )
-        .checked(settings.auto_update)
-        .build(app)?;
+        let auto_update_item =
+            CheckMenuItemBuilder::with_id("auto_update", &tr.settings_auto_update)
+                .checked(settings.auto_update)
+                .build(app)?;
 
         let check_update_item =
             MenuItemBuilder::with_id("check_update", &tr.settings_check_update).build(app)?;
@@ -2105,8 +2954,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let clear_logs_item =
             MenuItemBuilder::with_id("clear_logs", &tr.settings_clear_logs).build(app)?;
 
-        let logout_item =
-            MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
+        let logout_item = MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
 
         // Non-interactive version label shown at the top of the app submenu.
         let version_str = format!("v{}", app.package_info().version);
@@ -2229,7 +3077,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // ---- Appearance (radio-like behaviour) ----
                 _ if id.starts_with("appearance_") => {
                     let mode = &id["appearance_".len()..]; // "system", "dark", or "light"
-                    // Enforce radio: uncheck all, check selected.
+                                                           // Enforce radio: uncheck all, check selected.
                     let _ = appearance_system_c.set_checked(mode == "system");
                     let _ = appearance_dark_c.set_checked(mode == "dark");
                     let _ = appearance_light_c.set_checked(mode == "light");
@@ -2330,15 +3178,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     // On macOS, auto-install is blocked by Gatekeeper until
                                     // notarization is implemented (FEAT-003); the dialog
                                     // informs the user and the install branch is a no-op.
-                                    use tauri_plugin_dialog::{
-                                        DialogExt, MessageDialogButtons,
-                                    };
+                                    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
                                     h2.dialog()
                                         .message(&body)
                                         .title(&tr_dlg_title)
                                         .buttons(MessageDialogButtons::OkCancelCustom(
-                                            tr_install,
-                                            tr_later,
+                                            tr_install, tr_later,
                                         ))
                                         .show(move |confirmed| {
                                             if confirmed {
@@ -2358,20 +3203,32 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 Ok(None) => {
                                     save_check_timestamp(&h2);
                                     let _ = services::notification::show_notification(
-                                        &h2, "Messenger X", &tr_none, "update", false,
+                                        &h2,
+                                        "Messenger X",
+                                        &tr_none,
+                                        "update",
+                                        false,
                                     );
                                 }
                                 Err(e) => {
                                     log::warn!("[MessengerX] Update check failed: {e}");
                                     let _ = services::notification::show_notification(
-                                        &h2, "Messenger X", &tr_err, "update", false,
+                                        &h2,
+                                        "Messenger X",
+                                        &tr_err,
+                                        "update",
+                                        false,
                                     );
                                 }
                             },
                             Err(e) => {
                                 log::warn!("[MessengerX] Updater init failed: {e}");
                                 let _ = services::notification::show_notification(
-                                    &h2, "Messenger X", &tr_err, "update", false,
+                                    &h2,
+                                    "Messenger X",
+                                    &tr_err,
+                                    "update",
+                                    false,
                                 );
                             }
                         }
@@ -2384,16 +3241,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(log_dir) = h.path().app_log_dir() {
                         let log_file = log_dir.join("messengerx.log");
                         if log_file.exists() {
-                            let _ = h.opener().open_path(
-                                log_file.to_string_lossy().into_owned(),
-                                None::<&str>,
-                            );
+                            let _ = h
+                                .opener()
+                                .open_path(log_file.to_string_lossy().into_owned(), None::<&str>);
                         } else {
                             let _ = std::fs::create_dir_all(&log_dir);
-                            let _ = h.opener().open_path(
-                                log_dir.to_string_lossy().into_owned(),
-                                None::<&str>,
-                            );
+                            let _ = h
+                                .opener()
+                                .open_path(log_dir.to_string_lossy().into_owned(), None::<&str>);
                         }
                     }
                 }
@@ -2405,7 +3260,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             let path = log_dir.join(name);
                             if path.exists() {
                                 if let Err(e) = std::fs::remove_file(&path) {
-                                    log::warn!("[MessengerX] Failed to delete {}: {e}", path.display());
+                                    log::warn!(
+                                        "[MessengerX] Failed to delete {}: {e}",
+                                        path.display()
+                                    );
                                 } else {
                                     log::info!("[MessengerX] Deleted log file: {}", path.display());
                                 }
@@ -2520,9 +3378,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 let ver = update.version.clone();
                                 let body = tr_dlg_body_su.replace("{}", &ver);
                                 save_check_timestamp(&startup_handle);
-                                use tauri_plugin_dialog::{
-                                    DialogExt, MessageDialogButtons,
-                                };
+                                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
                                 // Windows / Linux: show dialog and install if confirmed.
                                 #[cfg(not(target_os = "macos"))]
                                 {
@@ -2611,9 +3467,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         },
                         Err(e) => {
-                            log::warn!(
-                                "[MessengerX] Startup updater init failed: {e}"
-                            );
+                            log::warn!("[MessengerX] Startup updater init failed: {e}");
                         }
                     }
                 });
@@ -2630,6 +3484,31 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    mod windows_startup_activation {
+        const SOURCE: &str = include_str!("lib.rs");
+
+        #[test]
+        fn windows_startup_activation_runs_in_ready_event() {
+            assert!(
+                SOURCE.contains("#[cfg(target_os = \"windows\")]")
+                    && SOURCE.contains("if let tauri::RunEvent::Ready = event"),
+                "Windows startup activation must remain in RunEvent::Ready"
+            );
+        }
+
+        #[test]
+        fn startup_minimized_preference_stays_guarded_via_initial_visibility() {
+            assert!(
+                SOURCE.contains(".visible(!settings.start_minimized)"),
+                "main window creation must keep start_minimized visibility guard"
+            );
+            assert!(
+                SOURCE.contains("matches!(window.is_visible(), Ok(true))"),
+                "Windows Ready activation must only run for initially visible windows"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     mod linux_runtime {
         use super::super::{configure_linux_runtime_env, LINUX_APPIMAGE_ENV_OVERRIDES};
