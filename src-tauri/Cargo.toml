@@ -1,6 +1,6 @@
 [package]
 name = "messengerx"
-version = "1.3.21"
+version = "1.3.22"
 description = "Cross-platform Messenger desktop client (Tauri)"
 authors = ["lasakondrej"]
 license = "MIT"
@@ -37,5 +37,5 @@ tauri-plugin-dialog = "2.0.0-beta.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 objc2 = "0.6.4"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSObject", "NSString"] }
-objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationRequest", "UNNotificationContent", "UNNotificationSound", "UNNotificationTrigger"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSObject", "NSString"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationRequest", "UNNotificationContent", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger"] }
