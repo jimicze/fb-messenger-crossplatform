@@ -42,6 +42,12 @@ jobs:
             rust-targets: ''
             label: 'Windows-x64'
 
+          # Windows arm64
+          - platform: 'windows-latest'
+            args: '--target aarch64-pc-windows-msvc'
+            rust-targets: 'aarch64-pc-windows-msvc'
+            label: 'Windows-arm64'
+
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -69,11 +75,24 @@ jobs:
           node-version: 'lts/*'
           cache: 'npm'
 
-      - name: Install Rust stable toolchain
+      - name: Install Rust stable toolchain (Linux / macOS)
+        if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
         with:
           toolchain: stable
           targets: ${{ matrix.rust-targets }}
+
+      - name: Install Rust stable toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          if ("${{ matrix.rust-targets }}" -ne "") {
+            rustup target add ${{ matrix.rust-targets }}
+          }
+          rustc -V
+          cargo -V
 
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
