@@ -2324,6 +2324,31 @@ fn log_platform_environment() {
     }
 }
 
+/// How long a previously consumed sender hint stays available for the
+/// typing-indicator-rearm fallback after the original count-rise dispatch
+/// already consumed the live hint.  Long enough to span a typical typing
+/// pause + reply burst, short enough to avoid attributing a later message
+/// from a different conversation to the previous sender.
+const SENDER_HINT_RETAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cache of sender names extracted from the JS DOM scraper and pushed to
+/// Rust via the `__MX_SENDER_V1__` document.title side-channel.
+///
+/// See the field-level docs at the [`SenderHintCache::default`]-constructed
+/// instance in `setup_app` for the lifecycle.
+#[derive(Default, Debug)]
+struct SenderHintCache {
+    /// Fresh hint pending consumption by the next count-rise notification.
+    /// Cleared (`take`) by the worker as soon as it matches `count`.
+    live: Option<(u32, String, std::time::Instant)>,
+    /// Last sender that was successfully consumed from `live`, kept for
+    /// [`SENDER_HINT_RETAIN`] so the typing-indicator-rearm path can
+    /// re-attribute the rearm fire to the same author when no fresh
+    /// `live` hint is available.  `Instant` is the time of consumption,
+    /// not the time the hint was originally produced.
+    retained: Option<(String, std::time::Instant)>,
+}
+
 /// Run the Tauri application.
 ///
 /// Registers all plugins, builds the main webview window with JS injection
@@ -2489,9 +2514,25 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     let had_good_title = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let pending_sender_hint = std::sync::Arc::new(std::sync::Mutex::new(
-        None::<(u32, String, std::time::Instant)>,
-    ));
+    // ------------------------------------------------------------------
+    // Sender-hint cache.
+    //
+    // `live`     – Fresh hint emitted by the JS side-channel
+    //              (`__MX_SENDER_V1__?count=…&sender=…` document.title sentinel).
+    //              Stored by the title-change handler, consumed by the
+    //              `count > 0` worker when a notification is being dispatched.
+    //              Taken via `Option::take` so the same hint cannot satisfy
+    //              two unrelated count-rises.
+    // `retained` – Last successfully consumed sender, kept for
+    //              `SENDER_HINT_RETAIN` (~10 s) so the typing-indicator-rearm
+    //              path (count drops to 0 from typing, then returns) can
+    //              re-use the same author when no fresh `live` hint has been
+    //              re-emitted by JS for the same conversation.  Without this
+    //              the rearm fire falls back to the generic "Nová zpráva"
+    //              title even when the originating sender is still known.
+    // ------------------------------------------------------------------
+    let pending_sender_hint =
+        std::sync::Arc::new(std::sync::Mutex::new(SenderHintCache::default()));
     // Set to `true` after a confirmed WebKitWebProcess crash (title became ""
     // after a good load).  When active on Linux, the `on_navigation` handler
     // blocks the fbsbx.com maw_proxy_page that is known to trigger the
@@ -2606,7 +2647,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     if let (Some(count), Some(sender)) = (count_hint, sender_hint) {
                         match pending_sender_hint.lock() {
                             Ok(mut hint) => {
-                                *hint = Some((count, sender.clone(), std::time::Instant::now()));
+                                hint.live =
+                                    Some((count, sender.clone(), std::time::Instant::now()));
                                 log::info!(
                                     "[MessengerX][SenderHint] stored count={} sender={:?}",
                                     count,
@@ -2671,10 +2713,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let sender = if count > 0 {
                         let deadline = std::time::Instant::now()
                             + std::time::Duration::from_millis(1_200);
-                        loop {
+                        let resolved = loop {
+                            let mut peek_retained: Option<String> = None;
                             match sender_hint.lock() {
                                 Ok(mut hint) => {
-                                    if let Some((hint_count, sender, stored_at)) = hint.take() {
+                                    if let Some((hint_count, sender, stored_at)) = hint.live.take()
+                                    {
                                         let age = stored_at.elapsed();
                                         if hint_count == count
                                             && age <= std::time::Duration::from_secs(3)
@@ -2685,6 +2729,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                 sender,
                                                 age.as_millis(),
                                             );
+                                            // Promote to retained so a typing-
+                                            // indicator-rearm fire (same conv,
+                                            // count drops to 0 then returns)
+                                            // can re-attribute the fire to the
+                                            // same author without waiting for
+                                            // a fresh JS hint that may never
+                                            // arrive (DOM unchanged).
+                                            hint.retained =
+                                                Some((sender.clone(), std::time::Instant::now()));
                                             break sender;
                                         }
 
@@ -2694,6 +2747,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                             count,
                                             age.as_millis(),
                                         );
+                                    }
+
+                                    // No live hint — peek retained for fallback
+                                    // (do not consume yet; only used if the wait
+                                    // deadline elapses with no live hint).
+                                    if let Some((sender, consumed_at)) = &hint.retained {
+                                        if consumed_at.elapsed() <= SENDER_HINT_RETAIN {
+                                            peek_retained = Some(sender.clone());
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -2705,10 +2767,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if std::time::Instant::now() >= deadline {
+                                if let Some(sender) = peek_retained {
+                                    log::info!(
+                                        "[MessengerX][SenderHint] using retained sender (typing-rearm fallback) sender={:?} count={}",
+                                        sender,
+                                        count,
+                                    );
+                                    break sender;
+                                }
                                 break String::new();
                             }
                             std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
+                        };
+                        resolved
                     } else {
                         String::new()
                     };
@@ -4369,6 +4440,65 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    mod sender_hint_cache {
+        use super::super::{SenderHintCache, SENDER_HINT_RETAIN};
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn default_cache_is_empty() {
+            let c = SenderHintCache::default();
+            assert!(c.live.is_none());
+            assert!(c.retained.is_none());
+        }
+
+        #[test]
+        fn live_take_then_retained_promotion_round_trip() {
+            let mut c = SenderHintCache {
+                live: Some((1, "Alice".into(), Instant::now())),
+                ..Default::default()
+            };
+            // Simulate worker promotion path.
+            let taken = c.live.take().expect("live present");
+            assert_eq!(taken.1, "Alice");
+            c.retained = Some((taken.1.clone(), Instant::now()));
+            assert!(c.live.is_none());
+            let (sender, _) = c.retained.as_ref().expect("retained set");
+            assert_eq!(sender, "Alice");
+        }
+
+        #[test]
+        fn retained_ttl_is_long_enough_to_cover_typing_pause() {
+            // Phase M design: a typical typing pause + reply burst should
+            // remain inside the retain window so the rearm fire reuses the
+            // sender.  Guard against accidental shrinkage to e.g. 1 s.
+            assert!(
+                SENDER_HINT_RETAIN >= Duration::from_secs(5),
+                "retain window must cover typical typing pause (>= 5s)"
+            );
+            // Also guard against accidental growth that would risk
+            // misattributing a later message from a different conversation.
+            assert!(
+                SENDER_HINT_RETAIN <= Duration::from_secs(30),
+                "retain window must stay short enough to avoid cross-conv attribution"
+            );
+        }
+
+        #[test]
+        fn retained_expiry_check_uses_consumed_at_age() {
+            // Stamp consumed_at far in the past — outside retain window.
+            let stale = Instant::now() - SENDER_HINT_RETAIN - Duration::from_secs(1);
+            let c = SenderHintCache {
+                retained: Some(("Bob".into(), stale)),
+                ..Default::default()
+            };
+            let (_sender, consumed_at) = c.retained.as_ref().unwrap();
+            assert!(
+                consumed_at.elapsed() > SENDER_HINT_RETAIN,
+                "stale retained entry must be detected as expired"
+            );
+        }
+    }
+
     mod windows_startup_activation {
         const SOURCE: &str = include_str!("lib.rs");
 
