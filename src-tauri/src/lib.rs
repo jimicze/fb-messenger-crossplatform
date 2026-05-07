@@ -2465,6 +2465,84 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
          AppleWebKit/537.36 (KHTML, like Gecko) \
          Chrome/120.0.0.0 Safari/537.36",
         )
+        // ------------------------------------------------------------------
+        // Phase G: Rust-side title-change unread-count detection.
+        //
+        // On Windows (WebView2) and Linux (WebKitGTK), Tauri v2 blocks
+        // invoke() from remote origins (https://www.messenger.com) at the
+        // WebView layer regardless of the capabilities `"remote"` block —
+        // that block is designed for iOS/Android, not desktop WebViews.
+        //
+        // This handler fires whenever document.title changes (via Wry's
+        // cross-platform title-changed hook) — no IPC, no origin checks.
+        // Messenger sets the title to "(N) Messenger" for N unread messages
+        // and back to "Messenger" when all are read.  Parsing that title
+        // gives us the unread count without JS→Rust IPC at all.
+        //
+        // On macOS (where invoke() already works) this also fires but
+        // NOTIF_STATE deduplication suppresses double-notifications when
+        // the same count is reported by both paths.
+        // ------------------------------------------------------------------
+        .on_document_title_changed(move |webview_window, title| {
+            // Parse "(N)" prefix — same logic as JS getUnreadCountFromTitle().
+            let count: u32 = title
+                .trim_start()
+                .strip_prefix('(')
+                .and_then(|s| s.split_once(')'))
+                .and_then(|(n, _)| n.parse::<u32>().ok())
+                .unwrap_or(0);
+
+            // Parse sender from "(N) SENDER | Messenger" format.
+            //   "(1) Jouda | Messenger"  → "Jouda"
+            //   "(1) Messenger"          → ""  (inbox / no open conversation)
+            //   "Jouda píše!" / typing   → ""  (count==0, skipped)
+            let sender: String = if count > 0 {
+                title
+                    .trim_start()
+                    .strip_prefix('(')
+                    .and_then(|s| s.split_once(')'))
+                    .and_then(|(_, rest)| {
+                        rest.trim()
+                            .split_once(" | Messenger")
+                            .map(|(name, _)| name.trim().to_owned())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            // Detect typing indicator: count==0 AND title is not the plain
+            // "Messenger" (all-read) AND has no "(N)" prefix AND the title is
+            // not empty AND does not contain " | Messenger" (which indicates a
+            // background conversation tab title like "Alice | Messenger" —
+            // Bug 2 false positive) AND the title is not blank (Bug 3: empty
+            // title from WebKitWebProcess crash must not be classified as typing).
+            let is_typing_indicator = count == 0
+                && !title.trim().is_empty()
+                && title.trim() != "Messenger"
+                && !title.trim_start().starts_with('(')
+                && !title.contains(" | Messenger");
+
+            log::info!(
+                "[MessengerX][TitleChange] title={:?} parsed_count={} sender={:?} is_typing={}",
+                title,
+                count,
+                sender,
+                is_typing_indicator,
+            );
+            let app = webview_window.app_handle().clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::commands::update_unread_count_from_title(
+                    count,
+                    sender,
+                    is_typing_indicator,
+                    app,
+                ) {
+                    log::warn!("[MessengerX][TitleChange] update_unread_count error: {e}");
+                }
+            });
+        })
         // Navigation policy: allow Messenger / Facebook CDN domains;
         // open everything else in the system browser.
         .on_navigation(move |url| {
