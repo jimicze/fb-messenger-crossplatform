@@ -93,3 +93,15 @@ fn main() {
 
     messengerx_lib::run()
 }
+
+/// On Linux, clear XDG startup-notification environment variables before
+/// WRY/GTK reads them, suppressing the GNOME "Ready 'AppName'" startup toast.
+///
+/// Effective on X11: prevents GTK3 from sending `_NET_STARTUP_INFO` completion.
+/// On Wayland the primary fix is `StartupNotify=false` in the `.desktop` file.
+#[cfg(target_os = "linux")]
+fn suppress_gnome_startup_notification() {
+    // Safety: called once before any other threads are spawned.
+    std::env::remove_var("DESKTOP_STARTUP_ID");
+    std::env::remove_var("XDG_ACTIVATION_TOKEN");
+}
