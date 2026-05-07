@@ -2409,6 +2409,22 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let nav_app_handle = app.handle().clone();
 
     // ------------------------------------------------------------------
+    // Phase K: crash detection state.
+    //
+    // If `title` becomes "" after a successful load, this almost certainly
+    // means the WebKitWebProcess has crashed.  On Linux/VMware this is
+    // triggered by `GStreamer element autoaudiosink not found` → NULL
+    // pointer dereference inside WebKit's media pipeline.
+    //
+    // `had_good_title` is set to `true` the first time we see a title that
+    // looks like a real Messenger page ("Messenger", "(N) Messenger", …).
+    // When we then observe `title=""` we log a WARN and schedule an auto-
+    // reload (up to MAX_CRASH_RELOADS times per session).
+    // ------------------------------------------------------------------
+    let had_good_title = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+    // ------------------------------------------------------------------
     // 3. Determine initial URL based on connectivity.
     //    If offline, load a local fallback page instead of messenger.com.
     // ------------------------------------------------------------------
@@ -2483,54 +2499,136 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // NOTIF_STATE deduplication suppresses double-notifications when
         // the same count is reported by both paths.
         // ------------------------------------------------------------------
-        .on_document_title_changed(move |webview_window, title| {
-            // Parse "(N)" prefix — same logic as JS getUnreadCountFromTitle().
-            let count: u32 = title
-                .trim_start()
-                .strip_prefix('(')
-                .and_then(|s| s.split_once(')'))
-                .and_then(|(n, _)| n.parse::<u32>().ok())
-                .unwrap_or(0);
+        .on_document_title_changed({
+            let had_good_title = had_good_title.clone();
+            let crash_reload_count = crash_reload_count.clone();
+            move |webview_window, title| {
+                // Parse "(N)" prefix — same logic as JS getUnreadCountFromTitle().
+                let count: u32 = title
+                    .trim_start()
+                    .strip_prefix('(')
+                    .and_then(|s| s.split_once(')'))
+                    .and_then(|(n, _)| n.parse::<u32>().ok())
+                    .unwrap_or(0);
 
-            // Do NOT extract sender from "(N) SENDER | Messenger" — SENDER is the
-            // *currently open* conversation, not the author of the new message.
-            // Example: user has "Karel Novák" open; "Jouda" sends a message →
-            // title becomes "(1) Karel Novák | Messenger" → wrong sender.
-            // The JS IPC path (macOS) correctly uses getFirstUnreadSenderName()
-            // which reads the actual unread entry from the DOM sidebar.
-            // On Win11/Linux we fall back to the generic "Nová zpráva" string.
-            let sender = String::new();
+                // Do NOT extract sender from "(N) SENDER | Messenger" — SENDER is the
+                // *currently open* conversation, not the author of the new message.
+                // Example: user has "Karel Novák" open; "Jouda" sends a message →
+                // title becomes "(1) Karel Novák | Messenger" → wrong sender.
+                // The JS IPC path (macOS) correctly uses getFirstUnreadSenderName()
+                // which reads the actual unread entry from the DOM sidebar.
+                // On Win11/Linux we fall back to the generic "Nová zpráva" string.
+                let sender = String::new();
 
-            // Detect typing indicator: count==0 AND title is not the plain
-            // "Messenger" (all-read) AND has no "(N)" prefix AND the title is
-            // not empty AND does not contain " | Messenger" (which indicates a
-            // background conversation tab title like "Alice | Messenger" —
-            // Bug 2 false positive) AND the title is not blank (Bug 3: empty
-            // title from WebKitWebProcess crash must not be classified as typing).
-            let is_typing_indicator = count == 0
-                && !title.trim().is_empty()
-                && title.trim() != "Messenger"
-                && !title.trim_start().starts_with('(')
-                && !title.contains(" | Messenger");
+                // Detect typing indicator: count==0 AND title is not the plain
+                // "Messenger" (all-read) AND has no "(N)" prefix AND the title is
+                // not empty AND does not contain " | Messenger" (which indicates a
+                // background conversation tab title like "Alice | Messenger" —
+                // Bug 2 false positive) AND the title is not blank (Bug 3: empty
+                // title from WebKitWebProcess crash must not be classified as typing).
+                let is_typing_indicator = count == 0
+                    && !title.trim().is_empty()
+                    && title.trim() != "Messenger"
+                    && !title.trim_start().starts_with('(')
+                    && !title.contains(" | Messenger");
 
-            log::info!(
-                "[MessengerX][TitleChange] title={:?} parsed_count={} sender={:?} is_typing={}",
-                title,
-                count,
-                sender,
-                is_typing_indicator,
-            );
-            let app = webview_window.app_handle().clone();
-            std::thread::spawn(move || {
-                if let Err(e) = crate::commands::update_unread_count_from_title(
+                log::info!(
+                    "[MessengerX][TitleChange] title={:?} parsed_count={} sender={:?} is_typing={}",
+                    title,
                     count,
                     sender,
                     is_typing_indicator,
-                    app,
-                ) {
-                    log::warn!("[MessengerX][TitleChange] update_unread_count error: {e}");
+                );
+                let app = webview_window.app_handle().clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::commands::update_unread_count_from_title(
+                        count,
+                        sender,
+                        is_typing_indicator,
+                        app,
+                    ) {
+                        log::warn!("[MessengerX][TitleChange] update_unread_count error: {e}");
+                    }
+                });
+
+                // ---------------------------------------------------------
+                // Phase K: WebKitWebProcess crash detection + auto-reload.
+                //
+                // A "good" title contains "Messenger", meaning the SPA has
+                // loaded successfully at least once this session.  If the
+                // title subsequently becomes empty ("") the WebKitWebProcess
+                // has almost certainly crashed (on Linux/VMware this is
+                // caused by a NULL-pointer deref inside GStreamer's audio
+                // pipeline when autoaudiosink is not found).
+                //
+                // Guard: had_good_title is reset before each reload so that
+                // a series of back-to-back crashes doesn't bypass the count.
+                // ---------------------------------------------------------
+                if title.contains("Messenger") && !title.trim().is_empty() {
+                    had_good_title.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-            });
+
+                const MAX_CRASH_RELOADS: u32 = 3;
+                if title.trim().is_empty()
+                    && had_good_title.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let prev_count = crash_reload_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if prev_count < MAX_CRASH_RELOADS {
+                        log::warn!(
+                            "[MessengerX][CrashDetect] WebKitWebProcess crash suspected \
+                             (title became empty after successful load). \
+                             Scheduling auto-reload {}/{MAX_CRASH_RELOADS}.",
+                            prev_count + 1,
+                        );
+                        // Reset so the next reload doesn't immediately re-trigger.
+                        had_good_title.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let wv = webview_window.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            match url::Url::parse("https://www.messenger.com/") {
+                                Ok(u) => {
+                                    if let Err(e) = wv.navigate(u) {
+                                        log::warn!(
+                                            "[MessengerX][CrashDetect] navigate() failed: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[MessengerX][CrashDetect] URL parse failed: {e}"
+                                    );
+                                }
+                            }
+                        });
+                    } else {
+                        log::warn!(
+                            "[MessengerX][CrashDetect] Max crash reloads ({MAX_CRASH_RELOADS}) \
+                             reached — not reloading again this session."
+                        );
+                    }
+                }
+            }
+        })
+        // ------------------------------------------------------------------
+        // Phase K: page-load timing hook.
+        //
+        // Logs `Started` (first byte / navigation committed) and `Finished`
+        // (DOMContentLoaded equivalent) with milliseconds since app launch.
+        // This lets us pinpoint which phase accounts for the 27-second white-
+        // screen gap observed on Win11 (WebView2 boot timing diagnostic).
+        // ------------------------------------------------------------------
+        .on_page_load(move |_webview_window, payload| {
+            use tauri::webview::PageLoadEvent;
+            let event_str = match payload.event() {
+                PageLoadEvent::Started => "Started",
+                PageLoadEvent::Finished => "Finished",
+            };
+            log::info!(
+                "[MessengerX][PageLoad] event={event_str} url={} t={}ms",
+                payload.url(),
+                setup_started.elapsed().as_millis(),
+            );
         })
         // Navigation policy: allow Messenger / Facebook CDN domains;
         // open everything else in the system browser.
@@ -2542,7 +2640,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let host = url.host_str().unwrap_or("");
-            log::info!("[MessengerX] on_navigation: host={host} url={url}");
+            log::info!(
+                "[MessengerX] on_navigation: host={host} url={url} t={}ms",
+                setup_started.elapsed().as_millis()
+            );
 
             // Handle Facebook's link shim: l.facebook.com/l.php?u=EXTERNAL_URL
             // Messenger wraps all external links in this shim — so `on_navigation`
