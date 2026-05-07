@@ -73,5 +73,39 @@ fn main() {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    set_webview2_no_proxy_auto_detect();
+
     messengerx_lib::run()
+}
+
+// -----------------------------------------------------------------------
+// Windows: suppress WPAD proxy auto-detection to eliminate the ~27-second
+// stall on first navigation.
+//
+// WebView2 inherits WinHTTP proxy settings including "Automatically detect
+// settings" (WPAD / DHCP Option 252 + DNS wpad.*).  On networks that do
+// not run a WPAD server the discovery attempt times out after ~27 seconds
+// before WebView2 falls back to DIRECT.  This manifests as a white window
+// on every app launch.
+//
+// `--proxy-auto-detect=0` (Chromium flag forwarded to the WebView2 child
+// process via WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS) disables automatic
+// proxy discovery while still honouring any manually configured proxy in
+// Windows Settings → Proxy → Manual proxy setup.  Corporate users who
+// configure a proxy explicitly are unaffected; only WPAD/PAC-script
+// auto-discovery is disabled.
+//
+// The env var must be set before WebView2 spawns its browser process,
+// which happens inside `messengerx_lib::run()`.  Setting it here in main()
+// before that call is the correct placement.
+// -----------------------------------------------------------------------
+#[cfg(target_os = "windows")]
+fn set_webview2_no_proxy_auto_detect() {
+    // Safety: called once at program start, before any threads are spawned.
+    // std::env::set_var is safe at this point.
+    std::env::set_var(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--proxy-auto-detect=0",
+    );
 }
