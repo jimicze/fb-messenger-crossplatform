@@ -3,6 +3,14 @@
   "identifier": "default",
   "description": "Default capabilities for the Messenger app",
   "windows": ["main"],
+  "remote": {
+    "urls": [
+      "https://www.messenger.com",
+      "https://*.messenger.com",
+      "https://www.facebook.com",
+      "https://*.facebook.com"
+    ]
+  },
   "permissions": [
     "core:default",
     "core:window:default",
