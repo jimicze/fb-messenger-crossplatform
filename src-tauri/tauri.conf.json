@@ -43,7 +43,8 @@
           "gstreamer1.0-plugins-good"
         ],
         "section": "web",
-        "priority": "optional"
+        "priority": "optional",
+        "desktopTemplate": "messengerx.desktop.hbs"
       },
       "appimage": {
         "bundleMediaFramework": true,
