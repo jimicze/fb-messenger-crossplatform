@@ -167,7 +167,18 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
             var _origProtoShow = ServiceWorkerRegistration.prototype.showNotification;
             ServiceWorkerRegistration.prototype.showNotification = function(title, options) {
                 if (window === window.top) {
-                    jlog('[SW.proto] showNotification intercepted: title=' + JSON.stringify(preview(title)));
+                    // Capture a 2-frame stack preview to identify which Messenger
+                    // module triggered the call.  Phase M diagnostic: helps decide
+                    // whether the Linux 3rd-toast is a duplicate main-thread
+                    // SW.proto path or a separate SW push event.
+                    var stackPreview = '';
+                    try {
+                        var s = (new Error('stack')).stack || '';
+                        stackPreview = s.split('\n').slice(1, 4).join(' || ');
+                        if (stackPreview.length > 360) stackPreview = stackPreview.slice(0, 357) + '...';
+                    } catch(_) {}
+                    jlog('[SW.proto] showNotification intercepted: title=' + JSON.stringify(preview(title)) +
+                         ' stack=' + JSON.stringify(stackPreview));
                 }
                 forwardToRust(title, options || {}, '[SW.proto]');
                 // Return a resolved Promise (matches the original API contract).
@@ -1782,6 +1793,57 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     dlog('[IPCProbe] ipcAvailable=' + _ipcAvailable + ' ' + _ipcDiag);
 
     // -----------------------------------------------------------------------
+    // 0b. Phase M trace — document-start beacon + SPA navigation wrappers.
+    //
+    //     `[DocStart]` is emitted at the earliest possible moment after the
+    //     init script runs (before any DOMContentLoaded handlers fire).  Its
+    //     `perfNow` value lets us cross-correlate with the Rust-side
+    //     `[PageLoad] event=Started` log to identify whether the Win11 27 s
+    //     white-screen gap lives in:
+    //       (a) WebView2 → first-byte (large [DocStart] perfNow), or
+    //       (b) document-start → DOMContentLoaded (small perfNow, large
+    //           [PageLoaded] domcontentloaded delta), or
+    //       (c) SPA hydration after DCL (visible via the history wrappers).
+    //
+    //     The history wrappers log every pushState/replaceState/popstate so
+    //     Messenger's client-side router transitions during boot become
+    //     traceable (e.g. `/` → `/t/<thread>` after auth restore).
+    // -----------------------------------------------------------------------
+    try {
+        var _docStartPerfNow = (typeof performance !== 'undefined' && performance.now)
+            ? Math.round(performance.now()) : -1;
+        var _docStartUrl = (location && location.href) ? location.href.slice(0, 160) : '';
+        dlog('[DocStart] perfNow=' + _docStartPerfNow + ' readyState=' + document.readyState + ' url=' + _docStartUrl);
+    } catch(_) {}
+
+    try {
+        function _logHistory(kind, urlArg) {
+            try {
+                var perfNow = (typeof performance !== 'undefined' && performance.now)
+                    ? Math.round(performance.now()) : -1;
+                var resolved = '';
+                try { resolved = new URL(String(urlArg || ''), location.href).href.slice(0, 160); }
+                catch(_) { resolved = String(urlArg || '').slice(0, 160); }
+                var current = (location && location.href) ? location.href.slice(0, 160) : '';
+                dlog('[Nav][' + kind + '] perfNow=' + perfNow + ' to=' + resolved + ' from=' + current);
+            } catch(_) {}
+        }
+        var _origPush = history.pushState;
+        history.pushState = function(state, title, url) {
+            _logHistory('pushState', url);
+            return _origPush.apply(this, arguments);
+        };
+        var _origReplace = history.replaceState;
+        history.replaceState = function(state, title, url) {
+            _logHistory('replaceState', url);
+            return _origReplace.apply(this, arguments);
+        };
+        window.addEventListener('popstate', function() {
+            _logHistory('popstate', location.href);
+        });
+    } catch(_) {}
+
+    // -----------------------------------------------------------------------
     // 1. Page-loaded ping (A5)
     // -----------------------------------------------------------------------
     var pingedDomReady = false;
@@ -2313,6 +2375,31 @@ fn log_platform_environment() {
     }
 }
 
+/// How long a previously consumed sender hint stays available for the
+/// typing-indicator-rearm fallback after the original count-rise dispatch
+/// already consumed the live hint.  Long enough to span a typical typing
+/// pause + reply burst, short enough to avoid attributing a later message
+/// from a different conversation to the previous sender.
+const SENDER_HINT_RETAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cache of sender names extracted from the JS DOM scraper and pushed to
+/// Rust via the `__MX_SENDER_V1__` document.title side-channel.
+///
+/// See the field-level docs at the [`SenderHintCache::default`]-constructed
+/// instance in `setup_app` for the lifecycle.
+#[derive(Default, Debug)]
+struct SenderHintCache {
+    /// Fresh hint pending consumption by the next count-rise notification.
+    /// Cleared (`take`) by the worker as soon as it matches `count`.
+    live: Option<(u32, String, std::time::Instant)>,
+    /// Last sender that was successfully consumed from `live`, kept for
+    /// [`SENDER_HINT_RETAIN`] so the typing-indicator-rearm path can
+    /// re-attribute the rearm fire to the same author when no fresh
+    /// `live` hint is available.  `Instant` is the time of consumption,
+    /// not the time the hint was originally produced.
+    retained: Option<(String, std::time::Instant)>,
+}
+
 /// Run the Tauri application.
 ///
 /// Registers all plugins, builds the main webview window with JS injection
@@ -2432,7 +2519,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load persisted settings so we can bake the zoom level into the
     //    initialization script before the window is created.
     // ------------------------------------------------------------------
+    // Phase M trace: measure load_settings cost (sync std::fs, can be slow on
+    // first launch on Win11 if appdata dir needs to be created on a slow disk).
+    let load_settings_start = std::time::Instant::now();
     let settings = services::auth::load_settings(app.handle()).unwrap_or_default();
+    log::info!(
+        "[MessengerX][Boot][Trace] load_settings elapsed={}ms last_url_present={} \
+         start_minimized={} appearance={:?} zoom={}",
+        load_settings_start.elapsed().as_millis(),
+        settings.last_messenger_url.is_some(),
+        settings.start_minimized,
+        settings.appearance,
+        settings.zoom_level,
+    );
     let zoom_level = settings.zoom_level;
 
     // ------------------------------------------------------------------
@@ -2478,9 +2577,25 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     let had_good_title = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let pending_sender_hint = std::sync::Arc::new(std::sync::Mutex::new(
-        None::<(u32, String, std::time::Instant)>,
-    ));
+    // ------------------------------------------------------------------
+    // Sender-hint cache.
+    //
+    // `live`     – Fresh hint emitted by the JS side-channel
+    //              (`__MX_SENDER_V1__?count=…&sender=…` document.title sentinel).
+    //              Stored by the title-change handler, consumed by the
+    //              `count > 0` worker when a notification is being dispatched.
+    //              Taken via `Option::take` so the same hint cannot satisfy
+    //              two unrelated count-rises.
+    // `retained` – Last successfully consumed sender, kept for
+    //              `SENDER_HINT_RETAIN` (~10 s) so the typing-indicator-rearm
+    //              path (count drops to 0 from typing, then returns) can
+    //              re-use the same author when no fresh `live` hint has been
+    //              re-emitted by JS for the same conversation.  Without this
+    //              the rearm fire falls back to the generic "Nová zpráva"
+    //              title even when the originating sender is still known.
+    // ------------------------------------------------------------------
+    let pending_sender_hint =
+        std::sync::Arc::new(std::sync::Mutex::new(SenderHintCache::default()));
     // Set to `true` after a confirmed WebKitWebProcess crash (title became ""
     // after a good load).  When active on Linux, the `on_navigation` handler
     // blocks the fbsbx.com maw_proxy_page that is known to trigger the
@@ -2492,12 +2607,28 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 3. Determine initial URL based on connectivity.
     //    If offline, load a local fallback page instead of messenger.com.
     // ------------------------------------------------------------------
+    // Phase M trace: is_likely_online does a TcpStream::connect_timeout(2s)
+    // — if DNS or routing is degraded this can dominate boot time on Win11.
+    let online_check_start = std::time::Instant::now();
     let is_online = services::network::is_likely_online();
+    log::info!(
+        "[MessengerX][Boot][Trace] is_likely_online elapsed={}ms result={is_online}",
+        online_check_start.elapsed().as_millis()
+    );
+    // Phase M trace: surface the URL-resolution decision so the persisted-URL
+    // safe-check verdict (Commit-A diagnostic ground truth) is visible without
+    // re-running the binary in dev.  Empty `last_url_raw` means first-launch.
+    let last_url_raw = settings.last_messenger_url.as_deref().unwrap_or("");
+    let last_url_safe = !last_url_raw.is_empty() && is_safe_messenger_startup_url(last_url_raw);
     let startup_url = settings
         .last_messenger_url
         .as_deref()
         .filter(|u| is_safe_messenger_startup_url(u))
         .unwrap_or("https://www.messenger.com/");
+    log::info!(
+        "[MessengerX][Boot][Trace] startup_url decision: last_raw={last_url_raw:?} \
+         safe={last_url_safe} chosen={startup_url:?}"
+    );
     let webview_url = if is_online {
         log::info!("[MessengerX][Boot] initial_url={startup_url}");
         WebviewUrl::External(url::Url::parse(startup_url)?)
@@ -2519,6 +2650,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     // 4. Build the main window programmatically.
     // ------------------------------------------------------------------
+    // Phase M trace: WebviewWindowBuilder construction starts here.  The
+    // `.build()?` call below is the synchronous handoff to the OS WebView
+    // (WebView2 on Windows, WebKitGTK on Linux, WKWebView on macOS) — on
+    // Win11 first-run this can include WebView2 runtime initialization,
+    // which historically dominates the 27 s white-screen gap.
+    let webview_build_started = std::time::Instant::now();
     let builder = WebviewWindowBuilder::new(app, "main", webview_url)
         .title("Messenger X")
         .inner_size(1200.0, 800.0)
@@ -2595,7 +2732,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     if let (Some(count), Some(sender)) = (count_hint, sender_hint) {
                         match pending_sender_hint.lock() {
                             Ok(mut hint) => {
-                                *hint = Some((count, sender.clone(), std::time::Instant::now()));
+                                hint.live =
+                                    Some((count, sender.clone(), std::time::Instant::now()));
                                 log::info!(
                                     "[MessengerX][SenderHint] stored count={} sender={:?}",
                                     count,
@@ -2660,10 +2798,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let sender = if count > 0 {
                         let deadline = std::time::Instant::now()
                             + std::time::Duration::from_millis(1_200);
-                        loop {
+                        let resolved = loop {
+                            let mut peek_retained: Option<String> = None;
                             match sender_hint.lock() {
                                 Ok(mut hint) => {
-                                    if let Some((hint_count, sender, stored_at)) = hint.take() {
+                                    if let Some((hint_count, sender, stored_at)) = hint.live.take()
+                                    {
                                         let age = stored_at.elapsed();
                                         if hint_count == count
                                             && age <= std::time::Duration::from_secs(3)
@@ -2674,6 +2814,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                 sender,
                                                 age.as_millis(),
                                             );
+                                            // Promote to retained so a typing-
+                                            // indicator-rearm fire (same conv,
+                                            // count drops to 0 then returns)
+                                            // can re-attribute the fire to the
+                                            // same author without waiting for
+                                            // a fresh JS hint that may never
+                                            // arrive (DOM unchanged).
+                                            hint.retained =
+                                                Some((sender.clone(), std::time::Instant::now()));
                                             break sender;
                                         }
 
@@ -2683,6 +2832,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                             count,
                                             age.as_millis(),
                                         );
+                                    }
+
+                                    // No live hint — peek retained for fallback
+                                    // (do not consume yet; only used if the wait
+                                    // deadline elapses with no live hint).
+                                    if let Some((sender, consumed_at)) = &hint.retained {
+                                        if consumed_at.elapsed() <= SENDER_HINT_RETAIN {
+                                            peek_retained = Some(sender.clone());
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -2694,10 +2852,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if std::time::Instant::now() >= deadline {
+                                if let Some(sender) = peek_retained {
+                                    log::info!(
+                                        "[MessengerX][SenderHint] using retained sender (typing-rearm fallback) sender={:?} count={}",
+                                        sender,
+                                        count,
+                                    );
+                                    break sender;
+                                }
                                 break String::new();
                             }
                             std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
+                        };
+                        resolved
                     } else {
                         String::new()
                     };
@@ -2915,6 +3082,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
 
+                // Phase M trace: explicit accept verdict so the count of
+                // accept-vs-block decisions during boot can be tallied
+                // straight from the log without inferring from absence.
+                log::debug!(
+                    "[MessengerX][Boot][Trace] on_navigation accept host={host} t={}ms",
+                    setup_started.elapsed().as_millis()
+                );
                 true
             }
         })
@@ -2923,6 +3097,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     log::info!(
         "[MessengerX][Boot] webview window built (online={is_online}, t={}ms)",
         setup_started.elapsed().as_millis()
+    );
+    log::info!(
+        "[MessengerX][Boot][Trace] WebviewWindowBuilder.build elapsed={}ms",
+        webview_build_started.elapsed().as_millis()
     );
 
     // ------------------------------------------------------------------
@@ -3559,6 +3737,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                     &tr_ready2,
                                                                     "update",
                                                                     false,
+                                                                    "updater-installed",
                                                                 );
                                                                 h2.restart();
                                                             }
@@ -3572,6 +3751,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                     &tr_err2,
                                                                     "update",
                                                                     false,
+                                                                    "updater-install-failed",
                                                                 );
                                                             }
                                                         }
@@ -3587,6 +3767,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         save_check_timestamp(&h);
                                         let _ = services::notification::show_notification(
                                             &h, "Messenger X", &tr_none, "update", false,
+                                            "updater-up-to-date",
                                         );
                                     }
                                     Err(e) => {
@@ -3595,6 +3776,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         );
                                         let _ = services::notification::show_notification(
                                             &h, "Messenger X", &tr_err, "update", false,
+                                            "updater-check-failed",
                                         );
                                     }
                                 },
@@ -3602,6 +3784,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     log::warn!("[MessengerX] Updater init failed: {e}");
                                     let _ = services::notification::show_notification(
                                         &h, "Messenger X", &tr_err, "update", false,
+                                        "updater-init-failed",
                                     );
                                 }
                             }
@@ -4068,6 +4251,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         &tr_none,
                                         "update",
                                         false,
+                                        "updater-up-to-date",
                                     );
                                 }
                                 Err(e) => {
@@ -4078,6 +4262,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         &tr_err,
                                         "update",
                                         false,
+                                        "updater-check-failed",
                                     );
                                 }
                             },
@@ -4089,6 +4274,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     &tr_err,
                                     "update",
                                     false,
+                                    "updater-init-failed",
                                 );
                             }
                         }
@@ -4267,6 +4453,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                 &tr_ready_c,
                                                                 "update",
                                                                 false,
+                                                                "updater-startup-installed",
                                                             );
                                                             h_install.restart();
                                                         }
@@ -4280,6 +4467,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                 &tr_err_c,
                                                                 "update",
                                                                 false,
+                                                                "updater-startup-install-failed",
                                                             );
                                                         }
                                                     }
@@ -4348,6 +4536,65 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    mod sender_hint_cache {
+        use super::super::{SenderHintCache, SENDER_HINT_RETAIN};
+        use std::time::{Duration, Instant};
+
+        #[test]
+        fn default_cache_is_empty() {
+            let c = SenderHintCache::default();
+            assert!(c.live.is_none());
+            assert!(c.retained.is_none());
+        }
+
+        #[test]
+        fn live_take_then_retained_promotion_round_trip() {
+            let mut c = SenderHintCache {
+                live: Some((1, "Alice".into(), Instant::now())),
+                ..Default::default()
+            };
+            // Simulate worker promotion path.
+            let taken = c.live.take().expect("live present");
+            assert_eq!(taken.1, "Alice");
+            c.retained = Some((taken.1.clone(), Instant::now()));
+            assert!(c.live.is_none());
+            let (sender, _) = c.retained.as_ref().expect("retained set");
+            assert_eq!(sender, "Alice");
+        }
+
+        #[test]
+        fn retained_ttl_is_long_enough_to_cover_typing_pause() {
+            // Phase M design: a typical typing pause + reply burst should
+            // remain inside the retain window so the rearm fire reuses the
+            // sender.  Guard against accidental shrinkage to e.g. 1 s.
+            assert!(
+                SENDER_HINT_RETAIN >= Duration::from_secs(5),
+                "retain window must cover typical typing pause (>= 5s)"
+            );
+            // Also guard against accidental growth that would risk
+            // misattributing a later message from a different conversation.
+            assert!(
+                SENDER_HINT_RETAIN <= Duration::from_secs(30),
+                "retain window must stay short enough to avoid cross-conv attribution"
+            );
+        }
+
+        #[test]
+        fn retained_expiry_check_uses_consumed_at_age() {
+            // Stamp consumed_at far in the past — outside retain window.
+            let stale = Instant::now() - SENDER_HINT_RETAIN - Duration::from_secs(1);
+            let c = SenderHintCache {
+                retained: Some(("Bob".into(), stale)),
+                ..Default::default()
+            };
+            let (_sender, consumed_at) = c.retained.as_ref().unwrap();
+            assert!(
+                consumed_at.elapsed() > SENDER_HINT_RETAIN,
+                "stale retained entry must be detected as expired"
+            );
+        }
+    }
+
     mod windows_startup_activation {
         const SOURCE: &str = include_str!("lib.rs");
 

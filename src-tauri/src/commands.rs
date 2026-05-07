@@ -456,6 +456,7 @@ pub fn send_notification(
         &body,
         &tag,
         effective_silent,
+        "ipc-send-notification",
     );
     match &result {
         Ok(()) => log::info!("[MessengerX][Notification] send_notification finished successfully"),
@@ -643,11 +644,12 @@ fn update_unread_count_core(
             activity_sig,
             effective_silent,
         );
-        if let Err(e) = crate::services::notification::show_notification(
+        if let Err(e) = crate::services::notification_dispatcher::dispatch(
             &app,
+            decision.reason,
+            sender.trim(),
+            count,
             &notif_title,
-            "",
-            "messenger-unread",
             effective_silent,
         ) {
             log::warn!("[MessengerX][Notification] unread-count notification failed: {e}");
