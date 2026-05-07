@@ -2492,25 +2492,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|(n, _)| n.parse::<u32>().ok())
                 .unwrap_or(0);
 
-            // Parse sender from "(N) SENDER | Messenger" format.
-            //   "(1) Jouda | Messenger"  → "Jouda"
-            //   "(1) Messenger"          → ""  (inbox / no open conversation)
-            //   "Jouda píše!" / typing   → ""  (count==0, skipped)
-            let sender: String = if count > 0 {
-                title
-                    .trim_start()
-                    .strip_prefix('(')
-                    .and_then(|s| s.split_once(')'))
-                    .and_then(|(_, rest)| {
-                        rest.trim()
-                            .split_once(" | Messenger")
-                            .map(|(name, _)| name.trim().to_owned())
-                    })
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+            // Do NOT extract sender from "(N) SENDER | Messenger" — SENDER is the
+            // *currently open* conversation, not the author of the new message.
+            // Example: user has "Karel Novák" open; "Jouda" sends a message →
+            // title becomes "(1) Karel Novák | Messenger" → wrong sender.
+            // The JS IPC path (macOS) correctly uses getFirstUnreadSenderName()
+            // which reads the actual unread entry from the DOM sidebar.
+            // On Win11/Linux we fall back to the generic "Nová zpráva" string.
+            let sender = String::new();
 
             // Detect typing indicator: count==0 AND title is not the plain
             // "Messenger" (all-read) AND has no "(N)" prefix AND the title is
