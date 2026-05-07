@@ -181,6 +181,15 @@ const MIN_SIG_CHANGE_NOTIFY_SECS: u64 = 3;
 /// notification, no new banner is shown.
 const TYPING_REARM_SECS: u64 = 5;
 
+/// Seconds after the last notification before the state machine re-arms
+/// unconditionally, even when the unread count has not changed.
+///
+/// Use case: user ignores a notification (doesn't read it); after this many
+/// seconds the next title-change event — regardless of count — will fire a
+/// new banner.  The fired timestamp is refreshed on each re-arm so the cadence
+/// is at most once per `NOTIF_REARM_SECS`, not once per event.
+const NOTIF_REARM_SECS: u64 = 60;
+
 /// Returns the current Unix time in seconds (best-effort; 0 on error).
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -271,6 +280,23 @@ fn decide_notification(
             typing_rearm_exhausted,
         } => {
             if count == 0 {
+                // If the window is focused the user is actively looking at the
+                // app — treat count=0 as an immediate confirmed read-all and
+                // skip the ZeroPending debounce.  The 7 s debounce exists only
+                // to distinguish genuine reads from the transient title-flicker
+                // Messenger produces when the user is NOT watching.
+                if is_focused {
+                    *state = NotifState::Idle;
+                    return NotificationDecision {
+                        should_fire: false,
+                        clear_badge: true,
+                        reason: "focused-read-all",
+                        previous_count: prev_count,
+                        count_increased: false,
+                        sig_changed: false,
+                        elapsed_since_fire: Some(now.saturating_sub(fired_at_secs)),
+                    };
+                }
                 *state = NotifState::ZeroPending {
                     prev_count,
                     prev_sig,
@@ -297,11 +323,19 @@ fn decide_notification(
                 // bypasses this floor so genuine new messages are never delayed.
                 let sig_under_floor =
                     sig_changed && !count_increased && elapsed < MIN_SIG_CHANGE_NOTIFY_SECS;
+                // Time-based re-arm: if the user has been ignoring the notification
+                // for NOTIF_REARM_SECS without reading (window never became focused
+                // while count was 0), fire once more so the message isn't silently
+                // missed.  The fired timestamp is updated on each re-arm, bounding
+                // the repeat rate to at most once per NOTIF_REARM_SECS (anti-spam).
+                let time_rearm = elapsed >= NOTIF_REARM_SECS;
                 let should_fire = notifications_enabled
                     && !is_focused
-                    && (count_increased || (sig_changed && !sig_under_floor));
+                    && (count_increased || (sig_changed && !sig_under_floor) || time_rearm);
                 let reason = if count_increased {
                     "count-increased"
+                } else if time_rearm {
+                    "time-rearm-60s"
                 } else if sig_changed && sig_under_floor {
                     "sig-changed-floor-suppressed"
                 } else if sig_changed {
@@ -337,6 +371,20 @@ fn decide_notification(
             prev_typing_rearm_exhausted,
         } => {
             if count == 0 {
+                // Same focused-read-all shortcut as in the Notified arm: if the
+                // window is focused the user is watching — reset immediately.
+                if is_focused {
+                    *state = NotifState::Idle;
+                    return NotificationDecision {
+                        should_fire: false,
+                        clear_badge: true,
+                        reason: "focused-read-all",
+                        previous_count: prev_count,
+                        count_increased: false,
+                        sig_changed: false,
+                        elapsed_since_fire: Some(now.saturating_sub(prev_fired_at_secs)),
+                    };
+                }
                 let zero_elapsed = now.saturating_sub(zero_since_secs);
                 if zero_elapsed >= ZERO_SUSTAIN_SECS {
                     *state = NotifState::Idle;
@@ -375,9 +423,16 @@ fn decide_notification(
                 let typing_rearm = zero_from_typing
                     && elapsed >= TYPING_REARM_SECS
                     && !prev_typing_rearm_exhausted;
+                // Time-based re-arm: same semantics as in the Notified arm — if
+                // NOTIF_REARM_SECS have elapsed since the last fire and the user
+                // still hasn't read the message, fire once more.
+                let time_rearm = elapsed >= NOTIF_REARM_SECS;
                 let should_fire = notifications_enabled
                     && !is_focused
-                    && (count_increased || (sig_changed && !sig_under_floor) || typing_rearm);
+                    && (count_increased
+                        || (sig_changed && !sig_under_floor)
+                        || typing_rearm
+                        || time_rearm);
                 let reason = if count_increased {
                     "zero-bounce-count-increased"
                 } else if sig_changed && sig_under_floor {
@@ -386,13 +441,18 @@ fn decide_notification(
                     "zero-bounce-sig-changed"
                 } else if typing_rearm {
                     "typing-indicator-rearm"
+                } else if time_rearm {
+                    "time-rearm-60s"
                 } else {
                     "zero-bounce-oscillation-suppressed"
                 };
                 // Compute whether the new Notified entry should block future rearms:
-                //   - genuine fire (count/sig): reset to false — new message, rearm allowed again
-                //   - typing_rearm fire:        set to true  — consumed the one allowed rearm
-                //   - no fire (suppressed):     carry forward prev so it survives oscillation
+                //   - genuine fire (count/sig/time): reset to false — new message,
+                //     rearm allowed again from a fresh baseline.
+                //   - typing_rearm fire:             set to true  — consumed the one
+                //     allowed rearm for this Notified entry.
+                //   - no fire (suppressed):          carry forward prev so exhausted
+                //     flag survives the oscillation cycle.
                 let new_typing_rearm_exhausted = if should_fire {
                     typing_rearm // true only when the rearm path fired
                 } else {
@@ -1213,7 +1273,8 @@ mod tests {
             typing_rearm_exhausted: false,
         };
         // Same count, empty sig — must not fire.
-        let decision = decide_notification(&mut state, 1, "", false, true, false, 200);
+        // Use now=159 so elapsed=59 < NOTIF_REARM_SECS=60 (time-rearm must not kick in).
+        let decision = decide_notification(&mut state, 1, "", false, true, false, 159);
         assert!(
             !decision.should_fire,
             "empty activity_sig must not trigger sig_changed notification"
@@ -1421,5 +1482,226 @@ mod tests {
 
         let normal = 1.1_f64.clamp(MIN_ZOOM, MAX_ZOOM);
         assert!((normal - 1.1).abs() < f64::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: focused→Idle immediate reset tests
+    // -----------------------------------------------------------------------
+
+    /// When the window is focused and count drops to 0 from Notified, the
+    /// state must reset to Idle immediately (no ZeroPending debounce).
+    #[test]
+    fn test_focused_read_all_from_notified_resets_immediately() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(),
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+        // is_focused=true, count=0 → must go straight to Idle.
+        let d = decide_notification(&mut state, 0, "", true, true, false, 102);
+        assert!(!d.should_fire);
+        assert!(d.clear_badge, "focused read-all must clear badge");
+        assert_eq!(d.reason, "focused-read-all");
+        assert_eq!(state, NotifState::Idle);
+    }
+
+    /// Same as above but starting from ZeroPending (window was already
+    /// in zero-pending state when the user gains focus).
+    #[test]
+    fn test_focused_read_all_from_zero_pending_resets_immediately() {
+        let mut state = NotifState::ZeroPending {
+            prev_count: 1,
+            prev_sig: String::new(),
+            prev_fired_at_secs: 100,
+            zero_since_secs: 102,
+            zero_from_typing: false,
+            prev_typing_rearm_exhausted: false,
+        };
+        let d = decide_notification(&mut state, 0, "", true, true, false, 104);
+        assert!(!d.should_fire);
+        assert!(d.clear_badge, "focused read-all must clear badge");
+        assert_eq!(d.reason, "focused-read-all");
+        assert_eq!(state, NotifState::Idle);
+    }
+
+    /// Full scenario: user gets notified, opens & reads the message
+    /// (focused+count→0 → Idle), minimizes, new message arrives → fires.
+    #[test]
+    fn test_focused_read_then_minimize_then_new_message_fires() {
+        // T=100: initial notification fires (Idle → Notified).
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+
+        // T=103: user opens window (focused=true), count still 1 — focus
+        // reset in lib.rs is skipped because count>0; state unchanged.
+        // (No decide_notification call here — that would be a title-change
+        // event from Messenger which may or may not happen on focus.)
+
+        // T=105: user reads the message → count drops to 0, window focused.
+        let d = decide_notification(&mut state, 0, "", true, true, false, 105);
+        assert!(!d.should_fire);
+        assert_eq!(d.reason, "focused-read-all");
+        assert_eq!(state, NotifState::Idle, "must reset to Idle after focused read");
+
+        // T=108: user minimizes; new message arrives → count=1, not focused.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 108);
+        assert!(d.should_fire, "new message after focused read must fire notification");
+        assert_eq!(d.reason, "idle-count-positive");
+    }
+
+    /// Focused read with typing_rearm_exhausted=true: state must still reset.
+    #[test]
+    fn test_focused_read_all_resets_even_when_typing_rearm_exhausted() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(),
+            fired_at_secs: 100,
+            typing_rearm_exhausted: true, // previously exhausted
+        };
+        let d = decide_notification(&mut state, 0, "", true, true, false, 110);
+        assert!(!d.should_fire);
+        assert_eq!(d.reason, "focused-read-all");
+        assert_eq!(state, NotifState::Idle);
+
+        // New message must fire without any exhausted flag interference.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 115);
+        assert!(d.should_fire);
+        assert_eq!(d.reason, "idle-count-positive");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2: 60 s time-rearm tests
+    // -----------------------------------------------------------------------
+
+    /// After NOTIF_REARM_SECS with the same count the notification must re-fire.
+    #[test]
+    fn test_time_rearm_60s_fires_after_elapsed() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(),
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+        // exactly at the boundary (elapsed == NOTIF_REARM_SECS) → fire
+        let now = 100 + NOTIF_REARM_SECS;
+        let d = decide_notification(&mut state, 1, "", false, true, false, now);
+        assert!(d.should_fire, "time-rearm must fire at the 60 s boundary");
+        assert_eq!(d.reason, "time-rearm-60s");
+        // fired_at_secs must be refreshed to now.
+        assert_eq!(
+            state,
+            NotifState::Notified {
+                count: 1,
+                sig: String::new(),
+                fired_at_secs: now,
+                typing_rearm_exhausted: false,
+            }
+        );
+    }
+
+    /// One second before NOTIF_REARM_SECS must still be suppressed.
+    #[test]
+    fn test_time_rearm_60s_suppressed_before_elapsed() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(),
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+        let now = 100 + NOTIF_REARM_SECS - 1;
+        let d = decide_notification(&mut state, 1, "", false, true, false, now);
+        assert!(!d.should_fire, "time-rearm must not fire before 60 s");
+        assert_eq!(d.reason, "same-activity-suppressed");
+    }
+
+    /// After a time-rearm fires, the fired_at timestamp resets; another
+    /// immediate call must be suppressed (anti-spam guard).
+    #[test]
+    fn test_time_rearm_60s_resets_timer_after_fire() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(),
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+        let t1 = 100 + NOTIF_REARM_SECS;
+        // First re-arm fires.
+        let d = decide_notification(&mut state, 1, "", false, true, false, t1);
+        assert!(d.should_fire);
+        assert_eq!(d.reason, "time-rearm-60s");
+
+        // 1 second later — must be suppressed (timer reset to t1).
+        let d = decide_notification(&mut state, 1, "", false, true, false, t1 + 1);
+        assert!(!d.should_fire, "second immediate call must be suppressed");
+        assert_eq!(d.reason, "same-activity-suppressed");
+    }
+
+    /// time-rearm must NOT fire when window is focused (user can see the message).
+    #[test]
+    fn test_time_rearm_60s_suppressed_when_focused() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(),
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+        let now = 100 + NOTIF_REARM_SECS;
+        // is_focused=true
+        let d = decide_notification(&mut state, 1, "", true, true, false, now);
+        assert!(!d.should_fire, "time-rearm must not fire when window is focused");
+    }
+
+    /// time-rearm from ZeroPending: user read the message quickly (within 7 s)
+    /// but a new message arrives 60 s after the original notification.
+    #[test]
+    fn test_time_rearm_60s_from_zero_pending_fires() {
+        // Original notif fired at T=100, user read at T=103 (ZeroPending entered
+        // via unfocused path to keep the test independent of fix 1).
+        let mut state = NotifState::ZeroPending {
+            prev_count: 1,
+            prev_sig: String::new(),
+            prev_fired_at_secs: 100,
+            zero_since_secs: 103,
+            zero_from_typing: false,
+            prev_typing_rearm_exhausted: false,
+        };
+        // New message arrives at T=162 (elapsed from original fire = 62 >= 60).
+        let d = decide_notification(&mut state, 1, "", false, true, false, 162);
+        assert!(d.should_fire, "time-rearm must fire from ZeroPending after 60 s");
+        assert_eq!(d.reason, "time-rearm-60s");
+    }
+
+    /// time-rearm from ZeroPending is suppressed when < 60 s since original fire.
+    #[test]
+    fn test_time_rearm_60s_from_zero_pending_suppressed_before_elapsed() {
+        let mut state = NotifState::ZeroPending {
+            prev_count: 1,
+            prev_sig: String::new(),
+            prev_fired_at_secs: 100,
+            zero_since_secs: 103,
+            zero_from_typing: false,
+            prev_typing_rearm_exhausted: false,
+        };
+        // Only 50 s since fire → still suppressed.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 150);
+        assert!(!d.should_fire);
+        assert_eq!(d.reason, "zero-bounce-oscillation-suppressed");
+    }
+
+    /// Verify NOTIF_REARM_SECS constant is within a sensible range.
+    #[test]
+    fn test_notif_rearm_constant_is_reasonable() {
+        const _: () = {
+            assert!(
+                NOTIF_REARM_SECS >= 30,
+                "rearm must be at least 30 s to avoid spam"
+            );
+            assert!(
+                NOTIF_REARM_SECS <= 300,
+                "rearm must be at most 5 min to remain useful"
+            );
+        };
     }
 }

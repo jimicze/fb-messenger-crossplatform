@@ -58,6 +58,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Ensure we are on the latest main before reading the current version.
+          # Without this, a commit pushed between the workflow trigger and this
+          # step causes "Updates were rejected (fetch first)" on git push.
+          git fetch origin main
+          git rebase origin/main
+
           BUMP="${{ github.event.inputs.bump_type }}"
           CURRENT=$(jq -r .version package.json)
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
