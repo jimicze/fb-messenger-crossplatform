@@ -644,13 +644,13 @@ fn update_unread_count_core(
             activity_sig,
             effective_silent,
         );
-        if let Err(e) = crate::services::notification::show_notification(
+        if let Err(e) = crate::services::notification_dispatcher::dispatch(
             &app,
-            &notif_title,
-            "",
-            "messenger-unread",
-            effective_silent,
             decision.reason,
+            sender.trim(),
+            count,
+            &notif_title,
+            effective_silent,
         ) {
             log::warn!("[MessengerX][Notification] unread-count notification failed: {e}");
         }
