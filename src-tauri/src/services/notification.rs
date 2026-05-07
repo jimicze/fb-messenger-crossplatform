@@ -23,6 +23,8 @@
 //! a shell string), and notification text is escaped as AppleScript string
 //! literals.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tauri::AppHandle;
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
@@ -30,9 +32,20 @@ use tauri_plugin_notification::NotificationExt;
 #[cfg(target_os = "macos")]
 use std::{
     ptr::NonNull,
-    sync::{atomic::AtomicU64, atomic::Ordering, OnceLock},
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Process-global monotonically-increasing notification dispatch counter.
+///
+/// Every entry into [`show_notification`] obtains a fresh `call_id` and logs it
+/// at all sink decision points (`[NotifSink] call_id=N site=… via=…`).  The
+/// counter exists purely for log correlation: when the user reports duplicate
+/// or unexpected toasts (e.g. Linux 3rd-toast diagnostic in Phase M), grepping
+/// `call_id` reveals whether the OS produced one or many native notifications
+/// per Rust dispatch — disambiguating Rust double-fire from
+/// notify-send/tauri-plugin double-sink from external SW push paths.
+static NOTIF_CALL_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
@@ -119,6 +132,10 @@ pub fn initialize() -> Result<(), String> {
 /// * `body`   – Notification body text.
 /// * `tag`    – Conversation tag for deduplication (used as group identifier).
 /// * `silent` – If `true`, suppress the notification sound.
+/// * `site`   – Caller-origin label for diagnostic correlation (e.g.
+///   `"unread-count-core"`, `"updater-installed"`, `"ipc-send-notification"`).
+///   Logged together with a process-global `call_id` so duplicate-toast
+///   investigations can grep a single Rust dispatch across all sink branches.
 ///
 /// # Errors
 /// Returns an error string if all available notification methods fail.
@@ -128,9 +145,12 @@ pub fn show_notification(
     body: &str,
     tag: &str,
     silent: bool,
+    site: &str,
 ) -> Result<(), String> {
+    let call_id = NOTIF_CALL_ID.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
-        "[MessengerX][Notification] show_notification start: title={title:?} body_len={} tag={tag:?} silent={silent}",
+        "[MessengerX][NotifSink] call_id={call_id} site={site:?} via=entry \
+         title={title:?} body_len={} tag={tag:?} silent={silent}",
         body.chars().count()
     );
 
@@ -140,9 +160,15 @@ pub fn show_notification(
         let result = show_via_user_notifications(title, body, tag, silent);
         match &result {
             Ok(()) => {
-                log::info!("[MessengerX][Notification] macOS notification enqueued successfully")
+                log::info!(
+                    "[MessengerX][NotifSink] call_id={call_id} site={site:?} via=macos-un \
+                     result=ok"
+                )
             }
-            Err(e) => log::warn!("[MessengerX][Notification] macOS notification failed: {e}"),
+            Err(e) => log::warn!(
+                "[MessengerX][NotifSink] call_id={call_id} site={site:?} via=macos-un \
+                 result=err err={e}"
+            ),
         }
         result
     }
@@ -153,19 +179,31 @@ pub fn show_notification(
         match show_via_notify_send(title, body, silent) {
             Ok(()) => {
                 log::info!(
-                    "[MessengerX][Notification] Linux notification delivered via notify-send"
+                    "[MessengerX][NotifSink] call_id={call_id} site={site:?} \
+                     via=linux-notify-send result=ok"
                 );
                 return Ok(());
             }
             Err(e) => {
                 log::warn!(
-                    "[MessengerX][Notification] notify-send unavailable or failed ({e}); \
-                     falling back to tauri-plugin-notification"
+                    "[MessengerX][NotifSink] call_id={call_id} site={site:?} \
+                     via=linux-notify-send result=err err={e} fallback=tauri-plugin"
                 );
             }
         }
 
-        show_via_tauri_plugin(app, title, body, tag, silent)
+        let result = show_via_tauri_plugin(app, title, body, tag, silent);
+        match &result {
+            Ok(()) => log::info!(
+                "[MessengerX][NotifSink] call_id={call_id} site={site:?} via=tauri-plugin \
+                 result=ok"
+            ),
+            Err(e) => log::warn!(
+                "[MessengerX][NotifSink] call_id={call_id} site={site:?} via=tauri-plugin \
+                 result=err err={e}"
+            ),
+        }
+        result
     }
 }
 

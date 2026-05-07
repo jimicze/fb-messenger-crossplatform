@@ -456,6 +456,7 @@ pub fn send_notification(
         &body,
         &tag,
         effective_silent,
+        "ipc-send-notification",
     );
     match &result {
         Ok(()) => log::info!("[MessengerX][Notification] send_notification finished successfully"),
@@ -649,6 +650,7 @@ fn update_unread_count_core(
             "",
             "messenger-unread",
             effective_silent,
+            decision.reason,
         ) {
             log::warn!("[MessengerX][Notification] unread-count notification failed: {e}");
         }

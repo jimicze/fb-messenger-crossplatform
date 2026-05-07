@@ -167,7 +167,18 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
             var _origProtoShow = ServiceWorkerRegistration.prototype.showNotification;
             ServiceWorkerRegistration.prototype.showNotification = function(title, options) {
                 if (window === window.top) {
-                    jlog('[SW.proto] showNotification intercepted: title=' + JSON.stringify(preview(title)));
+                    // Capture a 2-frame stack preview to identify which Messenger
+                    // module triggered the call.  Phase M diagnostic: helps decide
+                    // whether the Linux 3rd-toast is a duplicate main-thread
+                    // SW.proto path or a separate SW push event.
+                    var stackPreview = '';
+                    try {
+                        var s = (new Error('stack')).stack || '';
+                        stackPreview = s.split('\n').slice(1, 4).join(' || ');
+                        if (stackPreview.length > 360) stackPreview = stackPreview.slice(0, 357) + '...';
+                    } catch(_) {}
+                    jlog('[SW.proto] showNotification intercepted: title=' + JSON.stringify(preview(title)) +
+                         ' stack=' + JSON.stringify(stackPreview));
                 }
                 forwardToRust(title, options || {}, '[SW.proto]');
                 // Return a resolved Promise (matches the original API contract).
@@ -3559,6 +3570,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                     &tr_ready2,
                                                                     "update",
                                                                     false,
+                                                                    "updater-installed",
                                                                 );
                                                                 h2.restart();
                                                             }
@@ -3572,6 +3584,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                     &tr_err2,
                                                                     "update",
                                                                     false,
+                                                                    "updater-install-failed",
                                                                 );
                                                             }
                                                         }
@@ -3587,6 +3600,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         save_check_timestamp(&h);
                                         let _ = services::notification::show_notification(
                                             &h, "Messenger X", &tr_none, "update", false,
+                                            "updater-up-to-date",
                                         );
                                     }
                                     Err(e) => {
@@ -3595,6 +3609,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         );
                                         let _ = services::notification::show_notification(
                                             &h, "Messenger X", &tr_err, "update", false,
+                                            "updater-check-failed",
                                         );
                                     }
                                 },
@@ -3602,6 +3617,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     log::warn!("[MessengerX] Updater init failed: {e}");
                                     let _ = services::notification::show_notification(
                                         &h, "Messenger X", &tr_err, "update", false,
+                                        "updater-init-failed",
                                     );
                                 }
                             }
@@ -4068,6 +4084,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         &tr_none,
                                         "update",
                                         false,
+                                        "updater-up-to-date",
                                     );
                                 }
                                 Err(e) => {
@@ -4078,6 +4095,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                         &tr_err,
                                         "update",
                                         false,
+                                        "updater-check-failed",
                                     );
                                 }
                             },
@@ -4089,6 +4107,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     &tr_err,
                                     "update",
                                     false,
+                                    "updater-init-failed",
                                 );
                             }
                         }
@@ -4267,6 +4286,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                 &tr_ready_c,
                                                                 "update",
                                                                 false,
+                                                                "updater-startup-installed",
                                                             );
                                                             h_install.restart();
                                                         }
@@ -4280,6 +4300,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                                                 &tr_err_c,
                                                                 "update",
                                                                 false,
+                                                                "updater-startup-install-failed",
                                                             );
                                                         }
                                                     }
