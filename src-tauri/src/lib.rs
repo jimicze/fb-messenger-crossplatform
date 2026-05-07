@@ -2428,11 +2428,8 @@ fn log_platform_environment() {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
             log::info!("[MessengerX][Env][Windows] webview2_runtime_query={stdout:?}");
         }
-        // Verify WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS is set so we can confirm
-        // the env-var WPAD-fix is actually inherited by the WebView2 process.
-        let wv2_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
-            .unwrap_or_else(|_| "<not set>".to_string());
-        log::info!("[MessengerX][Env][Windows] WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS={wv2_args:?}");
+        // Proxy args are logged by resolve_webview2_proxy_args() at builder
+        // construction time, so no separate diagnostic is needed here.
     }
 
     #[cfg(target_os = "macos")]
@@ -2442,6 +2439,114 @@ fn log_platform_environment() {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
             log::info!("[MessengerX][Env][macOS] kernel={stdout:?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows proxy helpers
+// ---------------------------------------------------------------------------
+
+/// Reads the Windows Internet Options proxy settings from the registry and
+/// returns the appropriate Chromium command-line flag string to pass to
+/// [`WebviewWindowBuilder::additional_browser_args`].
+///
+/// Decision table (evaluated top-to-bottom, first match wins):
+///
+/// | AutoConfigURL | ProxyEnable | ProxyServer | AutoDetect | Chromium flag              |
+/// |---------------|-------------|-------------|------------|----------------------------|
+/// | non-empty     | any         | any         | any        | `--proxy-pac-url=<url>`    |
+/// | empty         | 1           | non-empty   | any        | `--proxy-server=<host:port>` |
+/// | empty         | 0 / absent  | absent      | 1          | `--no-proxy-server`        |
+/// | empty         | 0 / absent  | absent      | 0          | *(no proxy flag)*          |
+///
+/// `--disable-background-networking` is always appended.
+///
+/// ## Why `--no-proxy-server` for WPAD-only
+///
+/// When `AutoDetect=1` but neither a manual proxy nor a PAC URL is configured,
+/// Chromium performs WPAD discovery (DHCP option 252 + DNS `wpad.*`).  On
+/// networks without a WPAD server this times out after **~27 seconds** before
+/// falling back to DIRECT.  Because the user has no actual proxy configured we
+/// can safely skip discovery and go DIRECT immediately.
+#[cfg(target_os = "windows")]
+fn resolve_webview2_proxy_args() -> String {
+    const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    // Single `reg query` call to read all values from the key at once.
+    let reg_output = std::process::Command::new("reg")
+        .args(["query", KEY])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    let mut auto_detect: u32 = 0;
+    let mut proxy_enable: u32 = 0;
+    let mut proxy_server = String::new();
+    let mut auto_config_url = String::new();
+
+    for line in reg_output.lines() {
+        // Each data line is indented and looks like:
+        //   "    ValueName    REG_DWORD    0x1"
+        //   "    ValueName    REG_SZ    127.0.0.1:8080"
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix("AutoDetect") {
+            let rest = rest.trim();
+            if let Some(hex) = rest
+                .strip_prefix("REG_DWORD")
+                .map(|s| s.trim().trim_start_matches("0x"))
+            {
+                auto_detect = u32::from_str_radix(hex, 16).unwrap_or(0);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("ProxyEnable") {
+            let rest = rest.trim();
+            if let Some(hex) = rest
+                .strip_prefix("REG_DWORD")
+                .map(|s| s.trim().trim_start_matches("0x"))
+            {
+                proxy_enable = u32::from_str_radix(hex, 16).unwrap_or(0);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("ProxyServer") {
+            let rest = rest.trim();
+            if let Some(val) = rest.strip_prefix("REG_SZ") {
+                proxy_server = val.trim().to_string();
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("AutoConfigURL") {
+            let rest = rest.trim();
+            if let Some(val) = rest.strip_prefix("REG_SZ") {
+                auto_config_url = val.trim().to_string();
+            }
+        }
+    }
+
+    log::info!(
+        "[MessengerX][Proxy] auto_detect={auto_detect} proxy_enable={proxy_enable} \
+         proxy_server={proxy_server:?} auto_config_url={auto_config_url:?}"
+    );
+
+    let proxy_flag = if !auto_config_url.is_empty() {
+        // Explicit PAC URL — hand it straight to Chromium; no WPAD discovery needed.
+        format!("--proxy-pac-url={auto_config_url}")
+    } else if proxy_enable == 1 && !proxy_server.is_empty() {
+        // Manual proxy server — bypass all auto-detection.
+        format!("--proxy-server={proxy_server}")
+    } else if auto_detect == 1 {
+        // WPAD auto-detect is on but there is no actual proxy server configured.
+        // Skip discovery to avoid the ~27 s WPAD timeout on networks without a
+        // WPAD server.  Direct connection is the correct behaviour here.
+        "--no-proxy-server".to_string()
+    } else {
+        // No proxy configured at all — direct connection is already the default.
+        String::new()
+    };
+
+    log::info!("[MessengerX][Proxy] webview2_proxy_flag={proxy_flag:?}");
+
+    if proxy_flag.is_empty() {
+        "--disable-background-networking".to_string()
+    } else {
+        format!("{proxy_flag} --disable-background-networking")
     }
 }
 
@@ -2771,15 +2876,18 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // (WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS) is silently overridden by WRY
     // when it calls CreateCoreWebView2EnvironmentWithOptions.
     //
-    // --proxy-auto-detect=0          Disables WPAD (Web Proxy Auto-Discovery)
-    //                                which causes a ~21 s stall on Windows
-    //                                "Public" network profiles that trigger
-    //                                WPAD by default.
-    // --disable-background-networking Turns off speculative prefetch/DNS/OCSP
-    //                                  probes that can also add latency at boot.
+    // `resolve_webview2_proxy_args()` reads the Windows Internet Options proxy
+    // settings from the registry and picks the correct Chromium proxy flag:
+    //   - PAC URL configured → --proxy-pac-url=<url>
+    //   - Manual proxy      → --proxy-server=<host:port>
+    //   - WPAD only (no actual proxy server) → --no-proxy-server
+    //                         (avoids the ~27 s WPAD discovery timeout)
+    //   - No proxy at all   → (no proxy flag)
+    // Always appends --disable-background-networking.
     #[cfg(target_os = "windows")]
-    let builder = builder
-        .additional_browser_args("--proxy-auto-detect=0 --disable-background-networking");
+    let proxy_args = resolve_webview2_proxy_args();
+    #[cfg(target_os = "windows")]
+    let builder = builder.additional_browser_args(&proxy_args);
 
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.

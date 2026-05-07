@@ -73,9 +73,6 @@ fn main() {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    set_webview2_no_proxy_auto_detect();
-
     // On Linux, remove the XDG startup-notification environment variables
     // before WRY/GTK reads them.
     //
@@ -95,64 +92,4 @@ fn main() {
     suppress_gnome_startup_notification();
 
     messengerx_lib::run()
-}
-
-/// On Linux, clear XDG startup-notification environment variables.
-///
-/// Effective on X11: prevents GTK3 from sending the `_NET_STARTUP_INFO`
-/// completion signal, suppressing the GNOME "Ready 'AppName'" toast.
-///
-/// On Wayland the primary suppression is `StartupNotify=false` in the
-/// bundled `.desktop` file; this function provides additional defence-in-depth
-/// by removing `XDG_ACTIVATION_TOKEN` before GTK3 initialises.
-#[cfg(target_os = "linux")]
-fn suppress_gnome_startup_notification() {
-    // Safety: called once before any other threads are spawned.
-    std::env::remove_var("DESKTOP_STARTUP_ID");
-    std::env::remove_var("XDG_ACTIVATION_TOKEN");
-}
-
-// -----------------------------------------------------------------------
-// Windows: suppress WPAD proxy auto-detection and background networking
-// to eliminate the ~27-second stall on first navigation.
-//
-// Root-cause investigation history:
-//
-//   Hypothesis 1 (WPAD): WebView2 inherits WinHTTP "Automatically detect
-//   settings" (WPAD / DHCP Option 252 + DNS wpad.*).  On networks without
-//   a WPAD server the discovery attempt times out after ~27 s before
-//   WebView2 falls back to DIRECT.  `--proxy-auto-detect=0` disables it.
-//   Corporate users with manual proxy settings are unaffected.
-//
-//   Hypothesis 2 (background networking): WebView2 performs background
-//   probes at startup (captive-portal checks, Safe Browsing, OCSP/CT logs)
-//   that may also serialize on the network stack for ~27 s.
-//   `--disable-background-networking` disables these Chromium background
-//   services while leaving the main page fetch unaffected.
-//
-// Both flags are combined here so a single v1.3.32 log can distinguish:
-//   - If gap disappears → background-networking was the culprit (WPAD flag
-//     alone in v1.3.31 did not help, or the env-var was silently dropped
-//     by WRY overriding AdditionalBrowserArguments internally).
-//   - If gap persists → neither WPAD nor background-networking is the cause;
-//     look at WebView2 network-service process startup or IPv6 happy-eyeballs.
-//
-// The env var must be set before WebView2 spawns its browser process,
-// which happens inside `messengerx_lib::run()`.  Setting it here in main()
-// before that call is the correct placement.
-//
-// NOTE: `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` is only honoured when
-// `AdditionalBrowserArguments` is NOT set explicitly in
-// `CreateCoreWebView2EnvironmentWithOptions`.  If WRY passes an explicit
-// empty string there the env var is ignored; the [Env][Windows] log line
-// added to setup_app confirms whether the var survives into the process.
-// -----------------------------------------------------------------------
-#[cfg(target_os = "windows")]
-fn set_webview2_no_proxy_auto_detect() {
-    // Safety: called once at program start, before any threads are spawned.
-    // std::env::set_var is safe at this point.
-    std::env::set_var(
-        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--proxy-auto-detect=0 --disable-background-networking",
-    );
 }
