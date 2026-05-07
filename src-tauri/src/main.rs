@@ -76,7 +76,36 @@ fn main() {
     #[cfg(target_os = "windows")]
     set_webview2_no_proxy_auto_detect();
 
+    // On Linux, remove the XDG startup-notification environment variables
+    // before WRY/GTK reads them.  Without these vars GTK will not send a
+    // startup-completion signal on the session bus, so GNOME Shell never shows
+    // its "Připraveno 'AppName'" ("Ready 'AppName'") startup toast.
+    //
+    // Removing the vars is safe: they are only consumed by GTK for the startup
+    // animation hint and play no role in networking, IPC, or window management.
+    // The only visible side-effect is that the GNOME launcher's zoom-in
+    // animation does not animate the window from the launcher icon — acceptable
+    // for a system-tray application.
+    #[cfg(target_os = "linux")]
+    suppress_gnome_startup_notification();
+
     messengerx_lib::run()
+}
+
+/// On Linux, clear XDG startup-notification environment variables so that
+/// GNOME Shell does not display a "Připraveno 'Messenger X'" ("Ready 'AppName'")
+/// toast when the app window first appears.
+///
+/// GNOME Shell shows this toast in response to the GTK startup-completion
+/// signal (`_NET_STARTUP_INFO` on X11 / `xdg-activation` on Wayland).
+/// WRY/GTK reads `DESKTOP_STARTUP_ID` (X11) and `XDG_ACTIVATION_TOKEN`
+/// (Wayland) at window-creation time to produce that signal.  Clearing both
+/// vars before `messengerx_lib::run()` prevents the signal from being sent.
+#[cfg(target_os = "linux")]
+fn suppress_gnome_startup_notification() {
+    // Safety: called once before any other threads are spawned.
+    std::env::remove_var("DESKTOP_STARTUP_ID");
+    std::env::remove_var("XDG_ACTIVATION_TOKEN");
 }
 
 // -----------------------------------------------------------------------

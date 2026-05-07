@@ -2204,6 +2204,44 @@ const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
     jlog('visibility override installed');
 })();"#;
 
+/// Linux: suppress the GNOME MPRIS "Now Playing" media-player widget.
+///
+/// WebKitGTK implements the W3C Media Session API and automatically
+/// publishes any `navigator.mediaSession.metadata` (title, artist, …) to
+/// D-Bus via its MPRIS interface.  GNOME Shell subscribes to this interface
+/// and displays a media-player control widget in the notification shade that
+/// shows Messenger conversation titles / contact names.
+///
+/// This script replaces `navigator.mediaSession` with a no-op proxy at
+/// document-start, before Messenger's scripts run.  The replacement is
+/// API-compatible (all properties and methods exist) so Messenger does not
+/// throw errors — it simply cannot propagate metadata to D-Bus.
+///
+/// Audio and video calls are unaffected: WebRTC / Web Audio API handle the
+/// actual media routing and do not go through MediaSession.
+#[cfg(target_os = "linux")]
+const MEDIA_SESSION_SUPPRESS_SCRIPT: &str = r#"(function() {
+    try {
+        var _dummySession = {
+            get metadata() { return null; },
+            set metadata(v) { /* drop — prevent D-Bus/MPRIS broadcast */ },
+            get playbackState() { return 'none'; },
+            set playbackState(v) { /* drop */ },
+            setActionHandler: function() {},
+            setPositionState: function() {},
+            setCameraActive: function() {},
+            setMicrophoneActive: function() {},
+        };
+        Object.defineProperty(navigator, 'mediaSession', {
+            get: function() { return _dummySession; },
+            configurable: true,
+        });
+    } catch (e) {
+        // Swallow: if the override fails the only consequence is that the
+        // GNOME MPRIS widget may still appear.
+    }
+})();"#;
+
 /// Persists the current Unix timestamp (seconds) as `last_update_check_secs`
 /// in the user's settings file.
 ///
@@ -2694,6 +2732,28 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     let builder = builder.initialization_script(VISIBILITY_OVERRIDE_SCRIPT);
 
+    // On Linux, suppress the GNOME MPRIS media-player widget that would
+    // otherwise display Messenger conversation titles / contact names in the
+    // notification shade.  See MEDIA_SESSION_SUPPRESS_SCRIPT doc comment.
+    #[cfg(target_os = "linux")]
+    let builder = builder.initialization_script(MEDIA_SESSION_SUPPRESS_SCRIPT);
+
+    // On Windows, pass Chromium flags directly via the WebviewWindowBuilder
+    // `additional_browser_args` API.  This is the *only* reliable way to reach
+    // WebView2's AdditionalBrowserArguments setting — the env-var approach
+    // (WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS) is silently overridden by WRY
+    // when it calls CreateCoreWebView2EnvironmentWithOptions.
+    //
+    // --proxy-auto-detect=0          Disables WPAD (Web Proxy Auto-Discovery)
+    //                                which causes a ~21 s stall on Windows
+    //                                "Public" network profiles that trigger
+    //                                WPAD by default.
+    // --disable-background-networking Turns off speculative prefetch/DNS/OCSP
+    //                                  probes that can also add latency at boot.
+    #[cfg(target_os = "windows")]
+    let builder = builder
+        .additional_browser_args("--proxy-auto-detect=0 --disable-background-networking");
+
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
         .user_agent(
@@ -2947,8 +3007,32 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         log::warn!(
                             "[MessengerX][CrashDetect] Max crash reloads ({MAX_CRASH_RELOADS}) \
-                             reached — not reloading again this session."
+                             reached — navigating to messenger.com root to restore usability."
                         );
+                        // Navigate to root so the user is not left with a
+                        // blank / crashed window.  We do not increment the
+                        // reload counter here — this is a recovery navigation,
+                        // not another crash-triggered reload.
+                        let wv = webview_window.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            match url::Url::parse("https://www.messenger.com/") {
+                                Ok(u) => {
+                                    if let Err(e) = wv.navigate(u) {
+                                        log::warn!(
+                                            "[MessengerX][CrashDetect] recovery navigate() \
+                                             failed: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[MessengerX][CrashDetect] recovery URL parse \
+                                         failed: {e}"
+                                    );
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -2985,6 +3069,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let host = url.host_str().unwrap_or("");
+
+                // Pass through Tauri's own local asset server (tauri.localhost on
+                // Windows / WebView2).  It uses the http scheme, so the scheme
+                // check above does not catch it, and it must never be treated as
+                // an external URL or opened in the system browser.
+                if host == "tauri.localhost" || host == "localhost" {
+                    return true;
+                }
                 log::info!(
                     "[MessengerX] on_navigation: host={host} url={url} t={}ms",
                     setup_started.elapsed().as_millis()
