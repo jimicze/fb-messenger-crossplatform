@@ -295,7 +295,10 @@ jobs:
             libglib2.0-dev \
             libssl-dev \
             libdbus-1-dev \
-            xdg-utils
+            xdg-utils \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good
+          sudo apt-get install -y gstreamer1.0-pulseaudio || true
 
       # ── Node.js ──────────────────────────────────────────────────────────
       - name: Set up Node.js
@@ -694,5 +697,4 @@ jobs:
             --submit
 
           Write-Host "winget manifest submitted for ${VERSION}"
-
 

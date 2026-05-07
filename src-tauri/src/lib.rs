@@ -401,6 +401,37 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
 /// Injected at document-start; waits for DOM via `DOMContentLoaded`.
 const UNREAD_OBSERVER_SCRIPT: &str = r#"
 (function() {
+    var MX_SENDER_TITLE_PREFIX = '__MX_SENDER_V1__?';
+
+    function isMxSenderBridgeTitle(title) {
+        return typeof title === 'string' && title.indexOf(MX_SENDER_TITLE_PREFIX) === 0;
+    }
+
+    function emitSenderHintViaTitle(count, sender) {
+        try {
+            sender = String(sender || '').trim();
+            if (count <= 0 || sender.length < 1 || sender.length > 120) return;
+
+            // JS->Rust invoke is unavailable from remote messenger.com on some
+            // desktop WebViews.  document.title still reaches Rust via Wry's
+            // native on_document_title_changed hook, so we use a very short-lived
+            // sentinel title as a sender-hint side channel.  The Rust title
+            // handler recognizes this prefix, stores the hint, and returns early
+            // without treating it as a Messenger title/count event.
+            var previousTitle = document.title;
+            var payload = 'count=' + encodeURIComponent(String(count))
+                + '&sender=' + encodeURIComponent(sender);
+            document.title = MX_SENDER_TITLE_PREFIX + payload;
+            setTimeout(function() {
+                try {
+                    if (isMxSenderBridgeTitle(document.title)) {
+                        document.title = previousTitle;
+                    }
+                } catch(_) {}
+            }, 80);
+        } catch(_) {}
+    }
+
     function jlog(msg) {
         try {
             window.__TAURI__.core.invoke('js_log', { message: '[UnreadJS] ' + msg });
@@ -409,6 +440,9 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
 
     function getUnreadCountFromTitle() {
         var title = document.title;
+        if (isMxSenderBridgeTitle(title)) {
+            return (typeof prevTitleCount === 'number') ? prevTitleCount : 0;
+        }
         var match = title.match(/^\((\d+)\)/);
         return match ? parseInt(match[1], 10) : 0;
     }
@@ -1225,6 +1259,7 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
                 }
             } else {
                 sender = getFirstUnreadSenderName();
+                emitSenderHintViaTitle(count, sender);
                 activitySig = buildSig(count);
             }
             jlog('[Unread] immediate count=' + count
@@ -1268,6 +1303,7 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             // Re-read snapshot in case more DOM settled during the 500 ms wait.
             refreshActivitySnapshot();
             var sender = getFirstUnreadSenderName();
+            emitSenderHintViaTitle(effectiveCount, sender);
             var activitySig = buildSig(effectiveCount);
             // Update lastSentSig to the final sig (may differ from optimistic if
             // snapshot changed during the delay).
@@ -1562,6 +1598,25 @@ fn build_appearance_script(mode: &str) -> String {
 }})();"#,
         mode = mode
     )
+}
+
+/// Returns `true` when a persisted startup URL points to a concrete Messenger
+/// thread that is safe to restore on next app launch.
+fn is_safe_messenger_startup_url(value: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(value) else {
+        return false;
+    };
+
+    if parsed.scheme() != "https" {
+        return false;
+    }
+
+    if parsed.host_str() != Some("www.messenger.com") {
+        return false;
+    }
+
+    let path = parsed.path();
+    path.starts_with("/t/") || path.starts_with("/e2ee/t/")
 }
 
 /// Overrides `window.open()` to intercept external links that Messenger opens
@@ -2423,14 +2478,29 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     let had_good_title = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let pending_sender_hint = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<(u32, String, std::time::Instant)>,
+    ));
+    // Set to `true` after a confirmed WebKitWebProcess crash (title became ""
+    // after a good load).  When active on Linux, the `on_navigation` handler
+    // blocks the fbsbx.com maw_proxy_page that is known to trigger the
+    // GStreamer NULL-pointer deref, giving the reloaded page a chance to
+    // finish loading without immediately crashing again.
+    let post_crash_proxy_block = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // ------------------------------------------------------------------
     // 3. Determine initial URL based on connectivity.
     //    If offline, load a local fallback page instead of messenger.com.
     // ------------------------------------------------------------------
     let is_online = services::network::is_likely_online();
+    let startup_url = settings
+        .last_messenger_url
+        .as_deref()
+        .filter(|u| is_safe_messenger_startup_url(u))
+        .unwrap_or("https://www.messenger.com/");
     let webview_url = if is_online {
-        WebviewUrl::External(url::Url::parse("https://www.messenger.com")?)
+        log::info!("[MessengerX][Boot] initial_url={startup_url}");
+        WebviewUrl::External(url::Url::parse(startup_url)?)
     } else {
         log::info!("[MessengerX] Offline at startup — loading local fallback page");
         WebviewUrl::App("index.html".into())
@@ -2502,7 +2572,50 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .on_document_title_changed({
             let had_good_title = had_good_title.clone();
             let crash_reload_count = crash_reload_count.clone();
+            let pending_sender_hint = pending_sender_hint.clone();
+            let post_crash_proxy_block = post_crash_proxy_block.clone();
             move |webview_window, title| {
+                const SENDER_HINT_PREFIX: &str = "__MX_SENDER_V1__?";
+                if let Some(query) = title.strip_prefix(SENDER_HINT_PREFIX) {
+                    let mut count_hint = None;
+                    let mut sender_hint = None;
+                    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                        match key.as_ref() {
+                            "count" => count_hint = value.parse::<u32>().ok(),
+                            "sender" => {
+                                let s = value.trim();
+                                if !s.is_empty() && s.len() <= 120 {
+                                    sender_hint = Some(s.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if let (Some(count), Some(sender)) = (count_hint, sender_hint) {
+                        match pending_sender_hint.lock() {
+                            Ok(mut hint) => {
+                                *hint = Some((count, sender.clone(), std::time::Instant::now()));
+                                log::info!(
+                                    "[MessengerX][SenderHint] stored count={} sender={:?}",
+                                    count,
+                                    sender,
+                                );
+                            }
+                            Err(e) => log::warn!(
+                                "[MessengerX][SenderHint] mutex poisoned; dropping hint: {e}"
+                            ),
+                        }
+                    } else {
+                        log::warn!(
+                            "[MessengerX][SenderHint] malformed title payload: {:?}",
+                            title
+                        );
+                    }
+
+                    return;
+                }
+
                 // Parse "(N)" prefix — same logic as JS getUnreadCountFromTitle().
                 let count: u32 = title
                     .trim_start()
@@ -2515,10 +2628,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // *currently open* conversation, not the author of the new message.
                 // Example: user has "Karel Novák" open; "Jouda" sends a message →
                 // title becomes "(1) Karel Novák | Messenger" → wrong sender.
-                // The JS IPC path (macOS) correctly uses getFirstUnreadSenderName()
-                // which reads the actual unread entry from the DOM sidebar.
-                // On Win11/Linux we fall back to the generic "Nová zpráva" string.
-                let sender = String::new();
+                // A DOM-derived sender hint may arrive shortly after the title
+                // count via the `__MX_SENDER_V1__` sentinel side channel above.
+                // We intentionally do NOT parse the title's `SENDER | Messenger`
+                // segment here (Phase J: that segment is the open conversation,
+                // not necessarily the message author).  The spawned update below
+                // waits briefly for a verified DOM hint before firing.
 
                 // Detect typing indicator: count==0 AND title is not the plain
                 // "Messenger" (all-read) AND has no "(N)" prefix AND the title is
@@ -2533,14 +2648,60 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     && !title.contains(" | Messenger");
 
                 log::info!(
-                    "[MessengerX][TitleChange] title={:?} parsed_count={} sender={:?} is_typing={}",
+                    "[MessengerX][TitleChange] title={:?} parsed_count={} is_typing={} sender_hint_wait={}",
                     title,
                     count,
-                    sender,
                     is_typing_indicator,
+                    count > 0,
                 );
                 let app = webview_window.app_handle().clone();
+                let sender_hint = pending_sender_hint.clone();
                 std::thread::spawn(move || {
+                    let sender = if count > 0 {
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_millis(1_200);
+                        loop {
+                            match sender_hint.lock() {
+                                Ok(mut hint) => {
+                                    if let Some((hint_count, sender, stored_at)) = hint.take() {
+                                        let age = stored_at.elapsed();
+                                        if hint_count == count
+                                            && age <= std::time::Duration::from_secs(3)
+                                        {
+                                            log::info!(
+                                                "[MessengerX][SenderHint] using DOM sender hint count={} sender={:?} age={}ms",
+                                                count,
+                                                sender,
+                                                age.as_millis(),
+                                            );
+                                            break sender;
+                                        }
+
+                                        log::info!(
+                                            "[MessengerX][SenderHint] dropping stale hint count={} for parsed_count={} age={}ms",
+                                            hint_count,
+                                            count,
+                                            age.as_millis(),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[MessengerX][SenderHint] mutex poisoned; using generic sender: {e}"
+                                    );
+                                    break String::new();
+                                }
+                            }
+
+                            if std::time::Instant::now() >= deadline {
+                                break String::new();
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    } else {
+                        String::new()
+                    };
+
                     if let Err(e) = crate::commands::update_unread_count_from_title(
                         count,
                         sender,
@@ -2572,8 +2733,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if title.trim().is_empty()
                     && had_good_title.load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    let prev_count = crash_reload_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let prev_count =
+                        crash_reload_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if prev_count < MAX_CRASH_RELOADS {
                         log::warn!(
                             "[MessengerX][CrashDetect] WebKitWebProcess crash suspected \
@@ -2583,6 +2744,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         );
                         // Reset so the next reload doesn't immediately re-trigger.
                         had_good_title.store(false, std::sync::atomic::Ordering::Relaxed);
+                        // Activate the post-crash fbsbx proxy block so that the
+                        // maw_proxy_page navigation (which triggers the GStreamer
+                        // NULL-pointer deref) is suppressed on the reloaded page.
+                        post_crash_proxy_block.store(true, std::sync::atomic::Ordering::Relaxed);
                         let wv = webview_window.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -2595,9 +2760,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 Err(e) => {
-                                    log::warn!(
-                                        "[MessengerX][CrashDetect] URL parse failed: {e}"
-                                    );
+                                    log::warn!("[MessengerX][CrashDetect] URL parse failed: {e}");
                                 }
                             }
                         });
@@ -2632,77 +2795,128 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         // Navigation policy: allow Messenger / Facebook CDN domains;
         // open everything else in the system browser.
-        .on_navigation(move |url| {
-            let scheme = url.scheme();
-            // Pass through non-HTTP schemes (blob:, data:, about:, tauri:, etc.).
-            if scheme != "http" && scheme != "https" {
-                return true;
-            }
+        .on_navigation({
+            let post_crash_proxy_block = post_crash_proxy_block.clone();
+            move |url| {
+                let scheme = url.scheme();
+                // Pass through non-HTTP schemes (blob:, data:, about:, tauri:, etc.).
+                if scheme != "http" && scheme != "https" {
+                    return true;
+                }
 
-            let host = url.host_str().unwrap_or("");
-            log::info!(
-                "[MessengerX] on_navigation: host={host} url={url} t={}ms",
-                setup_started.elapsed().as_millis()
-            );
+                let host = url.host_str().unwrap_or("");
+                log::info!(
+                    "[MessengerX] on_navigation: host={host} url={url} t={}ms",
+                    setup_started.elapsed().as_millis()
+                );
 
-            // Handle Facebook's link shim: l.facebook.com/l.php?u=EXTERNAL_URL
-            // Messenger wraps all external links in this shim — so `on_navigation`
-            // sees a facebook.com URL instead of the real destination.  We extract
-            // the actual URL from the `u` query param and open it in the system browser.
-            if (host == "l.facebook.com" || host == "l.messenger.com") && url.path() == "/l.php" {
-                if let Some(actual_url) = url
-                    .query_pairs()
-                    .find(|(k, _)| k == "u")
-                    .map(|(_, v)| v.into_owned())
+                // Post-crash fbsbx proxy block (Linux only).
+                //
+                // After a confirmed WebKitWebProcess crash the maw_proxy_page on
+                // www.fbsbx.com is the likely trigger of the GStreamer NULL-pointer
+                // deref (autoaudiosink not found → media pipeline teardown crash).
+                // Blocking this one navigation on the reloaded page suppresses the
+                // crash loop while still allowing all other fbsbx.com content.
+                // The block is only active when `post_crash_proxy_block` was set
+                // true by CrashDetect — it is never active during normal startup.
+                if cfg!(target_os = "linux")
+                    && post_crash_proxy_block.load(std::sync::atomic::Ordering::Relaxed)
+                    && host == "www.fbsbx.com"
+                    && url.path().starts_with("/maw_proxy_page")
                 {
-                    log::info!("[MessengerX] Link shim detected — opening real URL: {actual_url}");
+                    log::warn!(
+                        "[MessengerX][CrashDetect] Blocking post-crash fbsbx maw_proxy_page \
+                     navigation to suppress GStreamer crash loop: {url}"
+                    );
+                    return false;
+                }
+
+                // Handle Facebook's link shim: l.facebook.com/l.php?u=EXTERNAL_URL
+                // Messenger wraps all external links in this shim — so `on_navigation`
+                // sees a facebook.com URL instead of the real destination.  We extract
+                // the actual URL from the `u` query param and open it in the system browser.
+                if (host == "l.facebook.com" || host == "l.messenger.com") && url.path() == "/l.php"
+                {
+                    if let Some(actual_url) = url
+                        .query_pairs()
+                        .find(|(k, _)| k == "u")
+                        .map(|(_, v)| v.into_owned())
+                    {
+                        log::info!(
+                            "[MessengerX] Link shim detected — opening real URL: {actual_url}"
+                        );
+                        let handle = nav_app_handle.clone();
+                        std::thread::spawn(move || {
+                            use tauri_plugin_opener::OpenerExt;
+                            if let Err(e) = handle.opener().open_url(&actual_url, None::<&str>) {
+                                log::warn!(
+                                    "[MessengerX] Failed to open link-shim URL {actual_url}: {e}"
+                                );
+                            }
+                        });
+                        return false;
+                    }
+                }
+
+                // Google domains are required for the Facebook login reCAPTCHA flow:
+                // Facebook redirects to accounts.google.com / recaptcha.google.com
+                // during login verification.  These pages must render inside the
+                // WebView (where session cookies exist) — opening them in the system
+                // browser breaks the flow because the browser has no session context.
+                const ALLOWED: &[&str] = &[
+                    "messenger.com",
+                    "facebook.com",
+                    "fbcdn.net",
+                    "fbsbx.com",
+                    // Google auth & reCAPTCHA (needed for FB login verification)
+                    "google.com",
+                    "gstatic.com",
+                    "recaptcha.net",
+                ];
+                let is_allowed = ALLOWED
+                    .iter()
+                    .any(|&d| host == d || host.ends_with(&format!(".{d}")));
+
+                if !is_allowed {
+                    let url_str = url.to_string();
                     let handle = nav_app_handle.clone();
+                    // Open in system browser on a background thread so we don't
+                    // block the navigation callback.
                     std::thread::spawn(move || {
                         use tauri_plugin_opener::OpenerExt;
-                        if let Err(e) = handle.opener().open_url(&actual_url, None::<&str>) {
-                            log::warn!(
-                                "[MessengerX] Failed to open link-shim URL {actual_url}: {e}"
-                            );
+                        if let Err(e) = handle.opener().open_url(&url_str, None::<&str>) {
+                            log::warn!("[MessengerX] Failed to open external URL {url_str}: {e}");
                         }
                     });
                     return false;
                 }
+
+                // Persist the last concrete Messenger thread URL and restore it
+                // on the next startup.  Win11/WebView2 currently spends ~27s on
+                // the root `https://www.messenger.com/` SPA redirect before it
+                // navigates to the thread; starting directly at the last thread
+                // avoids that blank-window phase.
+                if host == "www.messenger.com"
+                    && (url.path().starts_with("/t/") || url.path().starts_with("/e2ee/t/"))
+                {
+                    let handle = nav_app_handle.clone();
+                    let url_str = url.to_string();
+                    std::thread::spawn(move || {
+                        let mut s = services::auth::load_settings(&handle).unwrap_or_default();
+                        if s.last_messenger_url.as_deref() == Some(url_str.as_str()) {
+                            return;
+                        }
+                        s.last_messenger_url = Some(url_str.clone());
+                        if let Err(e) = services::auth::save_settings(&handle, &s) {
+                            log::warn!("[MessengerX][Boot] Failed to persist last URL: {e}");
+                        } else {
+                            log::info!("[MessengerX][Boot] persisted last URL: {url_str}");
+                        }
+                    });
+                }
+
+                true
             }
-
-            // Google domains are required for the Facebook login reCAPTCHA flow:
-            // Facebook redirects to accounts.google.com / recaptcha.google.com
-            // during login verification.  These pages must render inside the
-            // WebView (where session cookies exist) — opening them in the system
-            // browser breaks the flow because the browser has no session context.
-            const ALLOWED: &[&str] = &[
-                "messenger.com",
-                "facebook.com",
-                "fbcdn.net",
-                "fbsbx.com",
-                // Google auth & reCAPTCHA (needed for FB login verification)
-                "google.com",
-                "gstatic.com",
-                "recaptcha.net",
-            ];
-            let is_allowed = ALLOWED
-                .iter()
-                .any(|&d| host == d || host.ends_with(&format!(".{d}")));
-
-            if !is_allowed {
-                let url_str = url.to_string();
-                let handle = nav_app_handle.clone();
-                // Open in system browser on a background thread so we don't
-                // block the navigation callback.
-                std::thread::spawn(move || {
-                    use tauri_plugin_opener::OpenerExt;
-                    if let Err(e) = handle.opener().open_url(&url_str, None::<&str>) {
-                        log::warn!("[MessengerX] Failed to open external URL {url_str}: {e}");
-                    }
-                });
-                return false;
-            }
-
-            true
         })
         .build()?;
 

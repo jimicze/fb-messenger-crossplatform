@@ -30,7 +30,7 @@ use tauri_plugin_notification::NotificationExt;
 #[cfg(target_os = "macos")]
 use std::{
     ptr::NonNull,
-    sync::OnceLock,
+    sync::{atomic::AtomicU64, atomic::Ordering, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -926,10 +926,22 @@ fn build_macos_notification_identifier(tag: &str) -> String {
     // a fresh banner rather than silently replacing one already in Notification
     // Center.  A stable identifier caused macOS to re-use the existing
     // delivered record, suppressing the sound/banner after the first delivery.
-    let ts = SystemTime::now()
+    static LAST_ID_NANOS: AtomicU64 = AtomicU64::new(0);
+
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
+        .as_nanos() as u64;
+    let ts = loop {
+        let prev = LAST_ID_NANOS.load(Ordering::Relaxed);
+        let candidate = now.max(prev.saturating_add(1));
+        if LAST_ID_NANOS
+            .compare_exchange(prev, candidate, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break candidate;
+        }
+    };
     if !tag.is_empty() {
         format!("messengerx-{tag}-{ts}")
     } else {

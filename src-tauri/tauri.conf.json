@@ -38,13 +38,15 @@
         "depends": [
           "libwebkit2gtk-4.1-0",
           "libgtk-3-0",
-          "libayatana-appindicator3-1"
+          "libayatana-appindicator3-1",
+          "gstreamer1.0-plugins-base",
+          "gstreamer1.0-plugins-good"
         ],
         "section": "web",
         "priority": "optional"
       },
       "appimage": {
-        "bundleMediaFramework": false,
+        "bundleMediaFramework": true,
         "files": {}
       }
     },

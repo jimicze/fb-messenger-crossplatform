@@ -31,6 +31,9 @@ pub struct AppSettings {
     pub auto_update: bool,
     /// Unix timestamp (seconds) of the last update check; `None` if never checked.
     pub last_update_check_secs: Option<u64>,
+    /// Last visited Messenger thread URL (`/t/...` or `/e2ee/t/...`).
+    /// Used as the next startup URL to skip Messenger's slow root-page redirect.
+    pub last_messenger_url: Option<String>,
     /// Appearance mode: `"system"` (follow OS), `"dark"`, or `"light"`.
     pub appearance: String,
 }
@@ -46,6 +49,7 @@ impl Default for AppSettings {
             start_minimized: false,
             auto_update: true,
             last_update_check_secs: None,
+            last_messenger_url: None,
             appearance: "system".to_string(),
         }
     }
@@ -912,6 +916,7 @@ mod tests {
             start_minimized: true,
             auto_update: false,
             last_update_check_secs: Some(1_000_000),
+            last_messenger_url: Some("https://www.messenger.com/t/123/".to_string()),
             appearance: "dark".to_string(),
         };
         let json = serde_json::to_string(&settings).expect("serialize");
@@ -922,6 +927,10 @@ mod tests {
         assert!(!deserialized.notification_sound);
         assert!(deserialized.autostart);
         assert!(deserialized.start_minimized);
+        assert_eq!(
+            deserialized.last_messenger_url.as_deref(),
+            Some("https://www.messenger.com/t/123/")
+        );
         assert_eq!(deserialized.appearance, "dark");
     }
 
@@ -937,6 +946,7 @@ mod tests {
         assert!(settings.notification_sound);
         assert!(!settings.autostart);
         assert!(!settings.start_minimized);
+        assert_eq!(settings.last_messenger_url, None);
         // New appearance field defaults to "system"
         assert_eq!(settings.appearance, "system");
     }
