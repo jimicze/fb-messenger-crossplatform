@@ -2363,6 +2363,11 @@ fn log_platform_environment() {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
             log::info!("[MessengerX][Env][Windows] webview2_runtime_query={stdout:?}");
         }
+        // Verify WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS is set so we can confirm
+        // the env-var WPAD-fix is actually inherited by the WebView2 process.
+        let wv2_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+            .unwrap_or_else(|_| "<not set>".to_string());
+        log::info!("[MessengerX][Env][Windows] WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS={wv2_args:?}");
     }
 
     #[cfg(target_os = "macos")]
@@ -2629,12 +2634,20 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         "[MessengerX][Boot][Trace] startup_url decision: last_raw={last_url_raw:?} \
          safe={last_url_safe} chosen={startup_url:?}"
     );
-    let webview_url = if is_online {
-        log::info!("[MessengerX][Boot] initial_url={startup_url}");
-        WebviewUrl::External(url::Url::parse(startup_url)?)
+    // When online, start with the local loading.html so the window shows a
+    // spinner immediately (instead of a blank white screen) while WebView2
+    // initialises its network stack.  After build() we navigate to the real
+    // messenger.com URL in a background thread.  WebView2 keeps the previous
+    // page visible until ContentLoading fires for the new navigation, so the
+    // spinner stays on-screen for the entire ~27 s network-init gap.
+    // When offline, go straight to index.html (the offline fallback) as before.
+    let (webview_url, navigate_after_build) = if is_online {
+        log::info!("[MessengerX][Boot] initial_url={startup_url} (via loading.html splash)");
+        let target_url = url::Url::parse(startup_url)?;
+        (WebviewUrl::App("loading.html".into()), Some(target_url))
     } else {
         log::info!("[MessengerX] Offline at startup — loading local fallback page");
-        WebviewUrl::App("index.html".into())
+        (WebviewUrl::App("index.html".into()), None)
     };
 
     // Build the scrollbar-fix script with platform-specific behaviour.
@@ -3102,6 +3115,29 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         "[MessengerX][Boot][Trace] WebviewWindowBuilder.build elapsed={}ms",
         webview_build_started.elapsed().as_millis()
     );
+
+    // ------------------------------------------------------------------
+    // 4a-loading. If we started with the local loading.html splash page,
+    //   navigate to the real messenger.com URL now in a background thread.
+    //
+    //   A short delay (100 ms) gives the WebView time to paint the spinner
+    //   before we trigger the network navigation.  Without the delay, the
+    //   navigate() call races with the initial paint and the spinner may
+    //   never be visible.  100 ms is imperceptible to the user but long
+    //   enough for the compositor to flush the first frame.
+    // ------------------------------------------------------------------
+    if let Some(target_url) = navigate_after_build {
+        let navigate_webview = webview.clone();
+        log::info!(
+            "[MessengerX][Boot] scheduling navigate to {target_url} after 100ms splash delay"
+        );
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Err(e) = navigate_webview.navigate(target_url) {
+                log::warn!("[MessengerX][Boot] post-build navigate failed: {e}");
+            }
+        });
+    }
 
     // ------------------------------------------------------------------
     // 4b. Apply persisted zoom level via the native WebView API.

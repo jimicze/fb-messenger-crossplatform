@@ -80,25 +80,39 @@ fn main() {
 }
 
 // -----------------------------------------------------------------------
-// Windows: suppress WPAD proxy auto-detection to eliminate the ~27-second
-// stall on first navigation.
+// Windows: suppress WPAD proxy auto-detection and background networking
+// to eliminate the ~27-second stall on first navigation.
 //
-// WebView2 inherits WinHTTP proxy settings including "Automatically detect
-// settings" (WPAD / DHCP Option 252 + DNS wpad.*).  On networks that do
-// not run a WPAD server the discovery attempt times out after ~27 seconds
-// before WebView2 falls back to DIRECT.  This manifests as a white window
-// on every app launch.
+// Root-cause investigation history:
 //
-// `--proxy-auto-detect=0` (Chromium flag forwarded to the WebView2 child
-// process via WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS) disables automatic
-// proxy discovery while still honouring any manually configured proxy in
-// Windows Settings → Proxy → Manual proxy setup.  Corporate users who
-// configure a proxy explicitly are unaffected; only WPAD/PAC-script
-// auto-discovery is disabled.
+//   Hypothesis 1 (WPAD): WebView2 inherits WinHTTP "Automatically detect
+//   settings" (WPAD / DHCP Option 252 + DNS wpad.*).  On networks without
+//   a WPAD server the discovery attempt times out after ~27 s before
+//   WebView2 falls back to DIRECT.  `--proxy-auto-detect=0` disables it.
+//   Corporate users with manual proxy settings are unaffected.
+//
+//   Hypothesis 2 (background networking): WebView2 performs background
+//   probes at startup (captive-portal checks, Safe Browsing, OCSP/CT logs)
+//   that may also serialize on the network stack for ~27 s.
+//   `--disable-background-networking` disables these Chromium background
+//   services while leaving the main page fetch unaffected.
+//
+// Both flags are combined here so a single v1.3.32 log can distinguish:
+//   - If gap disappears → background-networking was the culprit (WPAD flag
+//     alone in v1.3.31 did not help, or the env-var was silently dropped
+//     by WRY overriding AdditionalBrowserArguments internally).
+//   - If gap persists → neither WPAD nor background-networking is the cause;
+//     look at WebView2 network-service process startup or IPv6 happy-eyeballs.
 //
 // The env var must be set before WebView2 spawns its browser process,
 // which happens inside `messengerx_lib::run()`.  Setting it here in main()
 // before that call is the correct placement.
+//
+// NOTE: `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` is only honoured when
+// `AdditionalBrowserArguments` is NOT set explicitly in
+// `CreateCoreWebView2EnvironmentWithOptions`.  If WRY passes an explicit
+// empty string there the env var is ignored; the [Env][Windows] log line
+// added to setup_app confirms whether the var survives into the process.
 // -----------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 fn set_webview2_no_proxy_auto_detect() {
@@ -106,6 +120,6 @@ fn set_webview2_no_proxy_auto_detect() {
     // std::env::set_var is safe at this point.
     std::env::set_var(
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--proxy-auto-detect=0",
+        "--proxy-auto-detect=0 --disable-background-networking",
     );
 }
