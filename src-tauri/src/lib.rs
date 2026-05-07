@@ -2217,28 +2217,55 @@ const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
 /// API-compatible (all properties and methods exist) so Messenger does not
 /// throw errors — it simply cannot propagate metadata to D-Bus.
 ///
+/// Override strategy (belt-and-suspenders):
+///   1. Define a frozen no-op object as the replacement.
+///   2. Try `Object.defineProperty` on `Navigator.prototype` first —
+///      in WebKitGTK the attribute is defined on the prototype, so this
+///      intercepts all `navigator.mediaSession` accesses immediately.
+///      Using `configurable: false` prevents page code from re-overriding.
+///   3. Fall back to the `navigator` instance if the prototype override
+///      throws (e.g. already non-configurable on the prototype).
+///   4. Log a console.warn if both paths fail so future debugging is easier.
+///
 /// Audio and video calls are unaffected: WebRTC / Web Audio API handle the
 /// actual media routing and do not go through MediaSession.
 #[cfg(target_os = "linux")]
 const MEDIA_SESSION_SUPPRESS_SCRIPT: &str = r#"(function() {
+    'use strict';
+    var _noop = Object.freeze({
+        metadata: null,
+        playbackState: 'none',
+        setActionHandler: function() {},
+        setPositionState: function() {},
+        setCameraActive: function() {},
+        setMicrophoneActive: function() {},
+    });
+    var _descriptor = {
+        get: function() { return _noop; },
+        set: function() { /* drop assignment — prevent re-override by page code */ },
+        configurable: false,
+        enumerable: false,
+    };
+    var _overridden = false;
+    // Strategy 1: override on the prototype (preferred — covers all instances).
     try {
-        var _dummySession = {
-            get metadata() { return null; },
-            set metadata(v) { /* drop — prevent D-Bus/MPRIS broadcast */ },
-            get playbackState() { return 'none'; },
-            set playbackState(v) { /* drop */ },
-            setActionHandler: function() {},
-            setPositionState: function() {},
-            setCameraActive: function() {},
-            setMicrophoneActive: function() {},
-        };
-        Object.defineProperty(navigator, 'mediaSession', {
-            get: function() { return _dummySession; },
-            configurable: true,
-        });
-    } catch (e) {
-        // Swallow: if the override fails the only consequence is that the
-        // GNOME MPRIS widget may still appear.
+        Object.defineProperty(Navigator.prototype, 'mediaSession', _descriptor);
+        _overridden = true;
+    } catch (_protoErr) {
+        // Prototype override failed; fall through to instance override.
+    }
+    // Strategy 2: override on the navigator instance as a fallback.
+    if (!_overridden) {
+        try {
+            Object.defineProperty(navigator, 'mediaSession', _descriptor);
+            _overridden = true;
+        } catch (_instanceErr) {
+            // Both overrides failed.
+        }
+    }
+    if (!_overridden) {
+        // eslint-disable-next-line no-console
+        console.warn('[MX] mediaSession override failed — GNOME MPRIS widget may still appear');
     }
 })();"#;
 
