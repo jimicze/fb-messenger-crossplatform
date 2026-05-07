@@ -1793,6 +1793,57 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     dlog('[IPCProbe] ipcAvailable=' + _ipcAvailable + ' ' + _ipcDiag);
 
     // -----------------------------------------------------------------------
+    // 0b. Phase M trace — document-start beacon + SPA navigation wrappers.
+    //
+    //     `[DocStart]` is emitted at the earliest possible moment after the
+    //     init script runs (before any DOMContentLoaded handlers fire).  Its
+    //     `perfNow` value lets us cross-correlate with the Rust-side
+    //     `[PageLoad] event=Started` log to identify whether the Win11 27 s
+    //     white-screen gap lives in:
+    //       (a) WebView2 → first-byte (large [DocStart] perfNow), or
+    //       (b) document-start → DOMContentLoaded (small perfNow, large
+    //           [PageLoaded] domcontentloaded delta), or
+    //       (c) SPA hydration after DCL (visible via the history wrappers).
+    //
+    //     The history wrappers log every pushState/replaceState/popstate so
+    //     Messenger's client-side router transitions during boot become
+    //     traceable (e.g. `/` → `/t/<thread>` after auth restore).
+    // -----------------------------------------------------------------------
+    try {
+        var _docStartPerfNow = (typeof performance !== 'undefined' && performance.now)
+            ? Math.round(performance.now()) : -1;
+        var _docStartUrl = (location && location.href) ? location.href.slice(0, 160) : '';
+        dlog('[DocStart] perfNow=' + _docStartPerfNow + ' readyState=' + document.readyState + ' url=' + _docStartUrl);
+    } catch(_) {}
+
+    try {
+        function _logHistory(kind, urlArg) {
+            try {
+                var perfNow = (typeof performance !== 'undefined' && performance.now)
+                    ? Math.round(performance.now()) : -1;
+                var resolved = '';
+                try { resolved = new URL(String(urlArg || ''), location.href).href.slice(0, 160); }
+                catch(_) { resolved = String(urlArg || '').slice(0, 160); }
+                var current = (location && location.href) ? location.href.slice(0, 160) : '';
+                dlog('[Nav][' + kind + '] perfNow=' + perfNow + ' to=' + resolved + ' from=' + current);
+            } catch(_) {}
+        }
+        var _origPush = history.pushState;
+        history.pushState = function(state, title, url) {
+            _logHistory('pushState', url);
+            return _origPush.apply(this, arguments);
+        };
+        var _origReplace = history.replaceState;
+        history.replaceState = function(state, title, url) {
+            _logHistory('replaceState', url);
+            return _origReplace.apply(this, arguments);
+        };
+        window.addEventListener('popstate', function() {
+            _logHistory('popstate', location.href);
+        });
+    } catch(_) {}
+
+    // -----------------------------------------------------------------------
     // 1. Page-loaded ping (A5)
     // -----------------------------------------------------------------------
     var pingedDomReady = false;
@@ -2468,7 +2519,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load persisted settings so we can bake the zoom level into the
     //    initialization script before the window is created.
     // ------------------------------------------------------------------
+    // Phase M trace: measure load_settings cost (sync std::fs, can be slow on
+    // first launch on Win11 if appdata dir needs to be created on a slow disk).
+    let load_settings_start = std::time::Instant::now();
     let settings = services::auth::load_settings(app.handle()).unwrap_or_default();
+    log::info!(
+        "[MessengerX][Boot][Trace] load_settings elapsed={}ms last_url_present={} \
+         start_minimized={} appearance={:?} zoom={}",
+        load_settings_start.elapsed().as_millis(),
+        settings.last_messenger_url.is_some(),
+        settings.start_minimized,
+        settings.appearance,
+        settings.zoom_level,
+    );
     let zoom_level = settings.zoom_level;
 
     // ------------------------------------------------------------------
@@ -2544,12 +2607,28 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // 3. Determine initial URL based on connectivity.
     //    If offline, load a local fallback page instead of messenger.com.
     // ------------------------------------------------------------------
+    // Phase M trace: is_likely_online does a TcpStream::connect_timeout(2s)
+    // — if DNS or routing is degraded this can dominate boot time on Win11.
+    let online_check_start = std::time::Instant::now();
     let is_online = services::network::is_likely_online();
+    log::info!(
+        "[MessengerX][Boot][Trace] is_likely_online elapsed={}ms result={is_online}",
+        online_check_start.elapsed().as_millis()
+    );
+    // Phase M trace: surface the URL-resolution decision so the persisted-URL
+    // safe-check verdict (Commit-A diagnostic ground truth) is visible without
+    // re-running the binary in dev.  Empty `last_url_raw` means first-launch.
+    let last_url_raw = settings.last_messenger_url.as_deref().unwrap_or("");
+    let last_url_safe = !last_url_raw.is_empty() && is_safe_messenger_startup_url(last_url_raw);
     let startup_url = settings
         .last_messenger_url
         .as_deref()
         .filter(|u| is_safe_messenger_startup_url(u))
         .unwrap_or("https://www.messenger.com/");
+    log::info!(
+        "[MessengerX][Boot][Trace] startup_url decision: last_raw={last_url_raw:?} \
+         safe={last_url_safe} chosen={startup_url:?}"
+    );
     let webview_url = if is_online {
         log::info!("[MessengerX][Boot] initial_url={startup_url}");
         WebviewUrl::External(url::Url::parse(startup_url)?)
@@ -2571,6 +2650,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     // 4. Build the main window programmatically.
     // ------------------------------------------------------------------
+    // Phase M trace: WebviewWindowBuilder construction starts here.  The
+    // `.build()?` call below is the synchronous handoff to the OS WebView
+    // (WebView2 on Windows, WebKitGTK on Linux, WKWebView on macOS) — on
+    // Win11 first-run this can include WebView2 runtime initialization,
+    // which historically dominates the 27 s white-screen gap.
+    let webview_build_started = std::time::Instant::now();
     let builder = WebviewWindowBuilder::new(app, "main", webview_url)
         .title("Messenger X")
         .inner_size(1200.0, 800.0)
@@ -2997,6 +3082,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
 
+                // Phase M trace: explicit accept verdict so the count of
+                // accept-vs-block decisions during boot can be tallied
+                // straight from the log without inferring from absence.
+                log::debug!(
+                    "[MessengerX][Boot][Trace] on_navigation accept host={host} t={}ms",
+                    setup_started.elapsed().as_millis()
+                );
                 true
             }
         })
@@ -3005,6 +3097,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     log::info!(
         "[MessengerX][Boot] webview window built (online={is_online}, t={}ms)",
         setup_started.elapsed().as_millis()
+    );
+    log::info!(
+        "[MessengerX][Boot][Trace] WebviewWindowBuilder.build elapsed={}ms",
+        webview_build_started.elapsed().as_millis()
     );
 
     // ------------------------------------------------------------------
