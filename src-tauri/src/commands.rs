@@ -104,6 +104,19 @@ pub(crate) enum NotifState {
         sig: String,
         /// Unix timestamp (seconds) when the notification fired.
         fired_at_secs: u64,
+        /// Whether the typing-indicator re-arm has already fired once for this
+        /// `Notified` entry.
+        ///
+        /// The re-arm path (`typing-indicator-rearm`) is allowed to fire at
+        /// most **once** per `Notified` entry.  Without this guard, the cycle
+        /// `typing(count=0) → message(count=1)` repeats indefinitely: each
+        /// re-arm creates a fresh `Notified{fired_at=now}`, which then enters
+        /// `ZeroPending{prev_fired_at=now}`, and after `TYPING_REARM_SECS`
+        /// have elapsed the re-arm fires again — an infinite notification spam.
+        ///
+        /// Reset to `false` when a genuine `count_increased` or `sig_changed`
+        /// notification fires, indicating a truly new message (not a re-arm).
+        typing_rearm_exhausted: bool,
     },
     /// Count just dropped to 0 after a notification.  We wait for zero to be
     /// sustained before treating it as a real read-all reset.
@@ -123,6 +136,13 @@ pub(crate) enum NotifState {
         /// re-fire so the user is notified of the message that followed
         /// the typing indicator.
         zero_from_typing: bool,
+        /// Carried forward from `Notified::typing_rearm_exhausted`.
+        ///
+        /// When `true`, the typing-indicator re-arm is blocked even if
+        /// `zero_from_typing` is `true` and enough time has elapsed.  This
+        /// prevents the infinite-spam loop described in
+        /// `Notified::typing_rearm_exhausted`.
+        prev_typing_rearm_exhausted: bool,
     },
 }
 
@@ -218,6 +238,7 @@ fn decide_notification(
                     count,
                     sig: activity_sig.to_owned(),
                     fired_at_secs: now,
+                    typing_rearm_exhausted: false,
                 };
                 NotificationDecision {
                     should_fire: true,
@@ -243,6 +264,7 @@ fn decide_notification(
             count: prev_count,
             sig: prev_sig,
             fired_at_secs,
+            typing_rearm_exhausted,
         } => {
             if count == 0 {
                 *state = NotifState::ZeroPending {
@@ -251,6 +273,7 @@ fn decide_notification(
                     prev_fired_at_secs: fired_at_secs,
                     zero_since_secs: now,
                     zero_from_typing: is_typing_indicator,
+                    prev_typing_rearm_exhausted: typing_rearm_exhausted,
                 };
                 NotificationDecision {
                     should_fire: false,
@@ -287,6 +310,7 @@ fn decide_notification(
                         count,
                         sig: activity_sig.to_owned(),
                         fired_at_secs: now,
+                        typing_rearm_exhausted: false,
                     };
                 }
                 NotificationDecision {
@@ -306,6 +330,7 @@ fn decide_notification(
             prev_fired_at_secs,
             zero_since_secs,
             zero_from_typing,
+            prev_typing_rearm_exhausted,
         } => {
             if count == 0 {
                 let zero_elapsed = now.saturating_sub(zero_since_secs);
@@ -338,10 +363,14 @@ fn decide_notification(
                 // Same floor as the Notified arm: sig-only fires are rate-limited.
                 let sig_under_floor =
                     sig_changed && !count_increased && elapsed < MIN_SIG_CHANGE_NOTIFY_SECS;
-                // Re-arm: the previous zero came from a typing indicator and enough
-                // time has elapsed since the last notification, so the returning
-                // count represents a message that was sent after typing — fire.
-                let typing_rearm = zero_from_typing && elapsed >= TYPING_REARM_SECS;
+                // Re-arm: the previous zero came from a typing indicator, enough
+                // time has elapsed, and the rearm has NOT already fired once for
+                // this Notified entry.  The `prev_typing_rearm_exhausted` guard
+                // breaks the infinite loop: rearm → Notified{exhausted=true} →
+                // ZeroPending{prev_exhausted=true} → rearm blocked.
+                let typing_rearm = zero_from_typing
+                    && elapsed >= TYPING_REARM_SECS
+                    && !prev_typing_rearm_exhausted;
                 let should_fire = notifications_enabled
                     && !is_focused
                     && (count_increased || (sig_changed && !sig_under_floor) || typing_rearm);
@@ -356,10 +385,20 @@ fn decide_notification(
                 } else {
                     "zero-bounce-oscillation-suppressed"
                 };
+                // Compute whether the new Notified entry should block future rearms:
+                //   - genuine fire (count/sig): reset to false — new message, rearm allowed again
+                //   - typing_rearm fire:        set to true  — consumed the one allowed rearm
+                //   - no fire (suppressed):     carry forward prev so it survives oscillation
+                let new_typing_rearm_exhausted = if should_fire {
+                    typing_rearm // true only when the rearm path fired
+                } else {
+                    prev_typing_rearm_exhausted
+                };
                 *state = NotifState::Notified {
                     count,
                     sig: activity_sig.to_owned(),
                     fired_at_secs: if should_fire { now } else { prev_fired_at_secs },
+                    typing_rearm_exhausted: new_typing_rearm_exhausted,
                 };
                 NotificationDecision {
                     should_fire,
@@ -653,8 +692,7 @@ fn update_unread_count_core(
     #[cfg(not(target_os = "macos"))]
     if decision.should_fire {
         if let Some(ref w) = main_window {
-            if let Err(e) =
-                w.request_user_attention(Some(tauri::UserAttentionType::Informational))
+            if let Err(e) = w.request_user_attention(Some(tauri::UserAttentionType::Informational))
             {
                 log::warn!("[MessengerX][Attention] request_user_attention failed: {e}");
             }
@@ -971,6 +1009,7 @@ mod tests {
                 count: 1,
                 sig: String::new(),
                 fired_at_secs: 100,
+                typing_rearm_exhausted: false,
             }
         );
     }
@@ -981,6 +1020,7 @@ mod tests {
             count: 1,
             sig: String::new(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
 
         let zero = decide_notification(&mut state, 0, "", false, true, false, 103);
@@ -997,6 +1037,7 @@ mod tests {
                 count: 1,
                 sig: String::new(),
                 fired_at_secs: 100,
+                typing_rearm_exhausted: false,
             }
         );
     }
@@ -1007,6 +1048,7 @@ mod tests {
             count: 1,
             sig: String::new(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
 
         let _ = decide_notification(&mut state, 0, "", false, true, false, 103);
@@ -1023,6 +1065,7 @@ mod tests {
             count: 1,
             sig: String::new(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
 
         let _ = decide_notification(&mut state, 0, "", false, true, false, 103);
@@ -1040,6 +1083,7 @@ mod tests {
             prev_fired_at_secs: 100,
             zero_since_secs: 103,
             zero_from_typing: false,
+            prev_typing_rearm_exhausted: false,
         };
 
         let decision = decide_notification(&mut state, 1, "1:1:Alice", false, true, false, 104);
@@ -1071,6 +1115,7 @@ mod tests {
             count: 1,
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
         // elapsed = 100+MIN_SIG_CHANGE_NOTIFY_SECS — exactly at the boundary → allow
         let now = 100 + MIN_SIG_CHANGE_NOTIFY_SECS;
@@ -1086,6 +1131,7 @@ mod tests {
             count: 1,
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
         // elapsed = MIN_SIG_CHANGE_NOTIFY_SECS - 1 → below floor → suppress
         let now = 100 + MIN_SIG_CHANGE_NOTIFY_SECS - 1;
@@ -1104,6 +1150,7 @@ mod tests {
             count: 1,
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
         // elapsed = 0 — well under the floor, but count increased → must fire
         let decision = decide_notification(&mut state, 2, "2:0:Alice", false, true, false, 100);
@@ -1151,6 +1198,7 @@ mod tests {
             count: 1,
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
         // Same count, empty sig — must not fire.
         let decision = decide_notification(&mut state, 1, "", false, true, false, 200);
@@ -1178,6 +1226,7 @@ mod tests {
             count: 1,
             sig: String::new(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
 
         // Typing indicator fires — count drops to 0, is_typing_indicator=true.
@@ -1193,6 +1242,7 @@ mod tests {
                 prev_fired_at_secs: 100,
                 zero_since_secs: 106,
                 zero_from_typing: true,
+                prev_typing_rearm_exhausted: false,
             }
         );
 
@@ -1210,6 +1260,7 @@ mod tests {
             count: 1,
             sig: String::new(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
 
         // Typing indicator at T=101 (elapsed so far: 1s).
@@ -1232,6 +1283,7 @@ mod tests {
             count: 1,
             sig: String::new(),
             fired_at_secs: 100,
+            typing_rearm_exhausted: false,
         };
 
         // Regular zero (not typing indicator) at T=103.
@@ -1245,6 +1297,76 @@ mod tests {
             "non-typing zero bounce must not re-arm even after cooldown"
         );
         assert_eq!(d.reason, "zero-bounce-oscillation-suppressed");
+    }
+
+    /// After a typing-indicator re-arm fires once, a second typing→message cycle
+    /// must NOT fire again — the re-arm is consumed (exhausted) per Notified entry.
+    /// This guards against the infinite-spam loop observed in production logs.
+    #[test]
+    fn test_typing_indicator_rearm_fires_only_once() {
+        // T=100: initial notification fires (Idle → Notified).
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+
+        // T=106: typing indicator (count=0, is_typing=true) → ZeroPending{zero_from_typing=true,
+        //        prev_typing_rearm_exhausted=false}.
+        let d = decide_notification(&mut state, 0, "", false, true, true, 106);
+        assert!(!d.should_fire);
+
+        // T=112: message arrives, elapsed=12 ≥ 5 → first rearm fires.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 112);
+        assert!(d.should_fire, "first rearm must fire");
+        assert_eq!(d.reason, "typing-indicator-rearm");
+        // State is now Notified{typing_rearm_exhausted=true}.
+
+        // T=118: another typing indicator → ZeroPending{prev_typing_rearm_exhausted=true}.
+        let d = decide_notification(&mut state, 0, "", false, true, true, 118);
+        assert!(!d.should_fire);
+
+        // T=124: another message, elapsed=12 ≥ 5 — but rearm is exhausted → must NOT fire.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 124);
+        assert!(
+            !d.should_fire,
+            "second rearm must be blocked (exhausted=true)"
+        );
+        assert_eq!(d.reason, "zero-bounce-oscillation-suppressed");
+    }
+
+    /// A genuine count increase resets the exhausted flag so the NEXT typing→message
+    /// cycle is allowed to re-arm again (rearm is per-message, not per-session).
+    #[test]
+    fn test_typing_indicator_rearm_reset_by_count_increase() {
+        // T=100: initial notification.
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+
+        // T=106: typing indicator.
+        let _ = decide_notification(&mut state, 0, "", false, true, true, 106);
+
+        // T=112: rearm fires (first time) → exhausted=true.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 112);
+        assert!(d.should_fire);
+        assert_eq!(d.reason, "typing-indicator-rearm");
+
+        // T=114: genuine new message (count=2) → fires via count_increased,
+        //        resets exhausted to false.
+        let d = decide_notification(&mut state, 2, "", false, true, false, 114);
+        assert!(d.should_fire, "count_increased must fire");
+        assert_eq!(d.reason, "count-increased");
+        // State is now Notified{count=2, typing_rearm_exhausted=false}.
+
+        // T=120: typing indicator again.
+        let _ = decide_notification(&mut state, 0, "", false, true, true, 120);
+
+        // T=126: message returns — rearm is allowed again (exhausted was reset).
+        let d = decide_notification(&mut state, 1, "", false, true, false, 126);
+        assert!(
+            d.should_fire,
+            "rearm must be allowed after exhausted was reset by count_increased"
+        );
+        assert_eq!(d.reason, "typing-indicator-rearm");
     }
 
     /// Verify TYPING_REARM_SECS constant is within a sensible range.

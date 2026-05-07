@@ -2513,11 +2513,16 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // Detect typing indicator: count==0 AND title is not the plain
-            // "Messenger" (all-read) AND has no "(N)" prefix.
-            // Examples: "Jouda píše!", "Alice is typing…"
+            // "Messenger" (all-read) AND has no "(N)" prefix AND the title is
+            // not empty AND does not contain " | Messenger" (which indicates a
+            // background conversation tab title like "Alice | Messenger" —
+            // Bug 2 false positive) AND the title is not blank (Bug 3: empty
+            // title from WebKitWebProcess crash must not be classified as typing).
             let is_typing_indicator = count == 0
+                && !title.trim().is_empty()
                 && title.trim() != "Messenger"
-                && !title.trim_start().starts_with('(');
+                && !title.trim_start().starts_with('(')
+                && !title.contains(" | Messenger");
 
             log::info!(
                 "[MessengerX][TitleChange] title={:?} parsed_count={} sender={:?} is_typing={}",
