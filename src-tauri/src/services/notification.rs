@@ -259,6 +259,7 @@ pub(crate) fn dispatch_bundle_notification(
         let sound = UNNotificationSound::defaultSound();
         content.setSound(Some(&sound));
         eprintln!("[MessengerX][NotifyHelper] sound=default (silent=false)");
+        eprintln!("[MessengerX][AudioRust] dispatch_bundle_notification requesting OS sound: UNNotificationSound.defaultSound title={title:?}");
     } else {
         eprintln!("[MessengerX][NotifyHelper] sound omitted (silent=true)");
     }
@@ -787,6 +788,10 @@ fn show_via_user_notifications(
     if !silent {
         let sound = UNNotificationSound::defaultSound();
         content.setSound(Some(&sound));
+        log::info!(
+            "[MessengerX][AudioRust] UNUserNotificationCenter requesting OS sound: \
+             UNNotificationSound.defaultSound title={title:?}"
+        );
     }
 
     let identifier = NSString::from_str(&build_macos_notification_identifier(tag));
@@ -858,6 +863,10 @@ fn show_via_tauri_plugin(
             "[MessengerX][Notification][Sound] tauri-plugin-notification sound={sound:?} \
              (Phase A diag — Win11 H4: plugin .sound() may not produce <audio> in toast XML)"
         );
+        log::info!(
+            "[MessengerX][AudioRust] tauri-plugin requesting OS sound: \
+             sound={sound:?} title={title:?}"
+        );
         builder = builder.sound(sound);
     } else {
         log::info!("[MessengerX][Notification][Sound] silent=true — no sound requested");
@@ -896,11 +905,27 @@ fn show_via_notify_send(title: &str, body: &str, silent: bool) -> Result<(), Str
     use std::process::Command;
 
     log::info!(
-        "[MessengerX][Notification] Trying notify-send: title={title:?} body_len={} silent={silent}",
+        "[MessengerX][Notification] Trying notify-send: title={title:?} body_len={} \
+         silent={silent} (LD_LIBRARY_PATH+LD_PRELOAD stripped for AppImage compat)",
         body.chars().count()
     );
 
     let mut cmd = Command::new("notify-send");
+
+    // When running as an AppImage, the launcher injects LD_LIBRARY_PATH (and
+    // sometimes LD_PRELOAD) pointing at bundled (older) GLib inside the image.
+    // The system `notify-send` binary resolves libnotify.so.4 from the system
+    // lib path, but libnotify.so.4 in turn requires symbols (e.g.
+    // `g_once_init_leave_pointer`) from the *system* GLib.  With AppImage's
+    // LD_LIBRARY_PATH active the dynamic linker picks the older bundled GLib
+    // instead → symbol lookup error → exit code 127 → no notification banner.
+    //
+    // Fix: strip those variables from the child environment so the system
+    // binary uses only system libraries.  This is safe because `notify-send`
+    // is a standalone tool with no need for any AppImage-internal libraries.
+    cmd.env_remove("LD_LIBRARY_PATH");
+    cmd.env_remove("LD_PRELOAD");
+
     cmd.arg("--app-name=Messenger X")
         .arg("--urgency=normal")
         .arg("--expire-time=5000")
@@ -909,6 +934,10 @@ fn show_via_notify_send(title: &str, body: &str, silent: bool) -> Result<(), Str
     // Request sound playback via libcanberra hint when not silenced.
     if !silent {
         cmd.arg("--hint=string:sound-name:message-new-instant");
+        log::info!(
+            "[MessengerX][AudioRust] notify-send requesting OS sound: \
+             sound-name=message-new-instant (libcanberra hint) title={title:?}"
+        );
     }
 
     cmd.arg(title).arg(body);

@@ -2059,6 +2059,54 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
 "#
 );
 
+/// Hooks `HTMLAudioElement.prototype.play` to log every audio playback event
+/// initiated by the Messenger page (notification sounds, ringtones, call alerts,
+/// etc.) to the Rust log file via `js_log`.
+///
+/// Log prefix: `[AudioJS]`.  Correlate with `[AudioRust]` Rust-side log lines
+/// (emitted in `show_via_notify_send` / `show_via_tauri_plugin` / macOS
+/// `show_via_user_notifications` when `silent=false`) to detect whether OS sound
+/// is played twice: once by Messenger's own `<audio>` element and once by the
+/// native notification sound hint we request.
+const AUDIO_HOOK_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function alog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[AudioJS] ' + msg });
+        } catch(_) {}
+    }
+
+    // Intercept every HTMLAudioElement.play() call made by Messenger.
+    // Reports: src (truncated), readyState, paused, muted so we can tell
+    // whether it is a real notification sound or a prefetch / silent preload.
+    try {
+        var _origPlay = HTMLAudioElement.prototype.play;
+        HTMLAudioElement.prototype.play = function() {
+            try {
+                var src = this.src || this.currentSrc || '(no-src)';
+                if (src.length > 120) { src = src.slice(0, 117) + '...'; }
+                alog('[play] src=' + JSON.stringify(src)
+                    + ' readyState=' + this.readyState
+                    + ' paused=' + this.paused
+                    + ' muted=' + this.muted
+                    + ' volume=' + (Math.round(this.volume * 100) / 100)
+                    + ' v=' + APP_VERSION);
+            } catch(_) {}
+            return _origPlay.apply(this, arguments);
+        };
+        alog('[init] HTMLAudioElement.prototype.play hooked v=' + APP_VERSION);
+    } catch(e) {
+        alog('[init] hook FAILED: ' + (e && e.message ? e.message : String(e)));
+    }
+})();
+"#
+);
+
 /// JavaScript snippet that triggers snapshot capture and forwards the HTML to
 /// Rust via `invoke('save_snapshot', …)`.  Called from the Rust snapshot timer.
 ///
@@ -2854,6 +2902,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
         .initialization_script(UNREAD_OBSERVER_SCRIPT)
         .initialization_script(DIAGNOSTIC_TELEMETRY_SCRIPT)
+        .initialization_script(AUDIO_HOOK_SCRIPT)
         .initialization_script(OFFLINE_DIALOG_HIDER_SCRIPT)
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
