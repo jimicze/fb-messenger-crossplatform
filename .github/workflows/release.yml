@@ -8,13 +8,19 @@ on:
   workflow_dispatch:
     inputs:
       bump_type:
-        description: 'Version bump type'
-        required: true
+        description: 'Version bump type (ignored when tag_override is set)'
+        required: false
         type: choice
+        default: patch
         options:
           - patch
           - minor
           - major
+      tag_override:
+        description: 'Build & release an existing tag without bumping (e.g. v1.4.1). Leave empty for a normal bump.'
+        required: false
+        type: string
+        default: ''
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,15 +52,25 @@ jobs:
     permissions:
       contents: write
     outputs:
-      new-tag: ${{ steps.bump.outputs.new-tag }}
+      new-tag:      ${{ steps.bump.outputs.new-tag || steps.override.outputs.new-tag }}
+      is-backbuild: ${{ steps.override.outputs.is-backbuild }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Use tag_override (no bump)
+        id: override
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag_override != ''
+        run: |
+          TAG="${{ github.event.inputs.tag_override }}"
+          echo "tag_override mode: using existing tag ${TAG}"
+          echo "new-tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "is-backbuild=true" >> "$GITHUB_OUTPUT"
+
       - name: Bump version, commit and push tag
         id: bump
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag_override == ''
         run: |
           set -euo pipefail
 
@@ -123,8 +139,9 @@ jobs:
     permissions:
       contents: write
     outputs:
-      release-id: ${{ steps.create.outputs.id }}
-      tag-name:   ${{ steps.resolve-tag.outputs.name }}
+      release-id:   ${{ steps.create.outputs.id }}
+      tag-name:     ${{ steps.resolve-tag.outputs.name }}
+      is-backbuild: ${{ needs.bump-version.outputs.is-backbuild }}
 
     steps:
       - name: Checkout repository
@@ -152,8 +169,13 @@ jobs:
           # path where bump-version just pushed it moments ago).
           git fetch --tags --quiet 2>/dev/null || true
 
-          # Find the tag immediately before the current one (semver-sorted).
-          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1 || true)
+          # Find the tag immediately BEFORE the current one (semver-sorted ascending).
+          # Using ascending sort + awk avoids the backbuild problem: if we are
+          # releasing an older tag (e.g. v1.4.1 after v1.4.3 exists), descending
+          # sort would return the *newer* tag and produce an empty commit range.
+          PREV_TAG=$(git tag --sort=version:refname \
+            | awk -v tag="$TAG" 'prev && $0==tag{print prev; exit} {prev=$0}' \
+            || true)
           echo "Range: ${PREV_TAG:-<beginning>}..${TAG}"
 
           # Collect commit subjects in the range (or all if first release).
@@ -595,9 +617,14 @@ jobs:
           gh release delete-asset "$TAG" latest.json --repo "$REPO" --yes 2>/dev/null || true
           gh release upload "$TAG" latest.json --repo "$REPO"
 
-          # Publish only after latest.json exists, so updater clients never see
-          # a "latest" release that returns 404 for the updater manifest.
-          gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+          # Publish the release. For backbuilds (tag_override) we do NOT mark it
+          # as Latest — the real latest release must stay unchanged.
+          if [[ "${{ needs.create-release.outputs.is-backbuild }}" == "true" ]]; then
+            gh release edit "$TAG" --repo "$REPO" --draft=false
+            echo "Backbuild: release published WITHOUT --latest (${TAG} is older than current latest)"
+          else
+            gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+          fi
 
           echo "Done: published complete updater manifest for ${TAG}"
           rm -rf "$WORK"
@@ -609,7 +636,7 @@ jobs:
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   update-homebrew:
     needs: [create-release, publish-updater]
-    if: always() && needs.publish-updater.result == 'success'
+    if: always() && needs.publish-updater.result == 'success' && needs.create-release.outputs.is-backbuild != 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -665,7 +692,7 @@ jobs:
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   update-winget:
     needs: [create-release, publish-updater]
-    if: always() && needs.publish-updater.result == 'success'
+    if: always() && needs.publish-updater.result == 'success' && needs.create-release.outputs.is-backbuild != 'true'
     runs-on: windows-latest
 
     steps:
