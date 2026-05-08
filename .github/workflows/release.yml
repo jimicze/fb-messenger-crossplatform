@@ -196,8 +196,14 @@ jobs:
           fi
 
           # Assemble the full release body: changelog (if any) + downloads table.
+          # If RELEASE_NOTES.md exists at the repo root it overrides the auto-
+          # generated changelog section (used for milestone releases like v1.4.0
+          # that consolidate many patch releases into a single curated summary).
           {
-            if [[ -n "$CHANGELOG" ]]; then
+            if [[ -f "RELEASE_NOTES.md" ]]; then
+              cat RELEASE_NOTES.md
+              echo ""
+            elif [[ -n "$CHANGELOG" ]]; then
               echo "$CHANGELOG"
             fi
             cat << 'DOWNLOADS'

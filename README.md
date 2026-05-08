@@ -143,6 +143,23 @@ Facebook/Messenger URLs stay in-app. External links open in your default system 
   </tr>
 </table>
 
+<details>
+<summary><strong>Platform notes — notifications &amp; startup</strong></summary>
+<br />
+
+| Platform | Notification system | Requirements / notes |
+|----------|---------------------|----------------------|
+| **macOS** | `UNUserNotificationCenter` | Grant permission in **System Settings → Notifications → Messenger X**. Notification sound plays on delivery. |
+| **Windows** | WinRT toast | Grant permission in **Settings → System → Notifications**. Focus Assist / Do Not Disturb suppresses toasts while active. |
+| **Linux (GNOME)** | `libnotify` (`notify-send`) with plugin fallback | Install `libnotify-bin` for best results. MPRIS media widget is suppressed automatically. |
+| **Linux (KDE / XFCE / other)** | Native notification plugin | Works out of the box on most desktop environments. |
+
+**Windows startup note**: Messenger X reads your Windows proxy settings from the registry and
+passes the correct flag to WebView2, so the 20–30 second blank-window delay that occurred on
+networks without a proxy server is fully eliminated as of v1.3.38.
+
+</details>
+
 ## 🏗️ Architecture
 
 ```
