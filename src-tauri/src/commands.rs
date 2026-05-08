@@ -2,7 +2,7 @@
 //! Defines all commands callable from the frontend via `window.__TAURI__.core.invoke()`.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
@@ -81,6 +81,11 @@ const MAX_ZOOM: f64 = 1.2;
 
 /// Last known unread count; `u32::MAX` forces an update on first call.
 pub(crate) static LAST_UNREAD_COUNT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Unix-second timestamp of the last window-restore-from-minimized event (Linux only).
+/// Written by the Linux visibility poll thread; read in `update_unread_count_core`
+/// for the `came_from_background` gate.  Zero means "never restored".
+pub(crate) static LAST_RESTORED_FROM_MINIMIZED_SECS: AtomicU64 = AtomicU64::new(0);
 
 /// Unix-second timestamp of the last "empty activity_sig with count > 0" warning.
 /// Used to throttle that diagnostic to at most once every
@@ -190,8 +195,14 @@ const TYPING_REARM_SECS: u64 = 5;
 /// is at most once per `NOTIF_REARM_SECS`, not once per event.
 const NOTIF_REARM_SECS: u64 = 60;
 
+/// Grace period after a window restore-from-minimized during which a notification
+/// is fired even if `is_focused()` returns true.  Cinnamon/Muffin focuses the
+/// window instantly on un-iconify, so without this gate the user would see
+/// `idle-focused-skip` and miss the pending notification.
+const RESTORE_GRACE_SECS: u64 = 3;
+
 /// Returns the current Unix time in seconds (best-effort; 0 on error).
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -621,8 +632,27 @@ fn update_unread_count_core(
         "[MessengerX][Notification][FocusProbe] focused={raw_focused} \
          minimized={raw_minimized:?} visible_api={raw_visible_api:?}"
     );
-    let is_focused = raw_focused;
+    // Fix 3: a minimized window on Cinnamon/Muffin can still report is_focused()=true;
+    // treat a minimized window as not focused regardless of the focus signal.
+    let is_focused = raw_focused && !raw_minimized.unwrap_or(false);
     let now = now_secs();
+    // Fix 2: if the window was just restored from minimized (Linux poll thread stamps
+    // LAST_RESTORED_FROM_MINIMIZED_SECS), treat it as "not focused" for the next
+    // RESTORE_GRACE_SECS so the user sees the notification banner on un-iconify.
+    let restore_secs = LAST_RESTORED_FROM_MINIMIZED_SECS.load(Ordering::SeqCst);
+    let came_from_background =
+        restore_secs > 0 && now.saturating_sub(restore_secs) < RESTORE_GRACE_SECS;
+    // Fix 4: log the came_from_background gate when active.
+    if came_from_background {
+        log::info!(
+            "[MessengerX][Notification][DECISION] came_from_background=true \
+             reason=restored-from-minimized elapsed_since_restore={}s",
+            now.saturating_sub(restore_secs)
+        );
+    }
+    // When the window was just restored from minimized, fire the notification
+    // regardless of current focus so the user is alerted to pending messages.
+    let effective_focused = is_focused && !came_from_background;
     let (decision, state_after) = {
         let mut state = NOTIF_STATE
             .lock()
@@ -631,7 +661,7 @@ fn update_unread_count_core(
             &mut state,
             count,
             &activity_sig,
-            is_focused,
+            effective_focused,
             settings.notifications_enabled,
             is_typing_indicator,
             now,
@@ -640,12 +670,15 @@ fn update_unread_count_core(
     };
 
     log::info!(
-        "[MessengerX][Notification][DECISION] count={} old_count={} focused={} enabled={} \
+        "[MessengerX][Notification][DECISION] count={} old_count={} focused={} \
+         came_from_background={} effective_focused={} enabled={} \
          reason={} fire={} clear_badge={} prev_count={} count_increased={} sig_changed={} \
          elapsed={:?} typing={} activity_sig={:?} state_after={:?}",
         count,
         old_count,
         is_focused,
+        came_from_background,
+        effective_focused,
         settings.notifications_enabled,
         decision.reason,
         decision.should_fire,

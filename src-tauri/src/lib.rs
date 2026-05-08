@@ -3591,6 +3591,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let is_visible = is_focused && !is_minimized;
                 if is_visible != was_visible {
+                    // Fix 1: stamp the restore-from-minimized timestamp so that
+                    // update_unread_count_core can detect the came_from_background
+                    // condition within RESTORE_GRACE_SECS.
+                    if is_visible && !was_visible {
+                        let restore_ts = crate::commands::now_secs();
+                        crate::commands::LAST_RESTORED_FROM_MINIMIZED_SECS
+                            .store(restore_ts, std::sync::atomic::Ordering::SeqCst);
+                        log::info!(
+                            "[MessengerX][Visibility] Window restored from minimized — \
+                             stamped LAST_RESTORED_FROM_MINIMIZED_SECS={}",
+                            restore_ts
+                        );
+                    }
                     was_visible = is_visible;
                     log::info!(
                         "[MessengerX][Visibility] Poll state changed: focused={} minimized={} visible={}",
