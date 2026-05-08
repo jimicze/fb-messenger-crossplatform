@@ -2457,17 +2457,19 @@ fn log_platform_environment() {
 /// | non-empty     | any         | any         | any        | `--proxy-pac-url=<url>`    |
 /// | empty         | 1           | non-empty   | any        | `--proxy-server=<host:port>` |
 /// | empty         | 0 / absent  | absent      | 1          | `--no-proxy-server`        |
-/// | empty         | 0 / absent  | absent      | 0          | *(no proxy flag)*          |
+/// | empty         | 0 / absent  | absent      | 0          | `--no-proxy-server`        |
 ///
 /// `--disable-background-networking` is always appended.
 ///
-/// ## Why `--no-proxy-server` for WPAD-only
+/// ## Why `--no-proxy-server` for both AutoDetect=0 and AutoDetect=1
 ///
-/// When `AutoDetect=1` but neither a manual proxy nor a PAC URL is configured,
-/// Chromium performs WPAD discovery (DHCP option 252 + DNS `wpad.*`).  On
-/// networks without a WPAD server this times out after **~27 seconds** before
-/// falling back to DIRECT.  Because the user has no actual proxy configured we
-/// can safely skip discovery and go DIRECT immediately.
+/// Even when `AutoDetect=0` (IE "Automatically detect settings" unchecked),
+/// Chromium's network process still calls `WinHttpGetProxyForUrl()` with the
+/// `WINHTTP_AUTOPROXY_AUTO_DETECT` flag as part of its system-proxy resolver.
+/// On networks without a WPAD server this times out after **~27 seconds**
+/// before falling back to DIRECT.  Because the user has no proxy configured at
+/// all we can safely tell Chromium to go DIRECT immediately via
+/// `--no-proxy-server`, bypassing all WinHTTP proxy discovery.
 #[cfg(target_os = "windows")]
 fn resolve_webview2_proxy_args() -> String {
     const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
@@ -2537,8 +2539,11 @@ fn resolve_webview2_proxy_args() -> String {
         // WPAD server.  Direct connection is the correct behaviour here.
         "--no-proxy-server".to_string()
     } else {
-        // No proxy configured at all — direct connection is already the default.
-        String::new()
+        // No proxy configured at all — but Chromium's WinHTTP proxy resolver
+        // still probes for WPAD via WinHttpGetProxyForUrl() even when
+        // AutoDetect=0, causing a ~27 s timeout on networks without a WPAD
+        // server.  Bypass all discovery and go DIRECT immediately.
+        "--no-proxy-server".to_string()
     };
 
     log::info!("[MessengerX][Proxy] webview2_proxy_flag={proxy_flag:?}");
