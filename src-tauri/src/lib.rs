@@ -3404,13 +3404,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         });
-                    } else {
-                        // l.php without a `u` param — block navigation to the shim page.
-                        log::warn!(
-                            "[MessengerX] l.php link shim has no `u` param — blocking navigation: {url}"
-                        );
+                        return false;
                     }
-                    return false;
+                    // No `u` param — this is likely a Messenger OAuth / login
+                    // cookie redirect (NOT an external link shim).  Let it
+                    // navigate inside the WebView so the login flow can complete.
                 }
 
                 // Google domains are required for the Facebook login reCAPTCHA flow:
