@@ -288,7 +288,7 @@ fn decide_notification(
             count: prev_count,
             sig: prev_sig,
             fired_at_secs,
-            typing_rearm_exhausted,
+            typing_rearm_exhausted: prev_exhausted,
         } => {
             if count == 0 {
                 // If the window is focused the user is actively looking at the
@@ -314,7 +314,7 @@ fn decide_notification(
                     prev_fired_at_secs: fired_at_secs,
                     zero_since_secs: now,
                     zero_from_typing: is_typing_indicator,
-                    prev_typing_rearm_exhausted: typing_rearm_exhausted,
+                    prev_typing_rearm_exhausted: prev_exhausted,
                 };
                 NotificationDecision {
                     should_fire: false,
@@ -355,11 +355,21 @@ fn decide_notification(
                     "same-activity-suppressed"
                 };
                 if should_fire {
+                    // Preserve the typing_rearm_exhausted flag when the
+                    // fire reason is sig-changed-only (oscillation), not a
+                    // count increase.  Only a genuine count_increased or
+                    // time_rearm resets it to false.  This breaks the
+                    // sig_changed → typing_rearm → sig_changed infinite loop.
+                    let new_exhausted = if count_increased || time_rearm {
+                        false // true new message or fresh cycle
+                    } else {
+                        prev_exhausted // sig-only fire — carry forward
+                    };
                     *state = NotifState::Notified {
                         count,
                         sig: activity_sig.to_owned(),
                         fired_at_secs: now,
-                        typing_rearm_exhausted: false,
+                        typing_rearm_exhausted: new_exhausted,
                     };
                 }
                 NotificationDecision {
