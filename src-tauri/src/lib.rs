@@ -1778,7 +1778,25 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
             jlog('download save-as: fetching ' + blobUrl);
             var response = await fetch(blobUrl);
 
-            // 3. Convert the response to a byte array and write to disk.
+            // 3. If the chosen path lacks a file extension, derive one
+            //    from the response Content-Type header (e.g. image/jpeg → .jpg).
+            if (path.indexOf('.') <= path.lastIndexOf('/')) {
+                var ct = (response.headers.get('Content-Type') || '');
+                var semi = ct.indexOf(';');
+                if (semi >= 0) ct = ct.substring(0, semi);
+                ct = ct.trim();
+                var ext = ({
+                    'image/jpeg': '.jpg',  'image/png': '.png',
+                    'image/gif': '.gif',   'image/webp': '.webp',
+                    'image/bmp': '.bmp',   'image/svg+xml': '.svg',
+                    'application/pdf': '.pdf', 'video/mp4': '.mp4',
+                    'video/webm': '.webm', 'audio/mpeg': '.mp3',
+                    'audio/ogg': '.ogg',
+                })[ct] || '';
+                if (ext) path += ext;
+            }
+
+            // 4. Convert the response to a byte array and write to disk.
             var buffer = await response.arrayBuffer();
             var data = Array.from(new Uint8Array(buffer));
 
