@@ -2219,17 +2219,26 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 })();
 "#;
 
-/// JavaScript snippet injected via `eval()` during logout.  Clears all
-/// accessible cookies (with proper subdomain handling), localStorage,
-/// sessionStorage, then navigates to `https://www.messenger.com`.
+/// JavaScript snippet injected via `eval()` during logout.  Performs a
+/// best-effort client-side clear of JS-accessible cookies (including
+/// subdomain and path variants), localStorage, and sessionStorage, then
+/// navigates to `https://www.messenger.com`.
+///
+/// **Limitations** — This cannot remove `HttpOnly` cookies (commonly used
+/// for auth tokens) and only affects cookies for the *current* origin.
+/// A full session drop may require a server-side logout flow in addition
+/// to this client-side clear.
 ///
 /// * Cookie names are trimmed after splitting on `;`.
 /// * Empty cookie names are skipped (guards against `document.cookie === ''`).
 /// * Cookie expiry uses RFC1123 GMT format for cross-WebView compatibility.
 /// * The `while` loop stops before the TLD (`hostParts.length > 1`).
+/// * Path clearing includes the current pathname and all parent prefixes
+///   (e.g. `/messages/t/123`, `/messages/t`, `/messages`, `/`).
 /// * Any storage error is caught so the redirect always runs in `finally`.
 const LOGOUT_CLEAR_SCRIPT: &str = r#"
 try {
+    var pathSegments = window.location.pathname.split('/').filter(Boolean);
     document.cookie.split(';').forEach(function(c) {
         var eq = c.indexOf('=');
         var name = (eq > -1 ? c.substring(0, eq) : c).trim();
@@ -2237,11 +2246,19 @@ try {
         var hostParts = window.location.hostname.split('.');
         while (hostParts.length > 1) {
             var domain = hostParts.join('.');
-            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=' + domain;
-            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.' + domain;
+            // Clear for root path and all parent path prefixes.
+            for (var i = pathSegments.length; i >= 0; i--) {
+                var p = '/' + pathSegments.slice(0, i).join('/');
+                document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=' + domain;
+                document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=.' + domain;
+            }
             hostParts.shift();
         }
-        document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
+        // Current origin (no domain attribute).
+        for (var i = pathSegments.length; i >= 0; i--) {
+            var p = '/' + pathSegments.slice(0, i).join('/');
+            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p;
+        }
     });
 } catch (e) {} finally {
     try { localStorage.clear(); } catch (e) {}
@@ -4473,9 +4490,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let _ = autostart_c.set_checked(false);
 
-                        // Clear WebView cookies / localStorage / sessionStorage
-                        // before navigating to messenger.com so Facebook's login
-                        // session is actually dropped.
+                        // Best-effort client-side clear of JS-accessible cookies
+                        // (including path variants), localStorage, and sessionStorage
+                        // before navigating to messenger.com.  HttpOnly cookies and
+                        // cookies for other origins are not affected by this script.
                         if let Some(wv) = handle.get_webview_window("main") {
                             let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);
                             let _ = wv.show();
@@ -4963,8 +4981,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let _ = autostart_c.set_checked(false);
 
-                    // Clear WebView cookies / localStorage / sessionStorage
-                    // before navigating to messenger.com.
+                    // Best-effort client-side clear of JS-accessible cookies
+                    // (including path variants), localStorage, and sessionStorage
+                    // before navigating to messenger.com.  HttpOnly cookies and
+                    // cookies for other origins are not affected by this script.
                     if let Some(wv) = h.get_webview_window("main") {
                         let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);
                         let _ = wv.show();
@@ -5463,6 +5483,21 @@ mod tests {
             assert!(
                 LOGOUT_CLEAR_SCRIPT.contains("if (!name) return"),
                 "logout script must skip empty cookie names"
+            );
+        }
+
+        /// The script must clear cookies for the current pathname and all
+        /// parent path prefixes (e.g. `/messages/t/123`, `/messages/t`,
+        /// `/messages`, `/`), not just `path=/`.
+        #[test]
+        fn clears_cookie_path_variants() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("pathSegments"),
+                "logout script must compute path segments"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("window.location.pathname"),
+                "logout script must read current pathname"
             );
         }
 
