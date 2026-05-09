@@ -4444,22 +4444,25 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         // session is actually dropped.
                         if let Some(wv) = handle.get_webview_window("main") {
                             let _ = wv.eval(
-                                "document.cookie.split(';').forEach(function(c){\
-                                 var eq=c.indexOf('=');\
-                                 var name=(eq>-1?c.substr(0,eq):c).trim();\
-                                 var hostParts=window.location.hostname.split('.');\
-                                 while(hostParts.length>0){\
-                                  var domain=hostParts.join('.');\
-                                  document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain='+domain;\
-                                  document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain=.'+domain;\
-                                  hostParts.shift();\
-                                 }\
-                                 document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/';\
-                                });\
-                                 localStorage.clear();\
-                                 sessionStorage.clear();\
-                                 sessionStorage.setItem('__mx_appearance','system');\
-                                 window.location.href='https://www.messenger.com';",
+                                "try{\
+                                 document.cookie.split(';').forEach(function(c){\
+                                  var eq=c.indexOf('=');\
+                                  var name=(eq>-1?c.substring(0,eq):c).trim();\
+                                  var hostParts=window.location.hostname.split('.');\
+                                  while(hostParts.length>1){\
+                                   var domain=hostParts.join('.');\
+                                   document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain='+domain;\
+                                   document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain=.'+domain;\
+                                   hostParts.shift();\
+                                  }\
+                                  document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/';\
+                                 });\
+                                 }catch(e){}finally{\
+                                 try{localStorage.clear();}catch(e){}\
+                                 try{sessionStorage.clear();}catch(e){}\
+                                 try{sessionStorage.setItem('__mx_appearance','system');}catch(e){}\
+                                 window.location.href='https://www.messenger.com';\
+                                 }",
                             );
                             let _ = wv.show();
                             let _ = wv.set_focus();
@@ -4948,22 +4951,25 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // before navigating to messenger.com.
                     if let Some(wv) = h.get_webview_window("main") {
                         let _ = wv.eval(
-                            "document.cookie.split(';').forEach(function(c){\
-                             var eq=c.indexOf('=');\
-                             var name=(eq>-1?c.substr(0,eq):c).trim();\
-                             var hostParts=window.location.hostname.split('.');\
-                             while(hostParts.length>0){\
-                              var domain=hostParts.join('.');\
-                              document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain='+domain;\
-                              document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain=.'+domain;\
-                              hostParts.shift();\
-                             }\
-                             document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/';\
-                            });\
-                             localStorage.clear();\
-                             sessionStorage.clear();\
-                             sessionStorage.setItem('__mx_appearance','system');\
-                             window.location.href='https://www.messenger.com';",
+                            "try{\
+                             document.cookie.split(';').forEach(function(c){\
+                              var eq=c.indexOf('=');\
+                              var name=(eq>-1?c.substring(0,eq):c).trim();\
+                              var hostParts=window.location.hostname.split('.');\
+                              while(hostParts.length>1){\
+                               var domain=hostParts.join('.');\
+                               document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain='+domain;\
+                               document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain=.'+domain;\
+                               hostParts.shift();\
+                              }\
+                              document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/';\
+                             });\
+                             }catch(e){}finally{\
+                             try{localStorage.clear();}catch(e){}\
+                             try{sessionStorage.clear();}catch(e){}\
+                             try{sessionStorage.setItem('__mx_appearance','system');}catch(e){}\
+                             window.location.href='https://www.messenger.com';\
+                             }",
                         );
                         let _ = wv.show();
                         let _ = wv.set_focus();
