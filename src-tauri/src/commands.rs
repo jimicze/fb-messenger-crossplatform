@@ -378,6 +378,25 @@ fn decide_notification(
                         fired_at_secs: now,
                         typing_rearm_exhausted: new_exhausted,
                     };
+                } else if !prev_sig.is_empty() && !activity_sig.is_empty() {
+                    // When both sigs differ (same count, same exhausted
+                    // flag), update the stored baseline sig so that future
+                    // sig_changed checks compare against the current
+                    // signature, not a stale "".
+                    if activity_sig != prev_sig {
+                        if let NotifState::Notified { sig, .. } = state {
+                            *sig = activity_sig.to_owned();
+                        }
+                    }
+                } else if prev_sig.is_empty() && !activity_sig.is_empty()
+                    && count == prev_count
+                {
+                    // Empty→nonempty transition that we suppressed — store
+                    // the arriving sig as a baseline so the next genuine
+                    // change can be detected.
+                    if let NotifState::Notified { sig, .. } = state {
+                        *sig = activity_sig.to_owned();
+                    }
                 }
                 NotificationDecision {
                     should_fire,
@@ -1339,6 +1358,54 @@ mod tests {
         assert!(decision.should_fire);
         assert!(decision.sig_changed);
         assert_eq!(decision.reason, "zero-bounce-sig-changed");
+    }
+
+    /// Empty prev_sig (from typing transition) → non-empty activity_sig:
+    /// should NOT fire, and should update the stored sig as a baseline
+    /// so future changes can be detected against the real signature.
+    #[test]
+    fn test_notif_notified_empty_prev_sig_baseline_update() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(), // empty — from typing-indicator transition
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+
+        // Same count, prev_sig is empty, activity_sig arrives non-empty.
+        let decision = decide_notification(
+            &mut state, 1, "1:0:Alice", false, true, false, 104,
+        );
+        assert!(!decision.should_fire, "empty→nonempty should NOT fire");
+        assert!(!decision.sig_changed);
+
+        // State sig should be updated to the baseline.
+        match &state {
+            NotifState::Notified { sig, .. } => {
+                assert_eq!(sig, "1:0:Alice", "sig should be updated to baseline");
+            }
+            _ => panic!("expected Notified state"),
+        }
+    }
+
+    /// ZeroPending with empty prev_sig: should NOT fire on sig change,
+    /// and NOT fire on count return (suppressed as empty-oscillation).
+    #[test]
+    fn test_notif_zero_pending_empty_prev_sig_no_fire() {
+        let mut state = NotifState::ZeroPending {
+            prev_count: 1,
+            prev_sig: String::new(),
+            prev_fired_at_secs: 100,
+            zero_since_secs: 103,
+            zero_from_typing: true,
+            prev_typing_rearm_exhausted: false,
+        };
+
+        let decision = decide_notification(
+            &mut state, 1, "1:0:Alice", false, true, false, 104,
+        );
+        assert!(!decision.should_fire, "empty prev_sig should NOT trigger fire");
+        assert!(!decision.sig_changed);
     }
 
     #[test]
