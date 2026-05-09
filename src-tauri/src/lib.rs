@@ -2219,6 +2219,75 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 })();
 "#;
 
+/// JavaScript snippet injected via `eval()` during logout.  Performs a
+/// best-effort client-side clear of JS-accessible cookies (including
+/// subdomain and path variants), localStorage, and sessionStorage, then
+/// navigates to `https://www.messenger.com`.
+///
+/// **Limitations** — This cannot remove `HttpOnly` cookies (commonly used
+/// for auth tokens) and only affects cookies for the *current* origin.
+/// A full session drop may require a server-side logout flow in addition
+/// to this client-side clear.
+///
+/// * Cookie names are trimmed after splitting on `;`.
+/// * Empty cookie names are skipped (guards against `document.cookie === ''`).
+/// * Cookie expiry uses RFC1123 GMT format for cross-WebView compatibility.
+/// * The `while` loop stops before the TLD (`hostParts.length > 1`).
+/// * Path clearing includes the current pathname and all parent prefixes
+///   (e.g. `/messages/t/123`, `/messages/t`, `/messages`, `/`).
+/// * Any storage error is caught so the redirect always runs in `finally`.
+const LOGOUT_CLEAR_SCRIPT: &str = r#"
+(function() {
+    try {
+        var pathSegments = window.location.pathname.split('/').filter(Boolean);
+        document.cookie.split(';').forEach(function(c) {
+            var eq = c.indexOf('=');
+            var name = (eq > -1 ? c.substring(0, eq) : c).trim();
+            if (!name) return;
+            var hostParts = window.location.hostname.split('.');
+            while (hostParts.length > 1) {
+                var domain = hostParts.join('.');
+                // Clear for root path and all parent path prefixes
+                // (both with and without trailing slash, since they are
+                // distinct cookie identities).
+                for (var i = pathSegments.length; i >= 0; i--) {
+                    var p = '/' + pathSegments.slice(0, i).join('/');
+                    document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=' + domain;
+                    document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=.' + domain;
+                    if (i > 0) {
+                        var pSlash = p + '/';
+                        document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + pSlash + ';domain=' + domain;
+                        document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + pSlash + ';domain=.' + domain;
+                    }
+                }
+                hostParts.shift();
+            }
+            // Current origin (no domain attribute).
+            for (var i = pathSegments.length; i >= 0; i--) {
+                var p = '/' + pathSegments.slice(0, i).join('/');
+                document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p;
+                if (i > 0) {
+                    document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + '/';
+                }
+            }
+        });
+    } catch (e) {
+        console.error('[MessengerX] Logout cookie clear failed:', e);
+    } finally {
+        try { localStorage.clear(); } catch (e) {
+            console.error('[MessengerX] Logout localStorage clear failed:', e);
+        }
+        try { sessionStorage.clear(); } catch (e) {
+            console.error('[MessengerX] Logout sessionStorage clear failed:', e);
+        }
+        try { sessionStorage.setItem('__mx_appearance', 'system'); } catch (e) {
+            console.error('[MessengerX] Logout appearance reset failed:', e);
+        }
+        window.location.href = 'https://www.messenger.com';
+    }
+})();
+"#;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -4404,6 +4473,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
                     // ---- Log out & clear data ----
                     "logout" => {
+                        if let Err(e) = services::cache::clear_snapshots(handle) {
+                            log::warn!("[MessengerX] Failed to clear snapshots during logout: {e}");
+                        }
                         let defaults = crate::commands::AppSettings::default();
                         let _ = services::auth::save_settings(handle, &defaults);
 
@@ -4438,14 +4510,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let _ = autostart_c.set_checked(false);
 
-                        // Navigate to messenger.com to clear session/cookies.
-                        // Also reset the appearance sessionStorage key so the
-                        // init-script starts clean on the new page load.
+                        // Best-effort client-side clear of JS-accessible cookies
+                        // (including path variants), localStorage, and sessionStorage
+                        // before navigating to messenger.com.  HttpOnly cookies and
+                        // cookies for other origins are not affected by this script.
                         if let Some(wv) = handle.get_webview_window("main") {
-                            let _ = wv.eval(
-                                "sessionStorage.setItem('__mx_appearance','system');\
-                                 window.location.href='https://www.messenger.com';",
-                            );
+                            if let Err(e) = wv.eval(LOGOUT_CLEAR_SCRIPT) {
+                                log::warn!("[MessengerX] Failed to eval logout clear script: {e}");
+                            }
                             let _ = wv.show();
                             let _ = wv.set_focus();
                         }
@@ -4895,7 +4967,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
                 // ---- Log out & clear data ----
                 "logout" => {
-                    let _ = services::cache::clear_snapshots(&h);
+                    if let Err(e) = services::cache::clear_snapshots(&h) {
+                        log::warn!("[MessengerX] Failed to clear snapshots during logout: {e}");
+                    }
                     let defaults = commands::AppSettings::default();
                     let _ = services::auth::save_settings(&h, &defaults);
 
@@ -4929,14 +5003,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let _ = autostart_c.set_checked(false);
 
-                    // Navigate to messenger.com to clear session/cookies.
-                    // Also reset the appearance sessionStorage key so the
-                    // init-script starts clean on the new page load.
+                    // Best-effort client-side clear of JS-accessible cookies
+                    // (including path variants), localStorage, and sessionStorage
+                    // before navigating to messenger.com.  HttpOnly cookies and
+                    // cookies for other origins are not affected by this script.
                     if let Some(wv) = h.get_webview_window("main") {
-                        let _ = wv.eval(
-                            "sessionStorage.setItem('__mx_appearance','system');\
-                             window.location.href='https://www.messenger.com';",
-                        );
+                        if let Err(e) = wv.eval(LOGOUT_CLEAR_SCRIPT) {
+                            log::warn!("[MessengerX] Failed to eval logout clear script: {e}");
+                        }
                         let _ = wv.show();
                         let _ = wv.set_focus();
                     }
@@ -5364,4 +5438,122 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Logout script regression tests
+    // -----------------------------------------------------------------------
+    mod logout_script {
+        use super::super::LOGOUT_CLEAR_SCRIPT;
+
+        /// The script must attempt to clear cookies (the core privacy action).
+        #[test]
+        fn clears_cookies() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("document.cookie"),
+                "logout script must touch document.cookie"
+            );
+        }
+
+        /// The script must clear localStorage and sessionStorage.
+        #[test]
+        fn clears_storage() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("localStorage.clear()"),
+                "logout script must clear localStorage"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("sessionStorage.clear()"),
+                "logout script must clear sessionStorage"
+            );
+        }
+
+        /// The script must reset the appearance override key in sessionStorage
+        /// so the next login page shows the correct theme.
+        #[test]
+        fn resets_appearance_key() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("__mx_appearance"),
+                "logout script must reset __mx_appearance"
+            );
+        }
+
+        /// The script must navigate to messenger.com after clearing.
+        #[test]
+        fn navigates_to_messenger() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("https://www.messenger.com"),
+                "logout script must redirect to messenger.com"
+            );
+        }
+
+        /// Cookie expiry must use the RFC1123 GMT format (not UTC) for
+        /// cross-WebView compatibility.
+        #[test]
+        fn cookie_expiry_uses_gmt() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("00:00:00 GMT"),
+                "cookie expiry must use GMT format"
+            );
+            assert!(
+                !LOGOUT_CLEAR_SCRIPT.contains("00:00:00 UTC"),
+                "cookie expiry must not use UTC format"
+            );
+        }
+
+        /// The cookie loop must guard against empty cookie names so that
+        /// `document.cookie === ''` does not generate invalid assignments.
+        #[test]
+        fn skips_empty_cookie_names() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("if (!name) return"),
+                "logout script must skip empty cookie names"
+            );
+        }
+
+        /// The script must clear cookies for the current pathname and all
+        /// parent path prefixes (e.g. `/messages/t/123`, `/messages/t`,
+        /// `/messages`, `/`), not just `path=/`.  It must also try the
+        /// trailing-slash variant of each prefix (e.g. `/messages/` is a
+        /// distinct cookie identity from `/messages`).
+        #[test]
+        fn clears_cookie_path_variants() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("pathSegments"),
+                "logout script must compute path segments"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("window.location.pathname"),
+                "logout script must read current pathname"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("var pSlash = p + '/'"),
+                "logout script must clear trailing-slash path variants"
+            );
+        }
+
+        /// The cookie-domain loop must stop before the TLD to avoid
+        /// assigning cookies to e.g. `domain=com`.
+        #[test]
+        fn stops_before_tld() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("hostParts.length > 1"),
+                "cookie loop must stop before TLD"
+            );
+        }
+
+        /// The script must be wrapped in an IIFE so that `var` bindings
+        /// do not leak onto the global `window` object.
+        #[test]
+        fn wrapped_in_iife() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.trim_start().starts_with("(function()"),
+                "logout script must be wrapped in an IIFE"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.trim_end().ends_with(")();"),
+                "logout script IIFE must end with )();"
+            );
+        }
+    }
+
 }
