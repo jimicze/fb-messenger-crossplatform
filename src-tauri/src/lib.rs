@@ -2247,11 +2247,18 @@ const LOGOUT_CLEAR_SCRIPT: &str = r#"
             var hostParts = window.location.hostname.split('.');
             while (hostParts.length > 1) {
                 var domain = hostParts.join('.');
-                // Clear for root path and all parent path prefixes.
+                // Clear for root path and all parent path prefixes
+                // (both with and without trailing slash, since they are
+                // distinct cookie identities).
                 for (var i = pathSegments.length; i >= 0; i--) {
                     var p = '/' + pathSegments.slice(0, i).join('/');
                     document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=' + domain;
                     document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=.' + domain;
+                    if (i > 0) {
+                        var pSlash = p + '/';
+                        document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + pSlash + ';domain=' + domain;
+                        document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + pSlash + ';domain=.' + domain;
+                    }
                 }
                 hostParts.shift();
             }
@@ -2259,6 +2266,9 @@ const LOGOUT_CLEAR_SCRIPT: &str = r#"
             for (var i = pathSegments.length; i >= 0; i--) {
                 var p = '/' + pathSegments.slice(0, i).join('/');
                 document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p;
+                if (i > 0) {
+                    document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + '/';
+                }
             }
         });
     } catch (e) {
@@ -5502,7 +5512,9 @@ mod tests {
 
         /// The script must clear cookies for the current pathname and all
         /// parent path prefixes (e.g. `/messages/t/123`, `/messages/t`,
-        /// `/messages`, `/`), not just `path=/`.
+        /// `/messages`, `/`), not just `path=/`.  It must also try the
+        /// trailing-slash variant of each prefix (e.g. `/messages/` is a
+        /// distinct cookie identity from `/messages`).
         #[test]
         fn clears_cookie_path_variants() {
             assert!(
@@ -5512,6 +5524,10 @@ mod tests {
             assert!(
                 LOGOUT_CLEAR_SCRIPT.contains("window.location.pathname"),
                 "logout script must read current pathname"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("var pSlash = p + '/'"),
+                "logout script must clear trailing-slash path variants"
             );
         }
 
