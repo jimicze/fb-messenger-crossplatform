@@ -3548,14 +3548,21 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         if success {
                             let body =
                                 format!("Saved to Downloads — {filename}");
-                            let _ = crate::services::notification::show_notification(
-                                &notify_handle,
-                                "Messenger X",
-                                &body,
-                                "download",
-                                true, // silent — no sound for file downloads
-                                "download-finished",
-                            );
+                            let h = notify_handle.clone();
+                            // Spawn on a background thread — on macOS dev
+                            // mode show_notification spawns the debug .app
+                            // bundle as a subprocess (~4 s), which would
+                            // beachball if called on the main thread here.
+                            std::thread::spawn(move || {
+                                let _ = crate::services::notification::show_notification(
+                                    &h,
+                                    "Messenger X",
+                                    &body,
+                                    "download",
+                                    true,
+                                    "download-finished",
+                                );
+                            });
                         }
                         true
                     }
