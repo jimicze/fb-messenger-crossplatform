@@ -327,7 +327,14 @@ fn decide_notification(
                 }
             } else {
                 let count_increased = count > prev_count;
-                let sig_changed = !activity_sig.is_empty() && activity_sig != prev_sig;
+                // Guard against empty→nonempty sig transitions.  When the
+                // current Notified state has sig="" (stored after a typing
+                // indicator dropped activity_sig), the return of any real
+                // signature reads as "changed" → duplicate notification.
+                // Applies to both individual and group conversations.
+                let sig_changed = !activity_sig.is_empty()
+                    && !prev_sig.is_empty()
+                    && activity_sig != prev_sig;
                 let elapsed = now.saturating_sub(fired_at_secs);
                 // sig_changed fires are rate-limited to prevent JS thread-mutation
                 // sequences from producing rapid-fire banners.  count_increased always
