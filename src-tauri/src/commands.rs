@@ -1003,11 +1003,35 @@ pub async fn pick_save_path(
     use std::sync::mpsc;
     use tauri_plugin_dialog::DialogExt;
 
+    // Pre-increment the suggested name so the dialog itself shows
+    // "download (2)", "download (3)", etc. when files already exist
+    // in the Downloads folder (the default save location).
+    let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let display_name = {
+        let candidate = downloads.join(&suggested_filename);
+        if !candidate.exists() {
+            suggested_filename.clone()
+        } else {
+            let (stem, ext) = suggested_filename
+                .rfind('.')
+                .map(|i| (&suggested_filename[..i], &suggested_filename[i..]))
+                .unwrap_or((suggested_filename.as_str(), ""));
+            let mut n: u32 = 2;
+            loop {
+                let name = format!("{stem} ({n}){ext}");
+                if !downloads.join(&name).exists() {
+                    break name;
+                }
+                n = n.saturating_add(1);
+            }
+        }
+    };
+
     let (tx, rx) = mpsc::channel();
 
     app.dialog()
         .file()
-        .set_file_name(&suggested_filename)
+        .set_file_name(&display_name)
         .save_file(move |file_path| {
             let result = file_path
                 .and_then(|fp| fp.into_path().ok())
@@ -1023,7 +1047,7 @@ pub async fn pick_save_path(
                 if !p.exists() {
                     return path_str;
                 }
-                // File already exists — auto-increment the name.
+                // File already exists — auto-increment the name (fallback).
                 let dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
                 let base = p
                     .file_name()
