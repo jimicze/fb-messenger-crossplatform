@@ -1668,6 +1668,24 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
         }
     }
 
+    // Detect Facebook's link shim: l.facebook.com/l.php?u=REAL_URL
+    // (also l.messenger.com/l.php?u=REAL_URL).
+    // Messenger wraps all outbound links in this shim.  When the shim URL is
+    // passed to window.open() it passes isAllowedUrl() (facebook.com subdomain)
+    // and falls through to _originalOpen — which WKWebView silently drops
+    // because WRY has no createWebViewWith UI delegate.  We extract the real
+    // destination and open it via the Tauri opener instead.
+    function extractLinkShimUrl(urlStr) {
+        try {
+            var parsed = new URL(urlStr);
+            if ((parsed.hostname === 'l.facebook.com' || parsed.hostname === 'l.messenger.com')
+                    && parsed.pathname === '/l.php') {
+                return parsed.searchParams.get('u') || null;
+            }
+        } catch(e) {}
+        return null;
+    }
+
     function openExternal(urlStr) {
         jlog('External URL — routing to system browser: ' + urlStr);
         try {
@@ -1686,6 +1704,16 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
         jlog('window.open intercepted: url=' + urlStr + ' target=' + target);
 
         if (urlStr && (urlStr.startsWith('http://') || urlStr.startsWith('https://'))) {
+            // Check for the Facebook/Messenger link shim BEFORE isAllowedUrl,
+            // because l.facebook.com IS an allowed domain but window.open()
+            // with that URL would be silently dropped by WKWebView (no
+            // createWebViewWith UI delegate in WRY).
+            var realUrl = extractLinkShimUrl(urlStr);
+            if (realUrl) {
+                jlog('Link shim in window.open — routing real URL to browser: ' + realUrl);
+                openExternal(realUrl);
+                return null;
+            }
             if (!isAllowedUrl(urlStr)) {
                 openExternal(urlStr);
                 return null;
@@ -2343,6 +2371,12 @@ const LINUX_APPIMAGE_ENV_OVERRIDES: &[(&str, &str)] = &[
     ("GIO_USE_VFS", "local"),
     // Avoid loading host dconf backend when bundled GLib is older/newer.
     ("GSETTINGS_BACKEND", "memory"),
+    // Force GTK3's built-in file chooser instead of the XDG Desktop Portal.
+    // Without this, WebKitGTK on Wayland inside an AppImage uses the portal
+    // (`org.freedesktop.portal.FileChooser`), which rejects requests from
+    // AppImages that have no portal access → `<input type="file">` silently
+    // fails and no file picker appears (Issue #27 Bug B).
+    ("GTK_USE_PORTAL", "0"),
 ];
 
 #[cfg(target_os = "linux")]
@@ -2425,10 +2459,11 @@ fn log_platform_environment() {
             })
             .unwrap_or_else(|_| "<unset>".into());
         let appimage = std::env::var("APPIMAGE").ok();
+        let gtk_use_portal = std::env::var("GTK_USE_PORTAL").unwrap_or_else(|_| "<unset>".into());
         log::info!(
             "[MessengerX][Env][Linux] session_type={session_type:?} wayland_display={wayland_display:?} \
              current_desktop={current_desktop:?} desktop_session={desktop_session:?} \
-             dbus_addr={dbus_addr:?} appimage={appimage:?}"
+             dbus_addr={dbus_addr:?} appimage={appimage:?} GTK_USE_PORTAL={gtk_use_portal:?}"
         );
 
         let notify_send_check = std::process::Command::new("sh")
@@ -2943,6 +2978,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(&proxy_args);
 
+    // Pre-clone the app handle for the on_download closure.  `nav_app_handle`
+    // is moved into the `on_navigation` closure below, so we must create the
+    // download clone before the builder chain consumes it.
+    let dl_app_handle = nav_app_handle.clone();
+
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
         .user_agent(
@@ -3315,8 +3355,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         });
-                        return false;
+                    } else {
+                        // l.php without a `u` param — block navigation to the shim page.
+                        log::warn!(
+                            "[MessengerX] l.php link shim has no `u` param — blocking navigation: {url}"
+                        );
                     }
+                    return false;
                 }
 
                 // Google domains are required for the Facebook login reCAPTCHA flow:
@@ -3384,6 +3429,132 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     setup_started.elapsed().as_millis()
                 );
                 true
+            }
+        })
+        // ------------------------------------------------------------------
+        // Issue #27 Fix A: Download handler with "Save As" dialog.
+        //
+        // Without this handler WKWebView/WebKitGTK/WebView2 silently save
+        // files to a platform default directory with no UI.  We intercept
+        // every download:
+        //   • Requested — show a native "Save As" dialog so the user can
+        //     choose the destination; cancel aborts the download.
+        //   • Finished  — reveal the saved file in the OS file manager
+        //     (Finder / Explorer / Files).
+        //
+        // `on_download` runs on a background thread so `blocking_save_file()`
+        // is safe to call without deadlocking the main UI thread.
+        //
+        // macOS note: `DownloadEvent::Finished.path` is always `None` due to
+        // WKWebView API constraints.  We store the destination set in the
+        // Requested handler inside an `Arc<Mutex>` and use it in Finished.
+        // ------------------------------------------------------------------
+        .on_download({
+            let download_dest: std::sync::Arc<
+                std::sync::Mutex<Option<std::path::PathBuf>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            move |_webview, event| {
+                match event {
+                    tauri::webview::DownloadEvent::Requested { url, destination } => {
+                        // Derive a suggested filename from the URL path.
+                        let filename = url
+                            .path_segments()
+                            .and_then(|mut seg| seg.next_back())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("download")
+                            .to_string();
+
+                        log::info!(
+                            "[MessengerX][Download] Requested url={url} \
+                             suggested_name={filename:?}"
+                        );
+
+                        // Show a "Save As" dialog.  The closure runs on a
+                        // background thread so blocking here is safe.
+                        use tauri_plugin_dialog::DialogExt;
+                        let chosen = dl_app_handle
+                            .dialog()
+                            .file()
+                            .set_file_name(&filename)
+                            .blocking_save_file();
+
+                        match chosen {
+                            Some(file_path) => {
+                                match file_path.into_path() {
+                                    Ok(path_buf) => {
+                                        log::info!(
+                                            "[MessengerX][Download] Saving to {path_buf:?}"
+                                        );
+                                        *destination = path_buf.clone();
+                                        if let Ok(mut guard) = download_dest.lock() {
+                                            *guard = Some(path_buf);
+                                        }
+                                        true // allow download
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[MessengerX][Download] Could not resolve \
+                                             save path: {e}"
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                            None => {
+                                log::info!(
+                                    "[MessengerX][Download] User cancelled save dialog"
+                                );
+                                false // abort download
+                            }
+                        }
+                    }
+                    tauri::webview::DownloadEvent::Finished { url, path, success } => {
+                        // On macOS `path` is always None (WKWebView API limit).
+                        // Fall back to the destination stored from the Requested event.
+                        let stored = download_dest.lock().ok().and_then(|g| g.clone());
+                        let effective_path = path.or(stored);
+
+                        log::info!(
+                            "[MessengerX][Download] Finished url={url} \
+                             path={effective_path:?} success={success}"
+                        );
+
+                        if success {
+                            if let Some(ref p) = effective_path {
+                                // Reveal the file in the OS file manager.
+                                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                                let p_str = p.to_string_lossy().to_string();
+                                #[cfg(target_os = "linux")]
+                                let parent_str = p
+                                    .parent()
+                                    .map(|d| d.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| ".".to_string());
+
+                                #[cfg(target_os = "macos")]
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("open")
+                                        .arg("-R")
+                                        .arg(&p_str)
+                                        .status();
+                                });
+                                #[cfg(target_os = "windows")]
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("explorer")
+                                        .arg(format!("/select,{p_str}"))
+                                        .status();
+                                });
+                                #[cfg(target_os = "linux")]
+                                std::thread::spawn(move || {
+                                    let _ = std::process::Command::new("xdg-open")
+                                        .arg(&parent_str)
+                                        .status();
+                                });
+                            }
+                        }
+                        true
+                    }
+                    _ => true,
+                }
             }
         })
         .build()?;
