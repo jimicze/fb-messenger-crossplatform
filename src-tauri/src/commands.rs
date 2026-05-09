@@ -1015,7 +1015,34 @@ pub async fn pick_save_path(
             let _ = tx.send(result);
         });
 
-    rx.recv().map_err(|e| format!("Save dialog error: {e}"))
+    rx.recv()
+        .map_err(|e| format!("Save dialog error: {e}"))
+        .map(|opt| {
+            opt.map(|path_str| {
+                let p = std::path::PathBuf::from(&path_str);
+                if !p.exists() {
+                    return path_str;
+                }
+                // File already exists — auto-increment the name.
+                let dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let base = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("download");
+                let (stem, ext) = base
+                    .rfind('.')
+                    .map(|i| (&base[..i], &base[i..]))
+                    .unwrap_or((base, ""));
+                let mut n: u32 = 2;
+                loop {
+                    let candidate = dir.join(format!("{stem} ({n}){ext}"));
+                    if !candidate.exists() {
+                        return candidate.to_string_lossy().to_string();
+                    }
+                    n = n.saturating_add(1);
+                }
+            })
+        })
 }
 
 /// Writes binary data to the given filesystem path and sends a system
