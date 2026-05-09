@@ -2260,10 +2260,18 @@ try {
             document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p;
         }
     });
-} catch (e) {} finally {
-    try { localStorage.clear(); } catch (e) {}
-    try { sessionStorage.clear(); } catch (e) {}
-    try { sessionStorage.setItem('__mx_appearance', 'system'); } catch (e) {}
+} catch (e) {
+    console.error('[MessengerX] Logout cookie clear failed:', e);
+} finally {
+    try { localStorage.clear(); } catch (e) {
+        console.error('[MessengerX] Logout localStorage clear failed:', e);
+    }
+    try { sessionStorage.clear(); } catch (e) {
+        console.error('[MessengerX] Logout sessionStorage clear failed:', e);
+    }
+    try { sessionStorage.setItem('__mx_appearance', 'system'); } catch (e) {
+        console.error('[MessengerX] Logout appearance reset failed:', e);
+    }
     window.location.href = 'https://www.messenger.com';
 }
 "#;
