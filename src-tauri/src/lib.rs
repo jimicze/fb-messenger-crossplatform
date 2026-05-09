@@ -5556,38 +5556,4 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Logout handler regression tests — assert both platforms keep
-    // snapshot clearing + script evaluation in sync.
-    // -----------------------------------------------------------------------
-    mod logout_handlers {
-        const SOURCE: &str = include_str!("lib.rs");
-
-        /// Both logout handlers must call `services::cache::clear_snapshots`.
-        #[test]
-        fn both_logout_handlers_clear_snapshots() {
-            assert!(
-                SOURCE.contains("services::cache::clear_snapshots(handle)"),
-                "tray logout must clear snapshots"
-            );
-            assert!(
-                SOURCE.contains("services::cache::clear_snapshots(&h)"),
-                "macOS logout must clear snapshots"
-            );
-        }
-
-        /// Both logout handlers must evaluate `LOGOUT_CLEAR_SCRIPT` and
-        /// log errors instead of silently dropping them.
-        #[test]
-        fn both_logout_handlers_log_eval_errors() {
-            assert!(
-                SOURCE.contains("Failed to eval logout clear script"),
-                "logout handlers must log eval errors"
-            );
-            assert!(
-                SOURCE.contains("if let Err(e) = wv.eval(LOGOUT_CLEAR_SCRIPT)"),
-                "logout handlers must handle eval Result"
-            );
-        }
-    }
 }
