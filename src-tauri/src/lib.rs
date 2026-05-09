@@ -4505,7 +4505,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         // before navigating to messenger.com.  HttpOnly cookies and
                         // cookies for other origins are not affected by this script.
                         if let Some(wv) = handle.get_webview_window("main") {
-                            let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);
+                            if let Err(e) = wv.eval(LOGOUT_CLEAR_SCRIPT) {
+                                log::warn!("[MessengerX] Failed to eval logout clear script: {e}");
+                            }
                             let _ = wv.show();
                             let _ = wv.set_focus();
                         }
@@ -4996,7 +4998,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // before navigating to messenger.com.  HttpOnly cookies and
                     // cookies for other origins are not affected by this script.
                     if let Some(wv) = h.get_webview_window("main") {
-                        let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);
+                        if let Err(e) = wv.eval(LOGOUT_CLEAR_SCRIPT) {
+                            log::warn!("[MessengerX] Failed to eval logout clear script: {e}");
+                        }
                         let _ = wv.show();
                         let _ = wv.set_focus();
                     }
@@ -5556,22 +5560,17 @@ mod tests {
             );
         }
 
-        /// The tray (Windows/Linux) logout handler must evaluate
-        /// `LOGOUT_CLEAR_SCRIPT`.
+        /// Both logout handlers must evaluate `LOGOUT_CLEAR_SCRIPT` and
+        /// log errors instead of silently dropping them.
         #[test]
-        fn tray_logout_evals_script() {
+        fn both_logout_handlers_log_eval_errors() {
             assert!(
-                SOURCE.contains("let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);"),
-                "tray logout must eval LOGOUT_CLEAR_SCRIPT"
+                SOURCE.contains("Failed to eval logout clear script"),
+                "logout handlers must log eval errors"
             );
-        }
-
-        /// The macOS menu logout handler must evaluate `LOGOUT_CLEAR_SCRIPT`.
-        #[test]
-        fn macos_logout_evals_script() {
             assert!(
-                SOURCE.contains("let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);"),
-                "macOS logout must eval LOGOUT_CLEAR_SCRIPT"
+                SOURCE.contains("if let Err(e) = wv.eval(LOGOUT_CLEAR_SCRIPT)"),
+                "logout handlers must handle eval Result"
             );
         }
     }
