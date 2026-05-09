@@ -327,7 +327,14 @@ fn decide_notification(
                 }
             } else {
                 let count_increased = count > prev_count;
-                let sig_changed = !activity_sig.is_empty() && activity_sig != prev_sig;
+                // Guard against empty→nonempty sig transitions.  When the
+                // current Notified state has sig="" (stored after a typing
+                // indicator dropped activity_sig), the return of any real
+                // signature reads as "changed" → duplicate notification.
+                // Applies to both individual and group conversations.
+                let sig_changed = !activity_sig.is_empty()
+                    && !prev_sig.is_empty()
+                    && activity_sig != prev_sig;
                 let elapsed = now.saturating_sub(fired_at_secs);
                 // sig_changed fires are rate-limited to prevent JS thread-mutation
                 // sequences from producing rapid-fire banners.  count_increased always
@@ -371,6 +378,15 @@ fn decide_notification(
                         fired_at_secs: now,
                         typing_rearm_exhausted: new_exhausted,
                     };
+                } else if prev_sig.is_empty() && !activity_sig.is_empty()
+                    && count == prev_count
+                {
+                    // Empty→nonempty transition that we suppressed — store
+                    // the arriving sig as a baseline so the next genuine
+                    // change can be detected.
+                    if let NotifState::Notified { sig, .. } = state {
+                        *sig = activity_sig.to_owned();
+                    }
                 }
                 NotificationDecision {
                     should_fire,
@@ -431,7 +447,16 @@ fn decide_notification(
                 }
             } else {
                 let count_increased = count > prev_count;
-                let sig_changed = !activity_sig.is_empty() && activity_sig != prev_sig;
+                // sig_changed requires BOTH the current and previous sig to be
+                // non-empty.  When prev_sig is "" (stored during a typing-indicator
+                // transition), the return of any real signature would otherwise
+                // register as "changed" → duplicate notification for the same
+                // message.  This was especially visible for group chats where the
+                // title oscillates between "(N) Sender | Messenger" (open tab)
+                // and "Sender píše skupině GroupName" (typing indicator).
+                let sig_changed = !activity_sig.is_empty()
+                    && !prev_sig.is_empty()
+                    && activity_sig != prev_sig;
                 let elapsed = now.saturating_sub(prev_fired_at_secs);
                 // Same floor as the Notified arm: sig-only fires are rate-limited.
                 let sig_under_floor =
@@ -1325,6 +1350,58 @@ mod tests {
         assert_eq!(decision.reason, "zero-bounce-sig-changed");
     }
 
+    /// Empty prev_sig (from typing transition) → non-empty activity_sig:
+    /// should NOT fire, and should update the stored sig as a baseline
+    /// so future changes can be detected against the real signature.
+    #[test]
+    fn test_notif_state_notified_empty_prev_sig_baseline_update() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: String::new(), // empty — from typing-indicator transition
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+
+        // Same count, prev_sig is empty, activity_sig arrives non-empty.
+        let decision = decide_notification(
+            &mut state, 1, "1:0:Alice", false, true, false, 104,
+        );
+        assert!(!decision.should_fire, "empty→nonempty should NOT fire");
+        assert!(!decision.sig_changed);
+
+        // State sig should be updated to the baseline.
+        match &state {
+            NotifState::Notified { sig, .. } => {
+                assert_eq!(sig, "1:0:Alice", "sig should be updated to baseline");
+            }
+            _ => panic!("expected Notified state"),
+        }
+    }
+
+    /// ZeroPending with empty prev_sig and non-empty activity_sig:
+    /// sig_changed must be false (guarded by empty prev_sig) so the
+    /// decision does NOT fire due to the sig-change path.
+    #[test]
+    fn test_notif_state_zero_pending_empty_prev_sig_no_fire() {
+        let mut state = NotifState::ZeroPending {
+            prev_count: 1,
+            prev_sig: String::new(),
+            prev_fired_at_secs: 100,
+            zero_since_secs: 103,
+            zero_from_typing: true,
+            prev_typing_rearm_exhausted: false,
+        };
+
+        let decision = decide_notification(
+            &mut state, 1, "1:0:Alice", false, true, false, 104,
+        );
+        assert!(!decision.should_fire, "empty prev_sig should NOT trigger fire");
+        assert!(
+            !decision.sig_changed,
+            "sig_changed must be false when prev_sig is empty"
+        );
+    }
+
     #[test]
     fn test_count_increased_detection() {
         // count > last_notified_count triggers notification.
@@ -1355,6 +1432,28 @@ mod tests {
         let decision = decide_notification(&mut state, 1, "1:1:Alice", false, true, false, now);
         assert!(decision.should_fire, "sig_changed after floor should fire");
         assert_eq!(decision.reason, "sig-changed");
+    }
+
+    /// sig_changed under floor: state.sig must stay unchanged so the same
+    /// change is still detectable after the floor elapses.
+    #[test]
+    fn test_sig_changed_under_floor_preserves_sig() {
+        let mut state = NotifState::Notified {
+            count: 1,
+            sig: "1:0:Alice".to_string(),
+            fired_at_secs: 100,
+            typing_rearm_exhausted: false,
+        };
+        let decision = decide_notification(&mut state, 1, "1:1:Alice", false, true, false, 101);
+        assert!(!decision.should_fire, "under-floor sig_changed should NOT fire");
+        assert_eq!(decision.reason, "sig-changed-floor-suppressed");
+        // Stored sig must remain the OLD value so the next poll still sees a change.
+        match &state {
+            NotifState::Notified { sig, .. } => {
+                assert_eq!(sig, "1:0:Alice", "sig must not be overwritten while under floor");
+            }
+            _ => panic!("expected Notified state"),
+        }
     }
 
     /// sig_changed fires immediately under the floor when it should be suppressed.
