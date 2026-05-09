@@ -2237,43 +2237,45 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 ///   (e.g. `/messages/t/123`, `/messages/t`, `/messages`, `/`).
 /// * Any storage error is caught so the redirect always runs in `finally`.
 const LOGOUT_CLEAR_SCRIPT: &str = r#"
-try {
-    var pathSegments = window.location.pathname.split('/').filter(Boolean);
-    document.cookie.split(';').forEach(function(c) {
-        var eq = c.indexOf('=');
-        var name = (eq > -1 ? c.substring(0, eq) : c).trim();
-        if (!name) return;
-        var hostParts = window.location.hostname.split('.');
-        while (hostParts.length > 1) {
-            var domain = hostParts.join('.');
-            // Clear for root path and all parent path prefixes.
+(function() {
+    try {
+        var pathSegments = window.location.pathname.split('/').filter(Boolean);
+        document.cookie.split(';').forEach(function(c) {
+            var eq = c.indexOf('=');
+            var name = (eq > -1 ? c.substring(0, eq) : c).trim();
+            if (!name) return;
+            var hostParts = window.location.hostname.split('.');
+            while (hostParts.length > 1) {
+                var domain = hostParts.join('.');
+                // Clear for root path and all parent path prefixes.
+                for (var i = pathSegments.length; i >= 0; i--) {
+                    var p = '/' + pathSegments.slice(0, i).join('/');
+                    document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=' + domain;
+                    document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=.' + domain;
+                }
+                hostParts.shift();
+            }
+            // Current origin (no domain attribute).
             for (var i = pathSegments.length; i >= 0; i--) {
                 var p = '/' + pathSegments.slice(0, i).join('/');
-                document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=' + domain;
-                document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p + ';domain=.' + domain;
+                document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p;
             }
-            hostParts.shift();
+        });
+    } catch (e) {
+        console.error('[MessengerX] Logout cookie clear failed:', e);
+    } finally {
+        try { localStorage.clear(); } catch (e) {
+            console.error('[MessengerX] Logout localStorage clear failed:', e);
         }
-        // Current origin (no domain attribute).
-        for (var i = pathSegments.length; i >= 0; i--) {
-            var p = '/' + pathSegments.slice(0, i).join('/');
-            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=' + p;
+        try { sessionStorage.clear(); } catch (e) {
+            console.error('[MessengerX] Logout sessionStorage clear failed:', e);
         }
-    });
-} catch (e) {
-    console.error('[MessengerX] Logout cookie clear failed:', e);
-} finally {
-    try { localStorage.clear(); } catch (e) {
-        console.error('[MessengerX] Logout localStorage clear failed:', e);
+        try { sessionStorage.setItem('__mx_appearance', 'system'); } catch (e) {
+            console.error('[MessengerX] Logout appearance reset failed:', e);
+        }
+        window.location.href = 'https://www.messenger.com';
     }
-    try { sessionStorage.clear(); } catch (e) {
-        console.error('[MessengerX] Logout sessionStorage clear failed:', e);
-    }
-    try { sessionStorage.setItem('__mx_appearance', 'system'); } catch (e) {
-        console.error('[MessengerX] Logout appearance reset failed:', e);
-    }
-    window.location.href = 'https://www.messenger.com';
-}
+})();
 "#;
 
 // ---------------------------------------------------------------------------
@@ -5538,6 +5540,56 @@ mod tests {
             assert!(
                 LOGOUT_CLEAR_SCRIPT.contains("hostParts.length > 1"),
                 "cookie loop must stop before TLD"
+            );
+        }
+
+        /// The script must be wrapped in an IIFE so that `var` bindings
+        /// do not leak onto the global `window` object.
+        #[test]
+        fn wrapped_in_iife() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.trim_start().starts_with("(function()"),
+                "logout script must be wrapped in an IIFE"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.trim_end().ends_with(")();"),
+                "logout script IIFE must end with )();"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Logout handler regression tests — assert both platforms keep
+    // snapshot clearing + script evaluation in sync.
+    // -----------------------------------------------------------------------
+    mod logout_handlers {
+        const SOURCE: &str = include_str!("lib.rs");
+
+        /// The tray (Windows/Linux) logout handler must call
+        /// `services::cache::clear_snapshots` and evaluate `LOGOUT_CLEAR_SCRIPT`.
+        #[test]
+        fn tray_logout_clears_snapshots_and_evals_script() {
+            assert!(
+                SOURCE.contains("services::cache::clear_snapshots(handle)"),
+                "tray logout must clear snapshots"
+            );
+            assert!(
+                SOURCE.contains("let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);"),
+                "tray logout must eval LOGOUT_CLEAR_SCRIPT"
+            );
+        }
+
+        /// The macOS menu logout handler must call
+        /// `services::cache::clear_snapshots(&h)` and evaluate `LOGOUT_CLEAR_SCRIPT`.
+        #[test]
+        fn macos_logout_clears_snapshots_and_evals_script() {
+            assert!(
+                SOURCE.contains("services::cache::clear_snapshots(&h)"),
+                "macOS logout must clear snapshots"
+            );
+            assert!(
+                SOURCE.contains("let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);"),
+                "macOS logout must eval LOGOUT_CLEAR_SCRIPT"
             );
         }
     }
