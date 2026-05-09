@@ -2983,6 +2983,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(&proxy_args);
 
+    // Pre-clone the app handle for the download-completion notification.
+    // `nav_app_handle` is moved into the `on_navigation` closure below.
+    let dl_app_handle = nav_app_handle.clone();
+
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
         .user_agent(
@@ -3465,6 +3469,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let download_dest: std::sync::Arc<
                 std::sync::Mutex<Option<std::path::PathBuf>>,
             > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            // Store filename separately for the notification.
+            let download_name: std::sync::Arc<
+                std::sync::Mutex<Option<String>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let notify_handle = dl_app_handle.clone();
             move |_webview, event| {
                 match event {
                     tauri::webview::DownloadEvent::Requested { url, destination } => {
@@ -3491,13 +3500,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(mut guard) = download_dest.lock() {
                             *guard = Some(save_path);
                         }
+                        if let Ok(mut guard) = download_name.lock() {
+                            *guard = Some(filename);
+                        }
                         true
                     }
                     tauri::webview::DownloadEvent::Finished { url, path, success } => {
-                        // On macOS `path` is always None (WKWebView API limit).
-                        // Fall back to the destination stored from the Requested event.
                         let stored = download_dest.lock().ok().and_then(|g| g.clone());
                         let effective_path = path.or(stored);
+                        let filename = download_name
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.clone())
+                            .unwrap_or_else(|| "download".to_string());
 
                         log::info!(
                             "[MessengerX][Download] Finished url={url} \
@@ -3505,8 +3520,18 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         );
 
                         if success {
+                            // Notify the user across all platforms.
+                            let body = format!("{filename} → Downloads");
+                            let _ = crate::services::notification::show_notification(
+                                &notify_handle,
+                                "Messenger X",
+                                &body,
+                                "download",
+                                false, // play sound
+                                "download-finished",
+                            );
+
                             if let Some(ref p) = effective_path {
-                                // Reveal the file in the OS file manager.
                                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                                 let p_str = p.to_string_lossy().to_string();
                                 #[cfg(target_os = "linux")]
