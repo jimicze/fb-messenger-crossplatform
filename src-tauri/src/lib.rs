@@ -2219,6 +2219,38 @@ const SNAPSHOT_TRIGGER_SCRIPT: &str = r#"
 })();
 "#;
 
+/// JavaScript snippet injected via `eval()` during logout.  Clears all
+/// accessible cookies (with proper subdomain handling), localStorage,
+/// sessionStorage, then navigates to `https://www.messenger.com`.
+///
+/// * Cookie names are trimmed after splitting on `;`.
+/// * Empty cookie names are skipped (guards against `document.cookie === ''`).
+/// * Cookie expiry uses RFC1123 GMT format for cross-WebView compatibility.
+/// * The `while` loop stops before the TLD (`hostParts.length > 1`).
+/// * Any storage error is caught so the redirect always runs in `finally`.
+const LOGOUT_CLEAR_SCRIPT: &str = r#"
+try {
+    document.cookie.split(';').forEach(function(c) {
+        var eq = c.indexOf('=');
+        var name = (eq > -1 ? c.substring(0, eq) : c).trim();
+        if (!name) return;
+        var hostParts = window.location.hostname.split('.');
+        while (hostParts.length > 1) {
+            var domain = hostParts.join('.');
+            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=' + domain;
+            document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.' + domain;
+            hostParts.shift();
+        }
+        document.cookie = name + '=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
+    });
+} catch (e) {} finally {
+    try { localStorage.clear(); } catch (e) {}
+    try { sessionStorage.clear(); } catch (e) {}
+    try { sessionStorage.setItem('__mx_appearance', 'system'); } catch (e) {}
+    window.location.href = 'https://www.messenger.com';
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -4404,7 +4436,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
                     // ---- Log out & clear data ----
                     "logout" => {
-                        let _ = services::cache::clear_snapshots(handle);
+                        if let Err(e) = services::cache::clear_snapshots(handle) {
+                            log::warn!("[MessengerX] Failed to clear snapshots during logout: {e}");
+                        }
                         let defaults = crate::commands::AppSettings::default();
                         let _ = services::auth::save_settings(handle, &defaults);
 
@@ -4443,27 +4477,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         // before navigating to messenger.com so Facebook's login
                         // session is actually dropped.
                         if let Some(wv) = handle.get_webview_window("main") {
-                            let _ = wv.eval(
-                                "try{\
-                                 document.cookie.split(';').forEach(function(c){\
-                                  var eq=c.indexOf('=');\
-                                  var name=(eq>-1?c.substring(0,eq):c).trim();\
-                                  var hostParts=window.location.hostname.split('.');\
-                                  while(hostParts.length>1){\
-                                   var domain=hostParts.join('.');\
-                                   document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain='+domain;\
-                                   document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain=.'+domain;\
-                                   hostParts.shift();\
-                                  }\
-                                  document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/';\
-                                 });\
-                                 }catch(e){}finally{\
-                                 try{localStorage.clear();}catch(e){}\
-                                 try{sessionStorage.clear();}catch(e){}\
-                                 try{sessionStorage.setItem('__mx_appearance','system');}catch(e){}\
-                                 window.location.href='https://www.messenger.com';\
-                                 }",
-                            );
+                            let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);
                             let _ = wv.show();
                             let _ = wv.set_focus();
                         }
@@ -4913,7 +4927,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
                 // ---- Log out & clear data ----
                 "logout" => {
-                    let _ = services::cache::clear_snapshots(&h);
+                    if let Err(e) = services::cache::clear_snapshots(&h) {
+                        log::warn!("[MessengerX] Failed to clear snapshots during logout: {e}");
+                    }
                     let defaults = commands::AppSettings::default();
                     let _ = services::auth::save_settings(&h, &defaults);
 
@@ -4950,27 +4966,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // Clear WebView cookies / localStorage / sessionStorage
                     // before navigating to messenger.com.
                     if let Some(wv) = h.get_webview_window("main") {
-                        let _ = wv.eval(
-                            "try{\
-                             document.cookie.split(';').forEach(function(c){\
-                              var eq=c.indexOf('=');\
-                              var name=(eq>-1?c.substring(0,eq):c).trim();\
-                              var hostParts=window.location.hostname.split('.');\
-                              while(hostParts.length>1){\
-                               var domain=hostParts.join('.');\
-                               document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain='+domain;\
-                               document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/;domain=.'+domain;\
-                               hostParts.shift();\
-                              }\
-                              document.cookie=name+'=;expires=Thu,01 Jan 1970 00:00:00 UTC;path=/';\
-                             });\
-                             }catch(e){}finally{\
-                             try{localStorage.clear();}catch(e){}\
-                             try{sessionStorage.clear();}catch(e){}\
-                             try{sessionStorage.setItem('__mx_appearance','system');}catch(e){}\
-                             window.location.href='https://www.messenger.com';\
-                             }",
-                        );
+                        let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);
                         let _ = wv.show();
                         let _ = wv.set_focus();
                     }
@@ -5395,6 +5391,88 @@ mod tests {
             assert!(
                 VISIBILITY_OVERRIDE_SCRIPT.contains("get_window_focused"),
                 "script must invoke get_window_focused to resync state on each navigation"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Logout script regression tests
+    // -----------------------------------------------------------------------
+    mod logout_script {
+        use super::super::LOGOUT_CLEAR_SCRIPT;
+
+        /// The script must attempt to clear cookies (the core privacy action).
+        #[test]
+        fn clears_cookies() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("document.cookie"),
+                "logout script must touch document.cookie"
+            );
+        }
+
+        /// The script must clear localStorage and sessionStorage.
+        #[test]
+        fn clears_storage() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("localStorage.clear()"),
+                "logout script must clear localStorage"
+            );
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("sessionStorage.clear()"),
+                "logout script must clear sessionStorage"
+            );
+        }
+
+        /// The script must reset the appearance override key in sessionStorage
+        /// so the next login page shows the correct theme.
+        #[test]
+        fn resets_appearance_key() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("__mx_appearance"),
+                "logout script must reset __mx_appearance"
+            );
+        }
+
+        /// The script must navigate to messenger.com after clearing.
+        #[test]
+        fn navigates_to_messenger() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("https://www.messenger.com"),
+                "logout script must redirect to messenger.com"
+            );
+        }
+
+        /// Cookie expiry must use the RFC1123 GMT format (not UTC) for
+        /// cross-WebView compatibility.
+        #[test]
+        fn cookie_expiry_uses_gmt() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("00:00:00 GMT"),
+                "cookie expiry must use GMT format"
+            );
+            assert!(
+                !LOGOUT_CLEAR_SCRIPT.contains("00:00:00 UTC"),
+                "cookie expiry must not use UTC format"
+            );
+        }
+
+        /// The cookie loop must guard against empty cookie names so that
+        /// `document.cookie === ''` does not generate invalid assignments.
+        #[test]
+        fn skips_empty_cookie_names() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("if (!name) return"),
+                "logout script must skip empty cookie names"
+            );
+        }
+
+        /// The cookie-domain loop must stop before the TLD to avoid
+        /// assigning cookies to e.g. `domain=com`.
+        #[test]
+        fn stops_before_tld() {
+            assert!(
+                LOGOUT_CLEAR_SCRIPT.contains("hostParts.length > 1"),
+                "cookie loop must stop before TLD"
             );
         }
     }
