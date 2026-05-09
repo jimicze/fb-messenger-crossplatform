@@ -1613,6 +1613,11 @@ fn build_appearance_script(mode: &str) -> String {
 
 /// Returns `true` when a persisted startup URL points to a concrete Messenger
 /// thread that is safe to restore on next app launch.
+///
+/// E2EE thread URLs (`/e2ee/t/...`) are deliberately excluded — WKWebView
+/// processes e2ee threads asynchronously and emits a blank title during
+/// initial load, which the crash detector misinterprets as a WebKitWebProcess
+/// crash → endless reload loop.
 fn is_safe_messenger_startup_url(value: &str) -> bool {
     let Ok(parsed) = url::Url::parse(value) else {
         return false;
@@ -1627,7 +1632,7 @@ fn is_safe_messenger_startup_url(value: &str) -> bool {
     }
 
     let path = parsed.path();
-    path.starts_with("/t/") || path.starts_with("/e2ee/t/")
+    path.starts_with("/t/")
 }
 
 /// Overrides `window.open()` to intercept external links that Messenger opens
@@ -2978,11 +2983,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     let builder = builder.additional_browser_args(&proxy_args);
 
-    // Pre-clone the app handle for the on_download closure.  `nav_app_handle`
-    // is moved into the `on_navigation` closure below, so we must create the
-    // download clone before the builder chain consumes it.
-    let dl_app_handle = nav_app_handle.clone();
-
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
         .user_agent(
@@ -3405,20 +3405,27 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if host == "www.messenger.com"
                     && (url.path().starts_with("/t/") || url.path().starts_with("/e2ee/t/"))
                 {
-                    let handle = nav_app_handle.clone();
-                    let url_str = url.to_string();
-                    std::thread::spawn(move || {
-                        let mut s = services::auth::load_settings(&handle).unwrap_or_default();
-                        if s.last_messenger_url.as_deref() == Some(url_str.as_str()) {
-                            return;
-                        }
-                        s.last_messenger_url = Some(url_str.clone());
-                        if let Err(e) = services::auth::save_settings(&handle, &s) {
-                            log::warn!("[MessengerX][Boot] Failed to persist last URL: {e}");
-                        } else {
-                            log::info!("[MessengerX][Boot] persisted last URL: {url_str}");
-                        }
-                    });
+                    // Skip e2ee thread URLs for persistence — on restart they
+                    // cause empty-title → crash-detect → reload loops because
+                    // WKWebView processes e2ee threads asynchronously and emits
+                    // a blank title during initial load, which the crash detector
+                    // misinterprets as a WebKitWebProcess crash.
+                    if !url.path().starts_with("/e2ee/") {
+                        let handle = nav_app_handle.clone();
+                        let url_str = url.to_string();
+                        std::thread::spawn(move || {
+                            let mut s = services::auth::load_settings(&handle).unwrap_or_default();
+                            if s.last_messenger_url.as_deref() == Some(url_str.as_str()) {
+                                return;
+                            }
+                            s.last_messenger_url = Some(url_str.clone());
+                            if let Err(e) = services::auth::save_settings(&handle, &s) {
+                                log::warn!("[MessengerX][Boot] Failed to persist last URL: {e}");
+                            } else {
+                                log::info!("[MessengerX][Boot] persisted last URL: {url_str}");
+                            }
+                        });
+                    }
                 }
 
                 // Phase M trace: explicit accept verdict so the count of
@@ -3432,18 +3439,23 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         // ------------------------------------------------------------------
-        // Issue #27 Fix A: Download handler with "Save As" dialog.
+        // Issue #27 Fix A: Download handler with reveal-on-finish.
         //
         // Without this handler WKWebView/WebKitGTK/WebView2 silently save
         // files to a platform default directory with no UI.  We intercept
         // every download:
-        //   • Requested — show a native "Save As" dialog so the user can
-        //     choose the destination; cancel aborts the download.
+        //   • Requested — set destination to the system Downloads directory
+        //     so the file goes to a predictable, user-accessible location.
         //   • Finished  — reveal the saved file in the OS file manager
         //     (Finder / Explorer / Files).
         //
-        // `on_download` runs on a background thread so `blocking_save_file()`
-        // is safe to call without deadlocking the main UI thread.
+        // IMPORTANT: on macOS, `on_download` runs on the MAIN THREAD
+        // (WKWebView's download delegate callbacks are dispatched on the
+        // main dispatch queue).  Calling `blocking_save_file()` here would
+        // create a nested NSSavePanel modal nested run loop while WKWebView
+        // waits synchronously for the completion handler → deadlock / freeze.
+        // We deliberately do NOT show a "Save As" dialog — the file is saved
+        // to ~/Downloads and the user can move it from there.
         //
         // macOS note: `DownloadEvent::Finished.path` is always `None` due to
         // WKWebView API constraints.  We store the destination set in the
@@ -3464,49 +3476,22 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or("download")
                             .to_string();
 
+                        // Resolve the user's Downloads directory.
+                        let downloads = dirs::download_dir().unwrap_or_else(|| {
+                            std::env::temp_dir()
+                        });
+                        let save_path = downloads.join(&filename);
+
                         log::info!(
                             "[MessengerX][Download] Requested url={url} \
-                             suggested_name={filename:?}"
+                             filename={filename:?} path={save_path:?}"
                         );
 
-                        // Show a "Save As" dialog.  The closure runs on a
-                        // background thread so blocking here is safe.
-                        use tauri_plugin_dialog::DialogExt;
-                        let chosen = dl_app_handle
-                            .dialog()
-                            .file()
-                            .set_file_name(&filename)
-                            .blocking_save_file();
-
-                        match chosen {
-                            Some(file_path) => {
-                                match file_path.into_path() {
-                                    Ok(path_buf) => {
-                                        log::info!(
-                                            "[MessengerX][Download] Saving to {path_buf:?}"
-                                        );
-                                        *destination = path_buf.clone();
-                                        if let Ok(mut guard) = download_dest.lock() {
-                                            *guard = Some(path_buf);
-                                        }
-                                        true // allow download
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "[MessengerX][Download] Could not resolve \
-                                             save path: {e}"
-                                        );
-                                        false
-                                    }
-                                }
-                            }
-                            None => {
-                                log::info!(
-                                    "[MessengerX][Download] User cancelled save dialog"
-                                );
-                                false // abort download
-                            }
+                        *destination = save_path.clone();
+                        if let Ok(mut guard) = download_dest.lock() {
+                            *guard = Some(save_path);
                         }
+                        true
                     }
                     tauri::webview::DownloadEvent::Finished { url, path, success } => {
                         // On macOS `path` is always None (WKWebView API limit).
