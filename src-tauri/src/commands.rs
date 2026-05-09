@@ -431,7 +431,16 @@ fn decide_notification(
                 }
             } else {
                 let count_increased = count > prev_count;
-                let sig_changed = !activity_sig.is_empty() && activity_sig != prev_sig;
+                // sig_changed requires BOTH the current and previous sig to be
+                // non-empty.  When prev_sig is "" (stored during a typing-indicator
+                // transition), the return of any real signature would otherwise
+                // register as "changed" → duplicate notification for the same
+                // message.  This was especially visible for group chats where the
+                // title oscillates between "(N) Sender | Messenger" (open tab)
+                // and "Sender píše skupině GroupName" (typing indicator).
+                let sig_changed = !activity_sig.is_empty()
+                    && !prev_sig.is_empty()
+                    && activity_sig != prev_sig;
                 let elapsed = now.saturating_sub(prev_fired_at_secs);
                 // Same floor as the Notified arm: sig-only fires are rate-limited.
                 let sig_under_floor =
