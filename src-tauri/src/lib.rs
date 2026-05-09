@@ -3450,116 +3450,112 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // every download:
         //   • Requested — set destination to the system Downloads directory
         //     so the file goes to a predictable, user-accessible location.
-        //   • Finished  — reveal the saved file in the OS file manager
-        //     (Finder / Explorer / Files).
+        //     Add a numeric suffix if the path already exists (avoids
+        //     NSURLErrorDomain -3000 on repeated downloads of the same file).
+        //   • Finished  — send a silent system notification with the saved
+        //     filename so the user knows the download completed.
         //
-        // IMPORTANT: on macOS, `on_download` runs on the MAIN THREAD
-        // (WKWebView's download delegate callbacks are dispatched on the
-        // main dispatch queue).  Calling `blocking_save_file()` here would
-        // create a nested NSSavePanel modal nested run loop while WKWebView
-        // waits synchronously for the completion handler → deadlock / freeze.
-        // We deliberately do NOT show a "Save As" dialog — the file is saved
-        // to ~/Downloads and the user can move it from there.
+        // IMPORTANT: on macOS, `on_download` runs on the MAIN THREAD.
+        // DO NOT call `blocking_save_file()` here — it deadlocks WKWebView's
+        // download completion handler (nested NSSavePanel modal run loop).
         //
         // macOS note: `DownloadEvent::Finished.path` is always `None` due to
-        // WKWebView API constraints.  We store the destination set in the
-        // Requested handler inside an `Arc<Mutex>` and use it in Finished.
+        // WKWebView API constraints.  We store the final path in `Arc<Mutex>`
+        // from the Requested handler and use it in Finished.
         // ------------------------------------------------------------------
         .on_download({
             let download_dest: std::sync::Arc<
                 std::sync::Mutex<Option<std::path::PathBuf>>,
             > = std::sync::Arc::new(std::sync::Mutex::new(None));
-            // Store filename separately for the notification.
-            let download_name: std::sync::Arc<
-                std::sync::Mutex<Option<String>>,
-            > = std::sync::Arc::new(std::sync::Mutex::new(None));
             let notify_handle = dl_app_handle.clone();
             move |_webview, event| {
                 match event {
                     tauri::webview::DownloadEvent::Requested { url, destination } => {
-                        // Derive a suggested filename from the URL path.
-                        let filename = url
+                        // WRY pre-fills `destination` with the HTTP
+                        // Content-Disposition `suggestedFilename` (macOS) or
+                        // a path derived from the URL (Windows/Linux).
+                        // Extract the filename stem from it; fall back to
+                        // deriving from the URL path if the destination is
+                        // empty or has no meaningful filename.
+                        let fallback_name = url
                             .path_segments()
                             .and_then(|mut seg| seg.next_back())
                             .filter(|s| !s.is_empty())
                             .unwrap_or("download")
                             .to_string();
 
-                        // Resolve the user's Downloads directory.
+                        let base_name = destination
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .filter(|n| !n.is_empty() && *n != "download")
+                            .unwrap_or(&fallback_name)
+                            .to_string();
+
                         let downloads = dirs::download_dir().unwrap_or_else(|| {
                             std::env::temp_dir()
                         });
-                        let save_path = downloads.join(&filename);
+
+                        // Append a numeric suffix if the file already exists
+                        // (e.g. "photo.jpg" → "photo (2).jpg").
+                        let save_path = {
+                            let mut candidate = downloads.join(&base_name);
+                            if candidate.exists() {
+                                let (stem, ext) = base_name
+                                    .rfind('.')
+                                    .map(|i| {
+                                        (&base_name[..i], &base_name[i..])
+                                    })
+                                    .unwrap_or((base_name.as_str(), ""));
+                                let mut n: u32 = 2;
+                                loop {
+                                    candidate = downloads.join(format!(
+                                        "{stem} ({n}){ext}"
+                                    ));
+                                    if !candidate.exists() {
+                                        break;
+                                    }
+                                    n = n.saturating_add(1);
+                                }
+                            }
+                            candidate
+                        };
 
                         log::info!(
                             "[MessengerX][Download] Requested url={url} \
-                             filename={filename:?} path={save_path:?}"
+                             base={base_name:?} path={save_path:?}"
                         );
 
                         *destination = save_path.clone();
                         if let Ok(mut guard) = download_dest.lock() {
                             *guard = Some(save_path);
                         }
-                        if let Ok(mut guard) = download_name.lock() {
-                            *guard = Some(filename);
-                        }
                         true
                     }
                     tauri::webview::DownloadEvent::Finished { url, path, success } => {
                         let stored = download_dest.lock().ok().and_then(|g| g.clone());
                         let effective_path = path.or(stored);
-                        let filename = download_name
-                            .lock()
-                            .ok()
-                            .and_then(|g| g.clone())
-                            .unwrap_or_else(|| "download".to_string());
+                        let filename = effective_path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("download");
 
                         log::info!(
                             "[MessengerX][Download] Finished url={url} \
-                             path={effective_path:?} success={success}"
+                             file={filename} success={success}"
                         );
 
                         if success {
-                            // Notify the user across all platforms.
-                            let body = format!("{filename} → Downloads");
+                            let body =
+                                format!("Saved to Downloads — {filename}");
                             let _ = crate::services::notification::show_notification(
                                 &notify_handle,
                                 "Messenger X",
                                 &body,
                                 "download",
-                                false, // play sound
+                                true, // silent — no sound for file downloads
                                 "download-finished",
                             );
-
-                            if let Some(ref p) = effective_path {
-                                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                                let p_str = p.to_string_lossy().to_string();
-                                #[cfg(target_os = "linux")]
-                                let parent_str = p
-                                    .parent()
-                                    .map(|d| d.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| ".".to_string());
-
-                                #[cfg(target_os = "macos")]
-                                std::thread::spawn(move || {
-                                    let _ = std::process::Command::new("open")
-                                        .arg("-R")
-                                        .arg(&p_str)
-                                        .status();
-                                });
-                                #[cfg(target_os = "windows")]
-                                std::thread::spawn(move || {
-                                    let _ = std::process::Command::new("explorer")
-                                        .arg(format!("/select,{p_str}"))
-                                        .status();
-                                });
-                                #[cfg(target_os = "linux")]
-                                std::thread::spawn(move || {
-                                    let _ = std::process::Command::new("xdg-open")
-                                        .arg(&parent_str)
-                                        .status();
-                                });
-                            }
                         }
                         true
                     }
