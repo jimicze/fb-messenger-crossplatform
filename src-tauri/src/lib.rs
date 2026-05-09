@@ -5253,6 +5253,28 @@ mod tests {
         }
     }
 
+    mod logout_handlers {
+        const SOURCE: &str = include_str!("lib.rs");
+
+        #[test]
+        fn both_logout_handlers_clear_snapshots() {
+            assert!(
+                SOURCE.contains("services::cache::clear_snapshots(handle)")
+                    && SOURCE.contains("services::cache::clear_snapshots(&h)"),
+                "both tray and macOS logout handlers must clear snapshots"
+            );
+        }
+
+        #[test]
+        fn both_logout_handlers_use_shared_logout_script() {
+            assert_eq!(
+                SOURCE.matches("wv.eval(LOGOUT_CLEAR_SCRIPT)").count(),
+                2,
+                "both tray and macOS logout handlers must eval LOGOUT_CLEAR_SCRIPT"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     mod linux_runtime {
         use super::super::{configure_linux_runtime_env, LINUX_APPIMAGE_ENV_OVERRIDES};
