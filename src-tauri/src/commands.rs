@@ -288,7 +288,7 @@ fn decide_notification(
             count: prev_count,
             sig: prev_sig,
             fired_at_secs,
-            typing_rearm_exhausted,
+            typing_rearm_exhausted: prev_exhausted,
         } => {
             if count == 0 {
                 // If the window is focused the user is actively looking at the
@@ -314,7 +314,7 @@ fn decide_notification(
                     prev_fired_at_secs: fired_at_secs,
                     zero_since_secs: now,
                     zero_from_typing: is_typing_indicator,
-                    prev_typing_rearm_exhausted: typing_rearm_exhausted,
+                    prev_typing_rearm_exhausted: prev_exhausted,
                 };
                 NotificationDecision {
                     should_fire: false,
@@ -355,11 +355,21 @@ fn decide_notification(
                     "same-activity-suppressed"
                 };
                 if should_fire {
+                    // Preserve the typing_rearm_exhausted flag when the
+                    // fire reason is sig-changed-only (oscillation), not a
+                    // count increase.  Only a genuine count_increased or
+                    // time_rearm resets it to false.  This breaks the
+                    // sig_changed → typing_rearm → sig_changed infinite loop.
+                    let new_exhausted = if count_increased || time_rearm {
+                        false // true new message or fresh cycle
+                    } else {
+                        prev_exhausted // sig-only fire — carry forward
+                    };
                     *state = NotifState::Notified {
                         count,
                         sig: activity_sig.to_owned(),
                         fired_at_secs: now,
-                        typing_rearm_exhausted: false,
+                        typing_rearm_exhausted: new_exhausted,
                     };
                 }
                 NotificationDecision {
@@ -989,6 +999,124 @@ pub fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+// ── Download save-as commands ──────────────────────────────────────────
+
+/// Opens a native "Save As" file dialog and returns the chosen path.
+/// Called from JS as the first step of a user-initiated file download.
+/// The dialog is async — it does NOT block the main thread (unlike
+/// `blocking_save_file()` which would deadlock inside `on_download`).
+#[tauri::command]
+pub async fn pick_save_path(
+    app: tauri::AppHandle,
+    suggested_filename: String,
+) -> Result<Option<String>, String> {
+    use std::sync::mpsc;
+    use tauri_plugin_dialog::DialogExt;
+
+    // Pre-increment the suggested name so the dialog itself shows
+    // "download (2)", "download (3)", etc. when files already exist
+    // in the Downloads folder (the default save location).
+    let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let display_name = {
+        let candidate = downloads.join(&suggested_filename);
+        if !candidate.exists() {
+            suggested_filename.clone()
+        } else {
+            let (stem, ext) = suggested_filename
+                .rfind('.')
+                .map(|i| (&suggested_filename[..i], &suggested_filename[i..]))
+                .unwrap_or((suggested_filename.as_str(), ""));
+            let mut n: u32 = 2;
+            loop {
+                let name = format!("{stem} ({n}){ext}");
+                if !downloads.join(&name).exists() {
+                    break name;
+                }
+                n = n.saturating_add(1);
+            }
+        }
+    };
+
+    let (tx, rx) = mpsc::channel();
+
+    app.dialog()
+        .file()
+        .set_file_name(&display_name)
+        .save_file(move |file_path| {
+            let result = file_path
+                .and_then(|fp| fp.into_path().ok())
+                .map(|p| p.to_string_lossy().to_string());
+            let _ = tx.send(result);
+        });
+
+    rx.recv()
+        .map_err(|e| format!("Save dialog error: {e}"))
+        .map(|opt| {
+            opt.map(|path_str| {
+                let p = std::path::PathBuf::from(&path_str);
+                if !p.exists() {
+                    return path_str;
+                }
+                // File already exists — auto-increment the name (fallback).
+                let dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let base = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("download");
+                let (stem, ext) = base
+                    .rfind('.')
+                    .map(|i| (&base[..i], &base[i..]))
+                    .unwrap_or((base, ""));
+                let mut n: u32 = 2;
+                loop {
+                    let candidate = dir.join(format!("{stem} ({n}){ext}"));
+                    if !candidate.exists() {
+                        return candidate.to_string_lossy().to_string();
+                    }
+                    n = n.saturating_add(1);
+                }
+            })
+        })
+}
+
+/// Writes binary data to the given filesystem path and sends a system
+/// notification about the completed download.
+///
+/// Called from JS after the user has chosen a save path and the blob data
+/// has been fetched via `fetch(blobUrl) → arrayBuffer()`.
+#[tauri::command]
+pub fn write_file_bytes(
+    path: String,
+    data: Vec<u8>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    std::fs::write(&path, &data).map_err(|e| format!("File write failed: {e}"))?;
+
+    // Extract filename for the notification.
+    let filename = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+
+    let body = format!("Saved — {filename}");
+    // Spawn on background thread — in dev mode show_notification spawns
+    // the debug .app bundle subprocess (~4 s), which would beachball.
+    let h = app.clone();
+    std::thread::spawn(move || {
+        let _ = crate::services::notification::show_notification(
+            &h,
+            "Messenger X",
+            &body,
+            "download",
+            true,
+            "download-save-as",
+        );
+    });
+
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
