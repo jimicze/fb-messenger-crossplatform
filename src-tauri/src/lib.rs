@@ -5255,28 +5255,6 @@ mod tests {
         }
     }
 
-    mod logout_handlers {
-        const SOURCE: &str = include_str!("lib.rs");
-
-        #[test]
-        fn both_logout_handlers_clear_snapshots() {
-            assert!(
-                SOURCE.contains("services::cache::clear_snapshots(handle)")
-                    && SOURCE.contains("services::cache::clear_snapshots(&h)"),
-                "both tray and macOS logout handlers must clear snapshots"
-            );
-        }
-
-        #[test]
-        fn both_logout_handlers_use_shared_logout_script() {
-            assert_eq!(
-                SOURCE.matches("wv.eval(LOGOUT_CLEAR_SCRIPT)").count(),
-                2,
-                "both tray and macOS logout handlers must eval LOGOUT_CLEAR_SCRIPT"
-            );
-        }
-    }
-
     #[cfg(target_os = "linux")]
     mod linux_runtime {
         use super::super::{configure_linux_runtime_env, LINUX_APPIMAGE_ENV_OVERRIDES};
@@ -5565,28 +5543,32 @@ mod tests {
     mod logout_handlers {
         const SOURCE: &str = include_str!("lib.rs");
 
-        /// The tray (Windows/Linux) logout handler must call
-        /// `services::cache::clear_snapshots` and evaluate `LOGOUT_CLEAR_SCRIPT`.
+        /// Both logout handlers must call `services::cache::clear_snapshots`.
         #[test]
-        fn tray_logout_clears_snapshots_and_evals_script() {
+        fn both_logout_handlers_clear_snapshots() {
             assert!(
                 SOURCE.contains("services::cache::clear_snapshots(handle)"),
                 "tray logout must clear snapshots"
             );
+            assert!(
+                SOURCE.contains("services::cache::clear_snapshots(&h)"),
+                "macOS logout must clear snapshots"
+            );
+        }
+
+        /// The tray (Windows/Linux) logout handler must evaluate
+        /// `LOGOUT_CLEAR_SCRIPT`.
+        #[test]
+        fn tray_logout_evals_script() {
             assert!(
                 SOURCE.contains("let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);"),
                 "tray logout must eval LOGOUT_CLEAR_SCRIPT"
             );
         }
 
-        /// The macOS menu logout handler must call
-        /// `services::cache::clear_snapshots(&h)` and evaluate `LOGOUT_CLEAR_SCRIPT`.
+        /// The macOS menu logout handler must evaluate `LOGOUT_CLEAR_SCRIPT`.
         #[test]
-        fn macos_logout_clears_snapshots_and_evals_script() {
-            assert!(
-                SOURCE.contains("services::cache::clear_snapshots(&h)"),
-                "macOS logout must clear snapshots"
-            );
+        fn macos_logout_evals_script() {
             assert!(
                 SOURCE.contains("let _ = wv.eval(LOGOUT_CLEAR_SCRIPT);"),
                 "macOS logout must eval LOGOUT_CLEAR_SCRIPT"
