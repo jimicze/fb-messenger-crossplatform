@@ -1743,6 +1743,15 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
         try { urlStr = new URL(href, window.location.href).toString(); } catch(_) { return; }
         jlog('click interceptor: href=' + urlStr);
 
+        // ── Blob URL → Save-As dialog ─────────────────────────────
+        if (urlStr.startsWith('blob:')) {
+            e.preventDefault();
+            e.stopPropagation();
+            var suggestedName = el.getAttribute('download') || 'download';
+            downloadSaveAs(urlStr, suggestedName);
+            return;
+        }
+
         if (!urlStr.startsWith('http://') && !urlStr.startsWith('https://')) return;
         if (isAllowedUrl(urlStr)) return; // allowed — let Tauri handle it
 
@@ -1750,6 +1759,40 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
         e.stopPropagation();
         openExternal(urlStr);
     }, true /* capture phase */);
+
+    // -----------------------------------------------------------------------
+    // 2.5 Download Save-As — blob URL → native Save As dialog
+    // -----------------------------------------------------------------------
+    async function downloadSaveAs(blobUrl, suggestedFilename) {
+        try {
+            // 1. Show native "Save As" dialog (async, non-blocking).
+            var path = await window.__TAURI__.core.invoke('pick_save_path', {
+                suggestedFilename: suggestedFilename
+            });
+            if (!path) {
+                jlog('download save-as: user cancelled');
+                return;
+            }
+
+            // 2. Fetch the blob data from the in-memory Blob store.
+            jlog('download save-as: fetching ' + blobUrl);
+            var response = await fetch(blobUrl);
+
+            // 3. Convert the response to a byte array and write to disk.
+            var buffer = await response.arrayBuffer();
+            var data = Array.from(new Uint8Array(buffer));
+
+            jlog('download save-as: writing ' + data.length + ' bytes to ' + path);
+            await window.__TAURI__.core.invoke('write_file_bytes', {
+                path: path,
+                data: data
+            });
+
+            jlog('download save-as: done → ' + path);
+        } catch(e) {
+            jlog('download save-as error: ' + (e.message || e));
+        }
+    }
 
     jlog('window.open override + click interceptor installed');
 })();
@@ -2720,6 +2763,8 @@ pub fn run() {
             commands::is_autostart_enabled,
             commands::js_log,
             commands::get_window_focused,
+            commands::pick_save_path,
+            commands::write_file_bytes,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

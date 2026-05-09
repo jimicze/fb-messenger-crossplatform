@@ -989,6 +989,73 @@ pub fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+// ── Download save-as commands ──────────────────────────────────────────
+
+/// Opens a native "Save As" file dialog and returns the chosen path.
+/// Called from JS as the first step of a user-initiated file download.
+/// The dialog is async — it does NOT block the main thread (unlike
+/// `blocking_save_file()` which would deadlock inside `on_download`).
+#[tauri::command]
+pub async fn pick_save_path(
+    app: tauri::AppHandle,
+    suggested_filename: String,
+) -> Result<Option<String>, String> {
+    use std::sync::mpsc;
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = mpsc::channel();
+
+    app.dialog()
+        .file()
+        .set_file_name(&suggested_filename)
+        .save_file(move |file_path| {
+            let result = file_path
+                .and_then(|fp| fp.into_path().ok())
+                .map(|p| p.to_string_lossy().to_string());
+            let _ = tx.send(result);
+        });
+
+    rx.recv().map_err(|e| format!("Save dialog error: {e}"))
+}
+
+/// Writes binary data to the given filesystem path and sends a system
+/// notification about the completed download.
+///
+/// Called from JS after the user has chosen a save path and the blob data
+/// has been fetched via `fetch(blobUrl) → arrayBuffer()`.
+#[tauri::command]
+pub fn write_file_bytes(
+    path: String,
+    data: Vec<u8>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    std::fs::write(&path, &data).map_err(|e| format!("File write failed: {e}"))?;
+
+    // Extract filename for the notification.
+    let filename = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("download");
+
+    let body = format!("Saved — {filename}");
+    // Spawn on background thread — in dev mode show_notification spawns
+    // the debug .app bundle subprocess (~4 s), which would beachball.
+    let h = app.clone();
+    std::thread::spawn(move || {
+        let _ = crate::services::notification::show_notification(
+            &h,
+            "Messenger X",
+            &body,
+            "download",
+            true,
+            "download-save-as",
+        );
+    });
+
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
