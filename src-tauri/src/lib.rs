@@ -2977,6 +2977,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     let had_good_title = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Set to `true` by `on_navigation` the first time the webview commits to a
+    // `www.messenger.com` URL.  `had_good_title` must NOT be set from the
+    // `loading.html` splash page title ("Messenger X") — that would cause a
+    // false-positive CrashDetect when the page title briefly clears during the
+    // initial SPA navigation on macOS WKWebView.
+    let messenger_com_navigated =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // ------------------------------------------------------------------
     // Sender-hint cache.
     //
@@ -3149,6 +3156,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let crash_reload_count = crash_reload_count.clone();
             let pending_sender_hint = pending_sender_hint.clone();
             let post_crash_proxy_block = post_crash_proxy_block.clone();
+            let messenger_com_navigated = messenger_com_navigated.clone();
             move |webview_window, title| {
                 const SENDER_HINT_PREFIX: &str = "__MX_SENDER_V1__?";
                 if let Some(query) = title.strip_prefix(SENDER_HINT_PREFIX) {
@@ -3330,7 +3338,17 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // Guard: had_good_title is reset before each reload so that
                 // a series of back-to-back crashes doesn't bypass the count.
                 // ---------------------------------------------------------
-                if title.contains("Messenger") && !title.trim().is_empty() {
+                // Only count a title as "good" when we have already committed
+                // to a real messenger.com URL.  The loading.html splash page
+                // title ("Messenger X") also contains "Messenger", so without
+                // this guard it would arm the crash detector — causing a false-
+                // positive CrashDetect when the title briefly clears during the
+                // initial SPA navigation on macOS WKWebView.
+                if title.contains("Messenger")
+                    && !title.trim().is_empty()
+                    && messenger_com_navigated
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     had_good_title.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
@@ -3426,6 +3444,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // open everything else in the system browser.
         .on_navigation({
             let post_crash_proxy_block = post_crash_proxy_block.clone();
+            let messenger_com_navigated_nav = messenger_com_navigated.clone();
             move |url| {
                 let scheme = url.scheme();
                 // Pass through non-HTTP schemes (blob:, data:, about:, tauri:, etc.).
@@ -3446,6 +3465,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     "[MessengerX] on_navigation: host={host} url={url} t={}ms",
                     setup_started.elapsed().as_millis()
                 );
+
+                // Arm crash detection once we have committed to a real
+                // messenger.com URL.  This prevents the loading.html splash
+                // title ("Messenger X") from falsely arming `had_good_title`
+                // before the SPA has actually loaded.
+                if host == "www.messenger.com" {
+                    messenger_com_navigated_nav
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 // Post-crash fbsbx proxy block (Linux only).
                 //
