@@ -2977,11 +2977,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     let had_good_title = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    // Set to `true` by `on_navigation` the first time the webview commits to a
-    // `www.messenger.com` URL.  `had_good_title` must NOT be set from the
-    // `loading.html` splash page title ("Messenger X") — that would cause a
-    // false-positive CrashDetect when the page title briefly clears during the
-    // initial SPA navigation on macOS WKWebView.
+    // Set to `true` by `on_navigation` the first time a navigation to a
+    // `www.messenger.com` URL is allowed through the policy callback.
+    // (`on_navigation` is a policy hook that may also return `false` to
+    // cancel; it is NOT a navigation-committed signal.)
+    // `had_good_title` must NOT be set from the `loading.html` splash page
+    // title ("Messenger X") — that would cause a false-positive CrashDetect
+    // when the page title briefly clears during the initial SPA navigation on
+    // macOS WKWebView.
     let messenger_com_navigated =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // ------------------------------------------------------------------
@@ -3338,8 +3341,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // Guard: had_good_title is reset before each reload so that
                 // a series of back-to-back crashes doesn't bypass the count.
                 // ---------------------------------------------------------
-                // Only count a title as "good" when we have already committed
-                // to a real messenger.com URL.  The loading.html splash page
+                // Only count a title as "good" once a real messenger.com
+                // navigation has been allowed.  The loading.html splash page
                 // title ("Messenger X") also contains "Messenger", so without
                 // this guard it would arm the crash detector — causing a false-
                 // positive CrashDetect when the title briefly clears during the
@@ -3466,10 +3469,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     setup_started.elapsed().as_millis()
                 );
 
-                // Arm crash detection once we have committed to a real
-                // messenger.com URL.  This prevents the loading.html splash
-                // title ("Messenger X") from falsely arming `had_good_title`
-                // before the SPA has actually loaded.
+                // Arm crash detection once a www.messenger.com navigation has
+                // been allowed by the policy callback.  This prevents the
+                // loading.html splash title ("Messenger X") from falsely
+                // arming `had_good_title` before the SPA has actually loaded.
                 if host == "www.messenger.com" {
                     messenger_com_navigated_nav
                         .store(true, std::sync::atomic::Ordering::Relaxed);
