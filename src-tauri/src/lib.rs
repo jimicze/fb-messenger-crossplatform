@@ -2257,8 +2257,12 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
                 // Log only scheme+host+path; strip query string and fragment so
                 // that CDN signatures/tokens are not captured in log files that
                 // users share in bug reports.
-                var display = src;
-                try { var u = new URL(src); display = u.origin + u.pathname; } catch(_) {}
+                 var display = src;
+                 try { var u = new URL(src); display = u.origin + u.pathname; } catch(_) {
+                     // src is a relative URL or opaque string — strip query/fragment
+                     // with a regex so tokens can't leak even when URL parsing fails.
+                     display = src.replace(/[?#].*$/, '');
+                 }
                 if (display.length > 200) { display = display.slice(0, 197) + '...'; }
                 mlog('failed <' + t.tagName.toLowerCase() + '> src=' +
                      JSON.stringify(display) + ' v=' + APP_VERSION);

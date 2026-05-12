@@ -227,11 +227,32 @@ fn was_minimized_is_updated_every_poll_cycle() {
 /// for the rest of the session.
 #[test]
 fn post_crash_proxy_block_cleared_on_page_load_finished() {
+    // Use a formatting-agnostic position-based check rather than a literal
+    // newline + indentation match that rustfmt could reflow.
+    //
+    // Strategy: `rfind` gives the *last* occurrence of the variable name,
+    // which is the `.store(false …)` call-site (not the clone or the load).
+    // Then verify:
+    //   (a) `.store(false` appears within 200 bytes forward of that position.
+    //   (b) `Finished` appears within 300 bytes *before* that position —
+    //       confirming the clear lives inside the PageLoadEvent::Finished branch.
+    let token = "post_crash_proxy_block_pl";
+    let pos = SOURCE
+        .rfind(token)
+        .expect("post_crash_proxy_block_pl not found in lib.rs SOURCE");
+
+    let forward = &SOURCE[pos..SOURCE.len().min(pos + 200)];
     assert!(
-        SOURCE.contains("post_crash_proxy_block_pl\n                                 .store(false"),
+        forward.contains(".store(false"),
         "post_crash_proxy_block must be cleared (store false) in on_page_load::Finished \
          for www.messenger.com; if it is never cleared GIF/video loading is permanently \
          broken after the first crash"
+    );
+
+    let preceding = &SOURCE[pos.saturating_sub(300)..pos];
+    assert!(
+        preceding.contains("Finished"),
+        "post_crash_proxy_block clear must be inside the on_page_load::Finished branch"
     );
 }
 
