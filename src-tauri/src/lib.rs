@@ -2201,6 +2201,64 @@ const AUDIO_HOOK_SCRIPT: &str = concat!(
 "#
 );
 
+/// JavaScript snippet that captures failed media-resource loads (`<img>`,
+/// `<video>`, `<audio>`, `<source>`) at the `window` capture phase and forwards
+/// each unique failed URL to the Rust log file via `js_log`.
+///
+/// This is passive diagnostic telemetry: it fires only when a media element
+/// fails to load (network error, blocked CDN domain, etc.) and deduplicates
+/// within the same page-load so the log is not flooded on retry loops.
+///
+/// Use-case: Linux users with DNS-level ad-blockers on their router may have
+/// certain CDN domains blocked.  GIFs and videos served from different CDN
+/// endpoints for DMs vs group chats may be affected differently.  The logged
+/// URL tells us (and the user) exactly which domain is being blocked without
+/// requiring them to open browser DevTools.
+///
+/// Log prefix: `[MediaErrorJS]`.
+const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function mlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[MediaErrorJS] ' + msg });
+        } catch(_) {}
+    }
+
+    // Dedup set: only the first failure per URL per page-load is logged so
+    // that retry loops don't flood the log file.
+    var _seen = new Set();
+
+    try {
+        window.addEventListener('error', function(e) {
+            try {
+                var t = e.target;
+                if (!(t instanceof HTMLImageElement  ||
+                      t instanceof HTMLVideoElement  ||
+                      t instanceof HTMLAudioElement  ||
+                      t instanceof HTMLSourceElement)) {
+                    return;
+                }
+                var src = t.src || t.currentSrc || '(no-src)';
+                if (src.length > 200) { src = src.slice(0, 197) + '...'; }
+                if (_seen.has(src)) { return; }
+                _seen.add(src);
+                mlog('failed <' + t.tagName.toLowerCase() + '> src=' +
+                     JSON.stringify(src) + ' v=' + APP_VERSION);
+            } catch(_) {}
+        }, true /* capture phase — catches errors from same-origin frames; cross-origin iframes excluded by browser SOP */);
+        mlog('listener registered v=' + APP_VERSION);
+    } catch(e) {
+        mlog('register FAILED: ' + (e && e.message ? e.message : String(e)));
+    }
+})();
+"#
+);
+
 /// JavaScript snippet that triggers snapshot capture and forwards the HTML to
 /// Rust via `invoke('save_snapshot', …)`.  Called from the Rust snapshot timer.
 ///
@@ -2798,6 +2856,122 @@ struct SenderHintCache {
     retained: Option<(String, std::time::Instant)>,
 }
 
+/// Opens the Messenger X log file on Linux.
+///
+/// Every Linux desktop ships with a text editor registered for `text/plain`,
+/// so `xdg-open` on a `.txt` file is the primary — and usually sufficient —
+/// approach.  `.log` files often have no MIME handler registered, so a
+/// `/tmp/messengerx-log.txt` symlink is used instead of the real path.
+///
+/// All spawns strip `LD_LIBRARY_PATH`/`LD_PRELOAD` — the AppImage runtime
+/// injects these with stale paths, causing child processes to fail silently
+/// (same root cause as the `notify-send` fix in v1.4.1).
+///
+/// Strategy — first success wins:
+///   1. **`xdg-open` on `/tmp/messengerx-log.txt` symlink** — opens in the
+///      user's default text editor (gedit, kate, mousepad, xed, VS Code, …)
+///      regardless of which DE or editor they have installed.
+///   2. **Terminal + `less`** — fallback if `xdg-open` is absent or fails.
+///      `x-terminal-emulator` (Debian/Ubuntu/Mint update-alternatives standard)
+///      then `xterm` (X11 base, near-universal), then others.
+///   3. **`xdg-open` on the log directory** — file-manager last resort.
+#[cfg(target_os = "linux")]
+fn open_log_on_linux(log_dir: &std::path::Path, log_file: &std::path::Path) {
+    let file_exists = log_file.exists();
+    let mut opened = false;
+
+    if file_exists {
+        // -------------------------------------------------------------------
+        // 1.  xdg-open via .txt symlink — opens in the default text editor.
+        //
+        // Every Linux desktop distro registers a text editor for text/plain.
+        // .log files often have no handler, so we symlink to .txt so that
+        // xdg-open picks the correct MIME type and launches the editor the
+        // user already has (gedit, kate, mousepad, xed, VS Code, etc.).
+        // AppImage env vars are stripped so xdg-open loads system libraries.
+        // -------------------------------------------------------------------
+        let tmp_link = std::env::temp_dir().join("messengerx-log.txt");
+        let _ = std::fs::remove_file(&tmp_link);
+        let target = if std::os::unix::fs::symlink(log_file, &tmp_link).is_ok() {
+            log::info!("[MessengerX] view_logs: created .txt symlink");
+            tmp_link.as_path()
+        } else {
+            log::warn!("[MessengerX] view_logs: symlink failed, using .log directly");
+            log_file
+        };
+        match std::process::Command::new("xdg-open")
+            .arg(target)
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .spawn()
+        {
+            Ok(_) => {
+                log::info!("[MessengerX] view_logs: xdg-open on {}", target.display());
+                opened = true;
+            }
+            Err(e) => {
+                log::warn!("[MessengerX] view_logs: xdg-open failed: {e}");
+                let _ = std::fs::remove_file(&tmp_link);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // 2.  Terminal + less — fallback when xdg-open is absent or fails.
+        //
+        // x-terminal-emulator is the Debian/Ubuntu/Mint update-alternatives
+        // entry pointing to the user's configured default terminal.
+        // xterm is in the X11 base and is available on virtually every Linux
+        // desktop installation.  The log file path is passed as a direct arg
+        // (Command::arg handles spaces; no sh -c quoting needed).
+        // -------------------------------------------------------------------
+        if !opened {
+            let terminals: &[(&str, &[&str])] = &[
+                ("x-terminal-emulator", &["-e", "less"]),
+                ("xterm",               &["-e", "less"]),
+                ("gnome-terminal",      &["--", "less"]),
+                ("xfce4-terminal",      &["-e", "less"]),
+                ("konsole",             &["-e", "less"]),
+                ("mate-terminal",       &["-e", "less"]),
+                ("lxterminal",          &["-e", "less"]),
+                ("tilix",               &["-e", "less"]),
+            ];
+            for (term, pre) in terminals {
+                match std::process::Command::new(term)
+                    .args(*pre)
+                    .arg(log_file)
+                    .env_remove("LD_LIBRARY_PATH")
+                    .env_remove("LD_PRELOAD")
+                    .spawn()
+                {
+                    Ok(_) => {
+                        log::info!("[MessengerX] view_logs: opened in terminal {term}");
+                        opened = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("[MessengerX] view_logs: {term} error: {e}"),
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3.  Open the log directory — file manager, absolute last resort.
+    // -----------------------------------------------------------------------
+    if !opened {
+        let _ = std::fs::create_dir_all(log_dir);
+        match std::process::Command::new("xdg-open")
+            .arg(log_dir)
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .spawn()
+        {
+            Ok(_) => log::info!("[MessengerX] view_logs: opened log directory in file manager"),
+            Err(e) => log::warn!("[MessengerX] view_logs: xdg-open dir failed: {e}"),
+        }
+    }
+}
+
 /// Run the Tauri application.
 ///
 /// Registers all plugins, builds the main webview window with JS injection
@@ -2810,11 +2984,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
-                .target(tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::LogDir {
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
                         file_name: Some("messengerx".to_string()),
-                    },
-                ))
+                    }),
+                ])
                 .max_file_size(500_000)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
                 .build(),
@@ -2987,18 +3162,21 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // macOS WKWebView.
     let messenger_com_navigated =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // On macOS WKWebView the document title briefly becomes `""` during
-    // EVERY SPA navigation (not only after a real WebKit crash).  To avoid
-    // false-positive CrashDetect fires we track whether the page has
-    // finished loading:
+    // The document title briefly becomes `""` during certain events:
+    //   • macOS WKWebView: on EVERY SPA navigation (not only after a real
+    //     WebKit crash) — thread-to-thread navigation clears the title.
+    //   • Linux WebKitGTK: on `window.location.reload()` (e.g. appearance
+    //     toggle) AND on real WebKitWebProcess crashes.
+    // To avoid false-positive CrashDetect fires on both platforms we track
+    // whether the page has finished loading via `page_load_stable`:
     //   • Reset to `false` in `on_navigation` for www.messenger.com
     //     (navigation has started, page is not yet stable).
     //   • Set to `true` in `on_page_load::Finished` for www.messenger.com
     //     (DOMContentLoaded-equivalent; page is now stable).
-    // `had_good_title` may only be set on macOS when `page_load_stable`
-    // is `true`, and CrashDetect may only fire on macOS when it is `true`.
-    // On Linux/Windows the old behaviour is preserved (WebKitGTK /
-    // WebView2 do NOT emit `""` title during normal SPA navigation).
+    // `had_good_title` may only be set when `page_load_stable` is `true`,
+    // and CrashDetect may only fire when it is `true` (all platforms).
+    // Real crashes that happen AFTER the page has fully loaded still fire
+    // correctly because `page_load_stable` is `true` at that point.
     let page_load_stable =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // ------------------------------------------------------------------
@@ -3099,6 +3277,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(UNREAD_OBSERVER_SCRIPT)
         .initialization_script(DIAGNOSTIC_TELEMETRY_SCRIPT)
         .initialization_script(AUDIO_HOOK_SCRIPT)
+        .initialization_script(MEDIA_ERROR_LOGGER_SCRIPT)
         .initialization_script(OFFLINE_DIALOG_HIDER_SCRIPT)
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
@@ -3148,7 +3327,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
          AppleWebKit/537.36 (KHTML, like Gecko) \
-         Chrome/120.0.0.0 Safari/537.36",
+         Chrome/136.0.0.0 Safari/537.36",
         )
         // ------------------------------------------------------------------
         // Phase G: Rust-side title-change unread-count detection.
@@ -3356,48 +3535,65 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // Guard: had_good_title is reset before each reload so that
                 // a series of back-to-back crashes doesn't bypass the count.
                 //
-                // macOS vs Linux/Windows:
-                //   • macOS WKWebView emits title="" during EVERY SPA
-                //     navigation (not only on crash) → page_load_stable
-                //     gate prevents false-positive CrashDetect fires during
-                //     normal thread navigation.
-                //   • Linux WebKitGTK / Windows WebView2 do NOT clear the
-                //     title during clean SPA navigation — title="" appears
-                //     only on a real WebKitWebProcess crash → the
-                //     page_load_stable gate short-circuits to `true` there
-                //     (!cfg!(target_os = "macos") == true) so crash
-                //     detection is unchanged on Linux/Windows.
+                // ---------------------------------------------------------
+                // CrashDetect: `had_good_title` arming and fire condition.
+                //
+                // `page_load_stable` (all platforms) gates both:
+                //   • Setting `had_good_title = true` — prevents arming
+                //     before the page has fully loaded after any navigation.
+                //   • The CrashDetect fire — prevents false positives while
+                //     the page is still loading (title="" is normal mid-load).
+                //
+                // This handles two distinct cases uniformly:
+                //   • macOS WKWebView: title="" during EVERY SPA navigation
+                //     (not just after a real crash) — the gate prevents
+                //     false-positive CrashDetect fires during normal thread
+                //     navigation.
+                //   • Linux WebKitGTK: title="" during `window.location.reload()`
+                //     (e.g. appearance toggle) — the gate prevents a false-
+                //     positive because `on_navigation` resets `page_load_stable`
+                //     to `false` before the reload and `on_page_load::Finished`
+                //     re-arms it once the page is stable again.
                 // ---------------------------------------------------------
                 // Only count a title as "good" once a real messenger.com
                 // navigation has been allowed.  The loading.html splash page
                 // title ("Messenger X") also contains "Messenger", so without
                 // this guard it would arm the crash detector — causing a false-
                 // positive CrashDetect when the title briefly clears during the
-                // initial SPA navigation on macOS WKWebView.
+                // initial navigation.
                 //
-                // On macOS we additionally require `page_load_stable == true`
-                // (set by on_page_load::Finished) because WKWebView emits
-                // title="" during EVERY SPA navigation, not only after a crash.
-                // On Linux/Windows this extra guard is skipped — WebKitGTK and
-                // WebView2 only emit title="" after real crashes.
+                // Recovery: if `on_page_load::Finished` was not received (e.g.,
+                // WebKitGTK SPA thread navigation may not fire Finished), a good
+                // Messenger title re-arms `page_load_stable` so CrashDetect is
+                // not permanently disarmed on Linux after the first SPA nav.
                 if title.contains("Messenger")
                     && !title.trim().is_empty()
                     && messenger_com_navigated
                         .load(std::sync::atomic::Ordering::Relaxed)
-                    && (!cfg!(target_os = "macos")
-                        || page_load_stable.load(std::sync::atomic::Ordering::Relaxed))
+                    && !page_load_stable.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    page_load_stable.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "[MessengerX][CrashDetect] page_load_stable=true \
+                         (good-title recovery — on_page_load::Finished not received)"
+                    );
+                }
+                if title.contains("Messenger")
+                    && !title.trim().is_empty()
+                    && messenger_com_navigated
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    && page_load_stable.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     had_good_title.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 const MAX_CRASH_RELOADS: u32 = 3;
-                // On macOS also require page_load_stable so we don't fire
-                // during normal SPA navigation (WKWebView clears the title on
-                // every navigation, not just on crash).
+                // `page_load_stable` must be true (page fully loaded) before
+                // CrashDetect fires.  This prevents false positives while the
+                // page is loading after any navigation or reload on all platforms.
                 if title.trim().is_empty()
                     && had_good_title.load(std::sync::atomic::Ordering::Relaxed)
-                    && (!cfg!(target_os = "macos")
-                        || page_load_stable.load(std::sync::atomic::Ordering::Relaxed))
+                    && page_load_stable.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     let prev_count =
                         crash_reload_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3479,10 +3675,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // This lets us pinpoint which phase accounts for the 27-second white-
         // screen gap observed on Win11 (WebView2 boot timing diagnostic).
         //
-        // On macOS, `Finished` for www.messenger.com additionally marks
+        // `Finished` for www.messenger.com additionally marks
         // `page_load_stable = true` so the CrashDetect gate is re-armed
-        // only after the SPA has fully settled (WKWebView emits title=""
-        // during every SPA navigation; we must not treat that as a crash).
+        // only after the page has fully settled (all platforms).
         // ------------------------------------------------------------------
         .on_page_load({
             let page_load_stable_pl = page_load_stable.clone();
@@ -3497,13 +3692,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     payload.url(),
                     setup_started.elapsed().as_millis(),
                 );
-                // macOS only: re-arm the crash-detect stable flag once the
-                // page has finished loading for messenger.com.  Using
-                // `cfg!(target_os = "macos")` (a runtime bool) rather than
-                // `#[cfg(...)]` keeps `page_load_stable_pl` referenced in
-                // the closure body on all platforms, avoiding an
-                // unused-variable warning on Linux/Windows.
-                if cfg!(target_os = "macos") && matches!(payload.event(), PageLoadEvent::Finished) {
+                // All platforms: re-arm the crash-detect stable flag once the
+                // page has finished loading for messenger.com.
+                if matches!(payload.event(), PageLoadEvent::Finished) {
                     let host = payload.url().host_str().unwrap_or("");
                     if host == "www.messenger.com" {
                         page_load_stable_pl.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3549,12 +3740,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if host == "www.messenger.com" {
                     messenger_com_navigated_nav
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    // On macOS, mark the page as not yet stable so the
-                    // empty-title SPA transition doesn't trigger CrashDetect.
+                    // Mark the page as not yet stable so that a transient
+                    // title="" during the load (macOS SPA navigation or Linux
+                    // window.location.reload()) doesn't trigger CrashDetect.
                     // Stability is restored by on_page_load::Finished.
-                    if cfg!(target_os = "macos") {
-                        page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // Post-crash fbsbx proxy block (Linux only).
@@ -4372,7 +4562,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                  window.location.reload();",
                                 mode
                             );
-                            let _ = wv.eval(&script);
+                            if let Err(e) = wv.eval(&script) {
+                                log::warn!("[MessengerX][Appearance] eval failed: {e}");
+                            }
                             // Update window chrome theme (title bar) immediately.
                             let theme = match mode {
                                 "dark" => Some(tauri::Theme::Dark),
@@ -4545,20 +4737,35 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
                     // ---- View Logs ----
                     "view_logs" => {
-                        use tauri_plugin_opener::OpenerExt;
                         if let Ok(log_dir) = handle.path().app_log_dir() {
                             let log_file = log_dir.join("messengerx.log");
-                            if log_file.exists() {
-                                let _ = handle.opener().open_path(
-                                    log_file.to_string_lossy().into_owned(),
-                                    None::<&str>,
-                                );
-                            } else {
-                                let _ = std::fs::create_dir_all(&log_dir);
-                                let _ = handle.opener().open_path(
-                                    log_dir.to_string_lossy().into_owned(),
-                                    None::<&str>,
-                                );
+                            log::info!(
+                                "[MessengerX] view_logs: path={} exists={}",
+                                log_file.display(),
+                                log_file.exists()
+                            );
+                            // On Linux (AppImage): use open_log_on_linux() which
+                            // strips LD_LIBRARY_PATH/LD_PRELOAD before spawning
+                            // and tries text editors + terminal before xdg-open.
+                            #[cfg(target_os = "linux")]
+                            open_log_on_linux(&log_dir, &log_file);
+
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                use tauri_plugin_opener::OpenerExt;
+                                let p = if log_file.exists() {
+                                    log_file.to_string_lossy().into_owned()
+                                } else {
+                                    let _ = std::fs::create_dir_all(&log_dir);
+                                    log_dir.to_string_lossy().into_owned()
+                                };
+                                if let Err(e) =
+                                    handle.opener().open_path(p, None::<&str>)
+                                {
+                                    log::warn!(
+                                        "[MessengerX] view_logs: opener failed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -4891,7 +5098,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                              window.location.reload();",
                             mode
                         );
-                        let _ = wv.eval(&script);
+                        if let Err(e) = wv.eval(&script) {
+                            log::warn!("[MessengerX][Appearance] eval failed: {e}");
+                        }
                         // Update window chrome theme (title bar) immediately.
                         let theme = match mode {
                             "dark" => Some(tauri::Theme::Dark),
@@ -5041,15 +5250,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     use tauri_plugin_opener::OpenerExt;
                     if let Ok(log_dir) = h.path().app_log_dir() {
                         let log_file = log_dir.join("messengerx.log");
-                        if log_file.exists() {
-                            let _ = h
-                                .opener()
-                                .open_path(log_file.to_string_lossy().into_owned(), None::<&str>);
+                        log::info!(
+                            "[MessengerX] view_logs: path={} exists={}",
+                            log_file.display(),
+                            log_file.exists()
+                        );
+                        let p = if log_file.exists() {
+                            log_file.to_string_lossy().into_owned()
                         } else {
                             let _ = std::fs::create_dir_all(&log_dir);
-                            let _ = h
-                                .opener()
-                                .open_path(log_dir.to_string_lossy().into_owned(), None::<&str>);
+                            log_dir.to_string_lossy().into_owned()
+                        };
+                        if let Err(e) = h.opener().open_path(p, None::<&str>) {
+                            log::warn!("[MessengerX] view_logs: opener failed: {e}");
                         }
                     }
                 }

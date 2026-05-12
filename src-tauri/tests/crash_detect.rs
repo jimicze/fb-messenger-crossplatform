@@ -1,7 +1,9 @@
 //! Regression tests: assert that the CrashDetect `had_good_title` arming guard
-//! (`messenger_com_navigated`) and the macOS `page_load_stable` SPA-navigation
-//! guard remain in place so that normal SPA title-clears and the `loading.html`
-//! splash-page title cannot trigger a false-positive crash-detection loop.
+//! (`messenger_com_navigated`) and the all-platform `page_load_stable`
+//! SPA-navigation / reload guard remain in place so that normal SPA title-clears,
+//! `window.location.reload()` (e.g. appearance toggle on Linux), and the
+//! `loading.html` splash-page title cannot trigger a false-positive crash-
+//! detection loop.
 //!
 //! These live in an integration-test file (not inside lib.rs) so that
 //! `include_str!("../src/lib.rs")` does NOT include the assertions themselves —
@@ -43,29 +45,31 @@ fn on_navigation_sets_messenger_com_navigated_for_messenger_host() {
 }
 
 // ---------------------------------------------------------------------------
-// page_load_stable guard (macOS SPA false-positive fix)
+// page_load_stable guard (all-platform SPA / reload false-positive fix)
 // ---------------------------------------------------------------------------
 
-/// On macOS, `had_good_title` may only be set when `page_load_stable` is also
-/// `true`.  WKWebView emits title="" during every SPA navigation (not just
-/// after a real crash), so without this guard any mid-session thread navigation
-/// would trigger CrashDetect.
+/// `had_good_title` must only be set when `page_load_stable` is also `true`.
+/// Both macOS WKWebView (title="" on every SPA navigation) and Linux
+/// WebKitGTK (`window.location.reload()` from the appearance toggle) transiently
+/// clear the document title — without this guard either would arm the crash
+/// detector prematurely.
 #[test]
 fn had_good_title_arming_is_gated_on_page_load_stable_on_macos() {
     assert!(
-        SOURCE.contains("|| page_load_stable.load"),
-        "had_good_title arming must include a page_load_stable gate for macOS"
+        SOURCE.contains("&& page_load_stable.load"),
+        "had_good_title arming must be guarded by && page_load_stable.load (all platforms)"
     );
 }
 
-/// The CrashDetect fire condition must also be gated on `page_load_stable` on
-/// macOS so that an already-armed `had_good_title` cannot fire CrashDetect
-/// during a normal SPA navigation (where the title briefly becomes "").
+/// The CrashDetect fire condition must also be gated on `page_load_stable` so
+/// that an already-armed `had_good_title` cannot fire CrashDetect while the
+/// page is still loading (title="" is normal during macOS SPA navigation and
+/// Linux appearance-toggle reload).
 #[test]
 fn crash_detect_fire_is_gated_on_page_load_stable_on_macos() {
     // There must be at least two occurrences of the page_load_stable gate —
     // one for had_good_title arming and one for the CrashDetect fire condition.
-    let count = SOURCE.matches("|| page_load_stable.load").count();
+    let count = SOURCE.matches("&& page_load_stable.load").count();
     assert!(
         count >= 2,
         "page_load_stable gate must appear in both had_good_title arming \
@@ -74,49 +78,51 @@ fn crash_detect_fire_is_gated_on_page_load_stable_on_macos() {
 }
 
 /// The `on_navigation` handler must reset `page_load_stable` to `false` for
-/// macOS when a www.messenger.com navigation starts.  This ensures a new SPA
-/// transition is not treated as stable until `on_page_load::Finished` fires.
+/// all platforms when a www.messenger.com navigation starts.  This ensures a
+/// new page transition is not treated as stable until `on_page_load::Finished`
+/// fires, preventing false-positive CrashDetect fires on macOS (SPA navigation)
+/// and Linux (appearance-toggle reload).
 #[test]
 fn on_navigation_resets_page_load_stable_on_macos() {
     // Assert the actual reset call exists — `page_load_stable_nav` only
     // appears in the on_navigation handler, so this uniquely identifies the
-    // correct store. Checking for the full call rather than just the variable
-    // name avoids a false positive where the variable is referenced but the
-    // store is absent.
+    // correct store.
     assert!(
         SOURCE.contains("page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed)"),
         "on_navigation must call page_load_stable_nav.store(false, ...) to reset stability"
     );
-    // The reset must be guarded by `if cfg!(target_os = "macos")` so that the
-    // condition evaluates to `false` at runtime on Linux/Windows (where
-    // WebKitGTK/WebView2 do not clear the title during normal SPA navigation);
-    // the optimizer then removes the dead branch.  We check both parts
-    // independently to avoid whitespace-sensitive multi-line assertions.
+    // The reset must NOT be wrapped in a platform guard — it applies to all
+    // platforms (macOS SPA navigation AND Linux appearance-toggle reload both
+    // require it).
     assert!(
-        SOURCE.contains("if cfg!(target_os = \"macos\") {"),
-        "page_load_stable_nav reset must be guarded by if cfg!(target_os = \"macos\")"
+        !SOURCE.contains("if cfg!(target_os = \"macos\") {\n                    page_load_stable_nav"),
+        "page_load_stable_nav reset must not be inside a macos-only cfg! guard"
     );
 }
 
 /// The `on_page_load` handler must set `page_load_stable` to `true` when the
-/// `Finished` event fires for www.messenger.com on macOS.  Without this the
-/// crash detector would never re-arm after a navigation.
+/// `Finished` event fires for www.messenger.com on all platforms.  Without this
+/// the crash detector would never re-arm after a navigation on any platform.
 #[test]
 fn on_page_load_sets_page_load_stable_true_on_finished() {
     assert!(
         SOURCE.contains("page_load_stable_pl"),
         "on_page_load must reference page_load_stable_pl to set stability flag"
     );
-    // The setter must be guarded by `cfg!(target_os = "macos") &&
-    // matches!(payload.event(), PageLoadEvent::Finished)`.  This combined
-    // condition is unique to the on_page_load handler and avoids matching
-    // any of the many other `#[cfg(target_os = "macos")]` attributes
-    // elsewhere in lib.rs.
+    // The setter must be guarded by `matches!(payload.event(), PageLoadEvent::Finished)`
+    // without a platform-only cfg! wrapper — it applies to all platforms.
     assert!(
         SOURCE.contains(
+            "matches!(payload.event(), PageLoadEvent::Finished)"
+        ),
+        "page_load_stable setter must use matches!(...Finished) (all platforms)"
+    );
+    // Must NOT be gated on a macOS-only condition any more.
+    assert!(
+        !SOURCE.contains(
             "cfg!(target_os = \"macos\") && matches!(payload.event(), PageLoadEvent::Finished)"
         ),
-        "page_load_stable setter must use cfg!(target_os = \"macos\") && matches!(...Finished)"
+        "page_load_stable setter must not be macOS-only; it must apply to all platforms"
     );
     // The store call must set the flag to true.
     assert!(
@@ -145,5 +151,20 @@ fn max_reloads_else_resets_had_good_title_to_break_loop() {
         count >= 2,
         "had_good_title.store(false, ...) must appear in both the reload branch and \
          the max-reloads else branch to prevent the infinite loop; found {count} occurrence(s)"
+    );
+}
+
+/// `on_document_title_changed` must recover `page_load_stable` to `true` when a
+/// good Messenger title is seen but `page_load_stable` is still `false` (i.e.,
+/// `on_page_load::Finished` was not received — possible on WebKitGTK where SPA
+/// thread navigation may not fire the `Finished` event).  Without this recovery,
+/// CrashDetect would be permanently disarmed on Linux after the first thread nav
+/// because `page_load_stable` would stay `false` for the rest of the session.
+#[test]
+fn good_title_recovery_sets_page_load_stable_when_finished_not_received() {
+    assert!(
+        SOURCE.contains("&& !page_load_stable.load"),
+        "on_document_title_changed must recover page_load_stable=true when a good title \
+         is seen but page_load_stable is still false (on_page_load::Finished not received)"
     );
 }
