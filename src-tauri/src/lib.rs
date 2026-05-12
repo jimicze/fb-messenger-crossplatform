@@ -4279,7 +4279,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let appearance_light_c = appearance_light_item.clone();
 
         // Translated strings for update-check notifications.
-        let tr_update_available = tr.settings_update_available.clone();
         let tr_no_update = tr.settings_no_update.clone();
         let tr_update_error = tr.settings_update_error.clone();
         let tr_update_ready = tr.settings_update_ready.clone();
@@ -4444,7 +4443,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // ---- Check for updates ----
                     "check_update" => {
                         let h = handle.clone();
-                        let tr_avail = tr_update_available.clone();
                         let tr_none = tr_no_update.clone();
                         let tr_err = tr_update_error.clone();
                         let tr_ready = tr_update_ready.clone();
