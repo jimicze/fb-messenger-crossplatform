@@ -2230,7 +2230,8 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
     }
 
     // Dedup set: only the first failure per URL per page-load is logged so
-    // that retry loops don't flood the log file.
+    // that retry loops don't flood the log file.  Keyed on the full raw URL
+    // so that long URLs differing only in their query string are not collapsed.
     var _seen = new Set();
 
     try {
@@ -2244,11 +2245,18 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
                     return;
                 }
                 var src = t.src || t.currentSrc || '(no-src)';
-                if (src.length > 200) { src = src.slice(0, 197) + '...'; }
+                // Dedup on the full raw URL before sanitising — prevents
+                // collisions between long URLs that share the same first N chars.
                 if (_seen.has(src)) { return; }
                 _seen.add(src);
+                // Log only scheme+host+path; strip query string and fragment so
+                // that CDN signatures/tokens are not captured in log files that
+                // users share in bug reports.
+                var display = src;
+                try { var u = new URL(src); display = u.origin + u.pathname; } catch(_) {}
+                if (display.length > 200) { display = display.slice(0, 197) + '...'; }
                 mlog('failed <' + t.tagName.toLowerCase() + '> src=' +
-                     JSON.stringify(src) + ' v=' + APP_VERSION);
+                     JSON.stringify(display) + ' v=' + APP_VERSION);
             } catch(_) {}
         }, true /* capture phase — catches errors from same-origin frames; cross-origin iframes excluded by browser SOP */);
         mlog('listener registered v=' + APP_VERSION);

@@ -52,9 +52,9 @@ fn on_navigation_sets_messenger_com_navigated_for_messenger_host() {
 /// Both macOS WKWebView (title="" on every SPA navigation) and Linux
 /// WebKitGTK (`window.location.reload()` from the appearance toggle) transiently
 /// clear the document title — without this guard either would arm the crash
-/// detector prematurely.
+/// detector prematurely.  This is an all-platform guard, not macOS-only.
 #[test]
-fn had_good_title_arming_is_gated_on_page_load_stable_on_macos() {
+fn had_good_title_arming_is_gated_on_page_load_stable() {
     assert!(
         SOURCE.contains("&& page_load_stable.load"),
         "had_good_title arming must be guarded by && page_load_stable.load (all platforms)"
@@ -64,9 +64,9 @@ fn had_good_title_arming_is_gated_on_page_load_stable_on_macos() {
 /// The CrashDetect fire condition must also be gated on `page_load_stable` so
 /// that an already-armed `had_good_title` cannot fire CrashDetect while the
 /// page is still loading (title="" is normal during macOS SPA navigation and
-/// Linux appearance-toggle reload).
+/// Linux appearance-toggle reload).  This is an all-platform guard.
 #[test]
-fn crash_detect_fire_is_gated_on_page_load_stable_on_macos() {
+fn crash_detect_fire_is_gated_on_page_load_stable() {
     // There must be at least two occurrences of the page_load_stable gate —
     // one for had_good_title arming and one for the CrashDetect fire condition.
     let count = SOURCE.matches("&& page_load_stable.load").count();
@@ -83,21 +83,27 @@ fn crash_detect_fire_is_gated_on_page_load_stable_on_macos() {
 /// fires, preventing false-positive CrashDetect fires on macOS (SPA navigation)
 /// and Linux (appearance-toggle reload).
 #[test]
-fn on_navigation_resets_page_load_stable_on_macos() {
+fn on_navigation_resets_page_load_stable() {
     // Assert the actual reset call exists — `page_load_stable_nav` only
     // appears in the on_navigation handler, so this uniquely identifies the
     // correct store.
+    let store = "page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed)";
     assert!(
-        SOURCE.contains("page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed)"),
+        SOURCE.contains(store),
         "on_navigation must call page_load_stable_nav.store(false, ...) to reset stability"
     );
-    // The reset must NOT be wrapped in a platform guard — it applies to all
-    // platforms (macOS SPA navigation AND Linux appearance-toggle reload both
-    // require it).
-    assert!(
-        !SOURCE.contains("if cfg!(target_os = \"macos\") {\n                    page_load_stable_nav"),
-        "page_load_stable_nav reset must not be inside a macos-only cfg! guard"
-    );
+    // The reset must NOT be inside a macOS-only cfg! guard.  We check this by
+    // finding the store call and inspecting the 300 bytes before it for a
+    // cfg!(target_os = "macos") token.  This is indentation-agnostic and won't
+    // false-pass if the guard is reformatted.
+    let macos_guard = "cfg!(target_os = \"macos\")";
+    if let Some(pos) = SOURCE.find(store) {
+        let preceding = &SOURCE[pos.saturating_sub(300)..pos];
+        assert!(
+            !preceding.contains(macos_guard),
+            "page_load_stable_nav reset must not be inside a macos-only cfg! guard"
+        );
+    }
 }
 
 /// The `on_page_load` handler must set `page_load_stable` to `true` when the
