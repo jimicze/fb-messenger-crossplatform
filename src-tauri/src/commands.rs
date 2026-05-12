@@ -651,6 +651,47 @@ fn update_unread_count_core(
     }
 
     // ------------------------------------------------------------------
+    // 1b. Startup-baseline guard.
+    //
+    // On every process start (including crash-induced restarts) NOTIF_STATE
+    // resets to `Idle` and LAST_UNREAD_COUNT resets to `u32::MAX`.  The
+    // first title update that arrives with `count > 0` would therefore take
+    // the `idle-count-positive` path and fire a spurious notification for a
+    // message the user already knows about.
+    //
+    // Guard: when `old_count == u32::MAX` (the sentinel written at static
+    // init — meaning "this process has never observed a count before") AND
+    // `count > 0`, silently establish a baseline in NOTIF_STATE without
+    // dispatching a notification.  This mirrors what would happen if the
+    // user had already been notified: state becomes `Notified` with the
+    // current count/sig and `fired_at_secs = now` so the normal
+    // sig_changed / time_rearm paths work correctly from here on.
+    //
+    // This applies to all callers (IPC JS path + title-hook path) because
+    // both converge here.
+    // ------------------------------------------------------------------
+    if old_count == u32::MAX && count > 0 {
+        let now = now_secs();
+        let mut state = NOTIF_STATE
+            .lock()
+            .map_err(|e| format!("notification state lock poisoned: {e}"))?;
+        if matches!(*state, NotifState::Idle) {
+            *state = NotifState::Notified {
+                count,
+                sig: activity_sig.clone(),
+                fired_at_secs: now,
+                typing_rearm_exhausted: false,
+            };
+            log::info!(
+                "[MessengerX][Notification][DECISION] startup-baseline: \
+                 count={count} silently baselined (no notification — pre-existing unread)"
+            );
+        }
+        // Do NOT return — badge / tray updates below still need to run.
+        // The notification section will see state=Notified and suppress the fire.
+    }
+
+    // ------------------------------------------------------------------
     // 2. Notification decision — evaluated independently of badge guard.
     // ------------------------------------------------------------------
     let settings = crate::services::auth::load_settings(&app).unwrap_or_default();

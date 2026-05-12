@@ -2244,7 +2244,12 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
                       t instanceof HTMLSourceElement)) {
                     return;
                 }
-                var src = t.src || t.currentSrc || '(no-src)';
+                // t.src / t.currentSrc covers <img>, <video>, <audio>, and
+                // <source> inside <video>/<audio>.  For <source> inside
+                // <picture>, the browser uses srcset rather than src, so fall
+                // back to the first URL token in srcset when src is empty.
+                var _srcset = t.srcset && t.srcset.split(',')[0].trim().split(/\s+/)[0];
+                var src = t.src || t.currentSrc || _srcset || '(no-src)';
                 // Dedup on the full raw URL before sanitising — prevents
                 // collisions between long URLs that share the same first N chars.
                 if (_seen.has(src)) { return; }
@@ -3683,37 +3688,55 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // This lets us pinpoint which phase accounts for the 27-second white-
         // screen gap observed on Win11 (WebView2 boot timing diagnostic).
         //
-        // `Finished` for www.messenger.com additionally marks
-        // `page_load_stable = true` so the CrashDetect gate is re-armed
-        // only after the page has fully settled (all platforms).
-        // ------------------------------------------------------------------
-        .on_page_load({
-            let page_load_stable_pl = page_load_stable.clone();
-            move |_webview_window, payload| {
-                use tauri::webview::PageLoadEvent;
-                let event_str = match payload.event() {
-                    PageLoadEvent::Started => "Started",
-                    PageLoadEvent::Finished => "Finished",
-                };
-                log::info!(
-                    "[MessengerX][PageLoad] event={event_str} url={} t={}ms",
-                    payload.url(),
-                    setup_started.elapsed().as_millis(),
-                );
-                // All platforms: re-arm the crash-detect stable flag once the
-                // page has finished loading for messenger.com.
-                if matches!(payload.event(), PageLoadEvent::Finished) {
-                    let host = payload.url().host_str().unwrap_or("");
-                    if host == "www.messenger.com" {
-                        page_load_stable_pl.store(true, std::sync::atomic::Ordering::Relaxed);
-                        log::info!(
-                            "[MessengerX][CrashDetect] page_load_stable=true (Finished, \
-                             www.messenger.com)"
-                        );
-                    }
-                }
-            }
-        })
+         // `Finished` for www.messenger.com additionally marks
+         // `page_load_stable = true` so the CrashDetect gate is re-armed
+         // only after the page has fully settled (all platforms).
+         //
+         // On `Finished` we also clear `post_crash_proxy_block` so that the
+         // fbsbx.com maw_proxy_page block (set on crash) is lifted once the
+         // reloaded Messenger page has successfully finished loading.  Without
+         // this clear the block is session-permanent: GIF picker and video
+         // thumbnails break for the rest of the session after any crash.
+         // ------------------------------------------------------------------
+         .on_page_load({
+             let page_load_stable_pl = page_load_stable.clone();
+             let post_crash_proxy_block_pl = post_crash_proxy_block.clone();
+             move |_webview_window, payload| {
+                 use tauri::webview::PageLoadEvent;
+                 let event_str = match payload.event() {
+                     PageLoadEvent::Started => "Started",
+                     PageLoadEvent::Finished => "Finished",
+                 };
+                 log::info!(
+                     "[MessengerX][PageLoad] event={event_str} url={} t={}ms",
+                     payload.url(),
+                     setup_started.elapsed().as_millis(),
+                 );
+                 // All platforms: re-arm the crash-detect stable flag once the
+                 // page has finished loading for messenger.com.  Also clear the
+                 // post-crash proxy block so GIF/video paths are restored.
+                 if matches!(payload.event(), PageLoadEvent::Finished) {
+                     let host = payload.url().host_str().unwrap_or("");
+                     if host == "www.messenger.com" {
+                         page_load_stable_pl.store(true, std::sync::atomic::Ordering::Relaxed);
+                         log::info!(
+                             "[MessengerX][CrashDetect] page_load_stable=true (Finished, \
+                              www.messenger.com)"
+                         );
+                         if post_crash_proxy_block_pl
+                             .load(std::sync::atomic::Ordering::Relaxed)
+                         {
+                             post_crash_proxy_block_pl
+                                 .store(false, std::sync::atomic::Ordering::Relaxed);
+                             log::info!(
+                                 "[MessengerX][CrashDetect] post_crash_proxy_block cleared \
+                                  (page loaded successfully after crash)"
+                             );
+                         }
+                     }
+                 }
+             }
+         })
         // Navigation policy: allow Messenger / Facebook CDN domains;
         // open everything else in the system browser.
         .on_navigation({
@@ -4769,8 +4792,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 log_file.exists()
                             );
                             // On Linux (AppImage): use open_log_on_linux() which
-                            // strips LD_LIBRARY_PATH/LD_PRELOAD before spawning
-                            // and tries text editors + terminal before xdg-open.
+                            // strips LD_LIBRARY_PATH/LD_PRELOAD before spawning.
+                            // Step 1: xdg-open on a .txt symlink (text editor).
+                            // Step 2: terminal + less fallback.
+                            // Step 3: xdg-open on log directory (file manager).
                             #[cfg(target_os = "linux")]
                             open_log_on_linux(&log_dir, &log_file);
 

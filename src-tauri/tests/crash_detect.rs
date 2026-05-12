@@ -10,6 +10,7 @@
 //! preventing false positives where the searched string appears inside the test.
 
 const SOURCE: &str = include_str!("../src/lib.rs");
+const COMMANDS: &str = include_str!("../src/commands.rs");
 
 // ---------------------------------------------------------------------------
 // messenger_com_navigated guard (startup false-positive fix)
@@ -211,5 +212,48 @@ fn was_minimized_is_updated_every_poll_cycle() {
         SOURCE.contains("was_minimized = is_minimized;"),
         "was_minimized must be assigned from is_minimized each poll iteration \
          (not only on visibility changes) so the stamp guard stays accurate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// post_crash_proxy_block — must be cleared after successful page reload
+// ---------------------------------------------------------------------------
+
+/// After a WebKit crash, `post_crash_proxy_block` is set to `true` to
+/// temporarily block the fbsbx.com maw_proxy_page that triggers a GStreamer
+/// NULL-pointer deref on ARM64 Linux.  The block must be cleared once the
+/// reloaded Messenger page finishes loading successfully (`on_page_load::Finished`
+/// for www.messenger.com), otherwise GIF picker and video thumbnails stay broken
+/// for the rest of the session.
+#[test]
+fn post_crash_proxy_block_cleared_on_page_load_finished() {
+    assert!(
+        SOURCE.contains("post_crash_proxy_block_pl\n                                 .store(false"),
+        "post_crash_proxy_block must be cleared (store false) in on_page_load::Finished \
+         for www.messenger.com; if it is never cleared GIF/video loading is permanently \
+         broken after the first crash"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Startup notification baseline — pre-existing unread must not re-notify
+// ---------------------------------------------------------------------------
+
+/// On every process restart (including crash-induced ones) NOTIF_STATE resets
+/// to `Idle`.  Without a startup-baseline guard, the first title update with
+/// `count > 0` takes the `idle-count-positive` branch and fires a spurious
+/// notification for a message the user already received.
+///
+/// The fix: when `old_count == u32::MAX` (the static sentinel — "this process
+/// has never seen a count before") and `count > 0`, silently advance
+/// NOTIF_STATE to `Notified` without dispatching so the pre-existing unread is
+/// treated as already-notified.
+#[test]
+fn startup_baseline_suppresses_pre_existing_unread_notification() {
+    assert!(
+        COMMANDS.contains("old_count == u32::MAX && count > 0"),
+        "update_unread_count_core must baseline the first positive count after \
+         boot (old_count == u32::MAX sentinel) to avoid re-notifying for \
+         pre-existing unread messages on every crash restart"
     );
 }
