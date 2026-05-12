@@ -2230,7 +2230,8 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
     }
 
     // Dedup set: only the first failure per URL per page-load is logged so
-    // that retry loops don't flood the log file.
+    // that retry loops don't flood the log file.  Keyed on the full raw URL
+    // so that long URLs differing only in their query string are not collapsed.
     var _seen = new Set();
 
     try {
@@ -2243,12 +2244,28 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
                       t instanceof HTMLSourceElement)) {
                     return;
                 }
-                var src = t.src || t.currentSrc || '(no-src)';
-                if (src.length > 200) { src = src.slice(0, 197) + '...'; }
+                // t.src / t.currentSrc covers <img>, <video>, <audio>, and
+                // <source> inside <video>/<audio>.  For <source> inside
+                // <picture>, the browser uses srcset rather than src, so fall
+                // back to the first URL token in srcset when src is empty.
+                var _srcset = t.srcset && t.srcset.split(',')[0].trim().split(/\s+/)[0];
+                var src = t.src || t.currentSrc || _srcset || '(no-src)';
+                // Dedup on the full raw URL before sanitising — prevents
+                // collisions between long URLs that share the same first N chars.
                 if (_seen.has(src)) { return; }
                 _seen.add(src);
+                // Log only scheme+host+path; strip query string and fragment so
+                // that CDN signatures/tokens are not captured in log files that
+                // users share in bug reports.
+                 var display = src;
+                 try { var u = new URL(src); display = u.origin + u.pathname; } catch(_) {
+                     // src is a relative URL or opaque string — strip query/fragment
+                     // with a regex so tokens can't leak even when URL parsing fails.
+                     display = src.replace(/[?#].*$/, '');
+                 }
+                if (display.length > 200) { display = display.slice(0, 197) + '...'; }
                 mlog('failed <' + t.tagName.toLowerCase() + '> src=' +
-                     JSON.stringify(src) + ' v=' + APP_VERSION);
+                     JSON.stringify(display) + ' v=' + APP_VERSION);
             } catch(_) {}
         }, true /* capture phase — catches errors from same-origin frames; cross-origin iframes excluded by browser SOP */);
         mlog('listener registered v=' + APP_VERSION);
@@ -3675,37 +3692,55 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // This lets us pinpoint which phase accounts for the 27-second white-
         // screen gap observed on Win11 (WebView2 boot timing diagnostic).
         //
-        // `Finished` for www.messenger.com additionally marks
-        // `page_load_stable = true` so the CrashDetect gate is re-armed
-        // only after the page has fully settled (all platforms).
-        // ------------------------------------------------------------------
-        .on_page_load({
-            let page_load_stable_pl = page_load_stable.clone();
-            move |_webview_window, payload| {
-                use tauri::webview::PageLoadEvent;
-                let event_str = match payload.event() {
-                    PageLoadEvent::Started => "Started",
-                    PageLoadEvent::Finished => "Finished",
-                };
-                log::info!(
-                    "[MessengerX][PageLoad] event={event_str} url={} t={}ms",
-                    payload.url(),
-                    setup_started.elapsed().as_millis(),
-                );
-                // All platforms: re-arm the crash-detect stable flag once the
-                // page has finished loading for messenger.com.
-                if matches!(payload.event(), PageLoadEvent::Finished) {
-                    let host = payload.url().host_str().unwrap_or("");
-                    if host == "www.messenger.com" {
-                        page_load_stable_pl.store(true, std::sync::atomic::Ordering::Relaxed);
-                        log::info!(
-                            "[MessengerX][CrashDetect] page_load_stable=true (Finished, \
-                             www.messenger.com)"
-                        );
-                    }
-                }
-            }
-        })
+         // `Finished` for www.messenger.com additionally marks
+         // `page_load_stable = true` so the CrashDetect gate is re-armed
+         // only after the page has fully settled (all platforms).
+         //
+         // On `Finished` we also clear `post_crash_proxy_block` so that the
+         // fbsbx.com maw_proxy_page block (set on crash) is lifted once the
+         // reloaded Messenger page has successfully finished loading.  Without
+         // this clear the block is session-permanent: GIF picker and video
+         // thumbnails break for the rest of the session after any crash.
+         // ------------------------------------------------------------------
+         .on_page_load({
+             let page_load_stable_pl = page_load_stable.clone();
+             let post_crash_proxy_block_pl = post_crash_proxy_block.clone();
+             move |_webview_window, payload| {
+                 use tauri::webview::PageLoadEvent;
+                 let event_str = match payload.event() {
+                     PageLoadEvent::Started => "Started",
+                     PageLoadEvent::Finished => "Finished",
+                 };
+                 log::info!(
+                     "[MessengerX][PageLoad] event={event_str} url={} t={}ms",
+                     payload.url(),
+                     setup_started.elapsed().as_millis(),
+                 );
+                 // All platforms: re-arm the crash-detect stable flag once the
+                 // page has finished loading for messenger.com.  Also clear the
+                 // post-crash proxy block so GIF/video paths are restored.
+                 if matches!(payload.event(), PageLoadEvent::Finished) {
+                     let host = payload.url().host_str().unwrap_or("");
+                     if host == "www.messenger.com" {
+                         page_load_stable_pl.store(true, std::sync::atomic::Ordering::Relaxed);
+                         log::info!(
+                             "[MessengerX][CrashDetect] page_load_stable=true (Finished, \
+                              www.messenger.com)"
+                         );
+                         if post_crash_proxy_block_pl
+                             .load(std::sync::atomic::Ordering::Relaxed)
+                         {
+                             post_crash_proxy_block_pl
+                                 .store(false, std::sync::atomic::Ordering::Relaxed);
+                             log::info!(
+                                 "[MessengerX][CrashDetect] post_crash_proxy_block cleared \
+                                  (page loaded successfully after crash)"
+                             );
+                         }
+                     }
+                 }
+             }
+         })
         // Navigation policy: allow Messenger / Facebook CDN domains;
         // open everything else in the system browser.
         .on_navigation({
@@ -4180,6 +4215,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             let mut was_visible = initially_focused && !initially_minimized;
+            // Track minimized state separately so that LAST_RESTORED_FROM_MINIMIZED_SECS
+            // is only stamped on a genuine minimize→restore transition.  Without this,
+            // Cinnamon/Muffin XUrgency blinks (triggered by request_user_attention) flip
+            // is_focused true/false rapidly; the poll thread would see a not-visible→visible
+            // edge on every blink and keep re-stamping, holding came_from_background=true
+            // across many seconds and allowing sig_changed to fire 4+ duplicate notifications
+            // from a single group message.
+            let mut was_minimized = initially_minimized;
             log::info!(
                 "[MessengerX][Visibility] Poll thread started: focused={} minimized={} visible={}",
                 initially_focused,
@@ -4208,7 +4251,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // Fix 1: stamp the restore-from-minimized timestamp so that
                     // update_unread_count_core can detect the came_from_background
                     // condition within RESTORE_GRACE_SECS.
-                    if is_visible && !was_visible {
+                    // Guard: only stamp when the window was actually minimized before
+                    // this transition.  Cinnamon XUrgency blinks produce rapid
+                    // not-focused→focused edges WITHOUT a preceding minimize; stamping
+                    // on those would hold came_from_background=true through the entire
+                    // blink sequence and let sig_changed fire duplicate notifications.
+                    if is_visible && !was_visible && was_minimized {
                         let restore_ts = crate::commands::now_secs();
                         crate::commands::LAST_RESTORED_FROM_MINIMIZED_SECS
                             .store(restore_ts, std::sync::atomic::Ordering::SeqCst);
@@ -4236,6 +4284,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
+                // Always update was_minimized so the next iteration knows the true
+                // prior minimized state regardless of whether visibility changed.
+                was_minimized = is_minimized;
             }
         });
     }
@@ -4745,8 +4796,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 log_file.exists()
                             );
                             // On Linux (AppImage): use open_log_on_linux() which
-                            // strips LD_LIBRARY_PATH/LD_PRELOAD before spawning
-                            // and tries text editors + terminal before xdg-open.
+                            // strips LD_LIBRARY_PATH/LD_PRELOAD before spawning.
+                            // Step 1: xdg-open on a .txt symlink (text editor).
+                            // Step 2: terminal + less fallback.
+                            // Step 3: xdg-open on log directory (file manager).
                             #[cfg(target_os = "linux")]
                             open_log_on_linux(&log_dir, &log_file);
 

@@ -10,6 +10,7 @@
 //! preventing false positives where the searched string appears inside the test.
 
 const SOURCE: &str = include_str!("../src/lib.rs");
+const COMMANDS: &str = include_str!("../src/commands.rs");
 
 // ---------------------------------------------------------------------------
 // messenger_com_navigated guard (startup false-positive fix)
@@ -52,9 +53,9 @@ fn on_navigation_sets_messenger_com_navigated_for_messenger_host() {
 /// Both macOS WKWebView (title="" on every SPA navigation) and Linux
 /// WebKitGTK (`window.location.reload()` from the appearance toggle) transiently
 /// clear the document title — without this guard either would arm the crash
-/// detector prematurely.
+/// detector prematurely.  This is an all-platform guard, not macOS-only.
 #[test]
-fn had_good_title_arming_is_gated_on_page_load_stable_on_macos() {
+fn had_good_title_arming_is_gated_on_page_load_stable() {
     assert!(
         SOURCE.contains("&& page_load_stable.load"),
         "had_good_title arming must be guarded by && page_load_stable.load (all platforms)"
@@ -64,9 +65,9 @@ fn had_good_title_arming_is_gated_on_page_load_stable_on_macos() {
 /// The CrashDetect fire condition must also be gated on `page_load_stable` so
 /// that an already-armed `had_good_title` cannot fire CrashDetect while the
 /// page is still loading (title="" is normal during macOS SPA navigation and
-/// Linux appearance-toggle reload).
+/// Linux appearance-toggle reload).  This is an all-platform guard.
 #[test]
-fn crash_detect_fire_is_gated_on_page_load_stable_on_macos() {
+fn crash_detect_fire_is_gated_on_page_load_stable() {
     // There must be at least two occurrences of the page_load_stable gate —
     // one for had_good_title arming and one for the CrashDetect fire condition.
     let count = SOURCE.matches("&& page_load_stable.load").count();
@@ -83,21 +84,27 @@ fn crash_detect_fire_is_gated_on_page_load_stable_on_macos() {
 /// fires, preventing false-positive CrashDetect fires on macOS (SPA navigation)
 /// and Linux (appearance-toggle reload).
 #[test]
-fn on_navigation_resets_page_load_stable_on_macos() {
+fn on_navigation_resets_page_load_stable() {
     // Assert the actual reset call exists — `page_load_stable_nav` only
     // appears in the on_navigation handler, so this uniquely identifies the
     // correct store.
+    let store = "page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed)";
     assert!(
-        SOURCE.contains("page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed)"),
+        SOURCE.contains(store),
         "on_navigation must call page_load_stable_nav.store(false, ...) to reset stability"
     );
-    // The reset must NOT be wrapped in a platform guard — it applies to all
-    // platforms (macOS SPA navigation AND Linux appearance-toggle reload both
-    // require it).
-    assert!(
-        !SOURCE.contains("if cfg!(target_os = \"macos\") {\n                    page_load_stable_nav"),
-        "page_load_stable_nav reset must not be inside a macos-only cfg! guard"
-    );
+    // The reset must NOT be inside a macOS-only cfg! guard.  We check this by
+    // finding the store call and inspecting the 300 bytes before it for a
+    // cfg!(target_os = "macos") token.  This is indentation-agnostic and won't
+    // false-pass if the guard is reformatted.
+    let macos_guard = "cfg!(target_os = \"macos\")";
+    if let Some(pos) = SOURCE.find(store) {
+        let preceding = &SOURCE[pos.saturating_sub(300)..pos];
+        assert!(
+            !preceding.contains(macos_guard),
+            "page_load_stable_nav reset must not be inside a macos-only cfg! guard"
+        );
+    }
 }
 
 /// The `on_page_load` handler must set `page_load_stable` to `true` when the
@@ -166,5 +173,108 @@ fn good_title_recovery_sets_page_load_stable_when_finished_not_received() {
         SOURCE.contains("&& !page_load_stable.load"),
         "on_document_title_changed must recover page_load_stable=true when a good title \
          is seen but page_load_stable is still false (on_page_load::Finished not received)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cinnamon XUrgency blink — LAST_RESTORED_FROM_MINIMIZED_SECS false-stamp fix
+// ---------------------------------------------------------------------------
+
+/// The poll thread must guard `LAST_RESTORED_FROM_MINIMIZED_SECS` stamps with
+/// `was_minimized`.  Without this guard, Cinnamon/Muffin XUrgency blinks
+/// (triggered by `request_user_attention()`) produce rapid not-focused→focused
+/// transitions that re-stamp the restore timestamp on every blink cycle.  Each
+/// re-stamp resets the 3-second `RESTORE_GRACE_SECS` window, holding
+/// `came_from_background=true` for seconds and allowing `sig_changed` to fire
+/// duplicate notifications from a single group message (observed: 4 banners).
+///
+/// The fix: only stamp when `was_minimized` is true so that ordinary
+/// background→focus transitions (including urgency blinks, which never involve
+/// a minimize) do not count as "restored from minimized".
+#[test]
+fn blink_stamp_requires_was_minimized() {
+    assert!(
+        SOURCE.contains("is_visible && !was_visible && was_minimized"),
+        "LAST_RESTORED_FROM_MINIMIZED_SECS must only be stamped when was_minimized \
+         is true; stamping on any not-visible→visible edge (including Cinnamon \
+         XUrgency blinks) causes 4× duplicate notifications from a single message"
+    );
+}
+
+/// The poll thread must keep `was_minimized` up to date after every poll
+/// cycle — not only when visibility changes.  Without this, a
+/// minimize→unminimize (without focus) followed by a focus gain would see
+/// `was_minimized=true` stale from a much earlier cycle and may incorrectly
+/// stamp or miss the stamp.
+#[test]
+fn was_minimized_is_updated_every_poll_cycle() {
+    assert!(
+        SOURCE.contains("was_minimized = is_minimized;"),
+        "was_minimized must be assigned from is_minimized each poll iteration \
+         (not only on visibility changes) so the stamp guard stays accurate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// post_crash_proxy_block — must be cleared after successful page reload
+// ---------------------------------------------------------------------------
+
+/// After a WebKit crash, `post_crash_proxy_block` is set to `true` to
+/// temporarily block the fbsbx.com maw_proxy_page that triggers a GStreamer
+/// NULL-pointer deref on ARM64 Linux.  The block must be cleared once the
+/// reloaded Messenger page finishes loading successfully (`on_page_load::Finished`
+/// for www.messenger.com), otherwise GIF picker and video thumbnails stay broken
+/// for the rest of the session.
+#[test]
+fn post_crash_proxy_block_cleared_on_page_load_finished() {
+    // Use a formatting-agnostic position-based check rather than a literal
+    // newline + indentation match that rustfmt could reflow.
+    //
+    // Strategy: `rfind` gives the *last* occurrence of the variable name,
+    // which is the `.store(false …)` call-site (not the clone or the load).
+    // Then verify:
+    //   (a) `.store(false` appears within 200 bytes forward of that position.
+    //   (b) `Finished` appears within 300 bytes *before* that position —
+    //       confirming the clear lives inside the PageLoadEvent::Finished branch.
+    let token = "post_crash_proxy_block_pl";
+    let pos = SOURCE
+        .rfind(token)
+        .expect("post_crash_proxy_block_pl not found in lib.rs SOURCE");
+
+    let forward = &SOURCE[pos..SOURCE.len().min(pos + 200)];
+    assert!(
+        forward.contains(".store(false"),
+        "post_crash_proxy_block must be cleared (store false) in on_page_load::Finished \
+         for www.messenger.com; if it is never cleared GIF/video loading is permanently \
+         broken after the first crash"
+    );
+
+    let preceding = &SOURCE[pos.saturating_sub(300)..pos];
+    assert!(
+        preceding.contains("Finished"),
+        "post_crash_proxy_block clear must be inside the on_page_load::Finished branch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Startup notification baseline — pre-existing unread must not re-notify
+// ---------------------------------------------------------------------------
+
+/// On every process restart (including crash-induced ones) NOTIF_STATE resets
+/// to `Idle`.  Without a startup-baseline guard, the first title update with
+/// `count > 0` takes the `idle-count-positive` branch and fires a spurious
+/// notification for a message the user already received.
+///
+/// The fix: when `old_count == u32::MAX` (the static sentinel — "this process
+/// has never seen a count before") and `count > 0`, silently advance
+/// NOTIF_STATE to `Notified` without dispatching so the pre-existing unread is
+/// treated as already-notified.
+#[test]
+fn startup_baseline_suppresses_pre_existing_unread_notification() {
+    assert!(
+        COMMANDS.contains("old_count == u32::MAX && count > 0"),
+        "update_unread_count_core must baseline the first positive count after \
+         boot (old_count == u32::MAX sentinel) to avoid re-notifying for \
+         pre-existing unread messages on every crash restart"
     );
 }
