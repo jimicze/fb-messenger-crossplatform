@@ -2858,25 +2858,23 @@ struct SenderHintCache {
 
 /// Opens the Messenger X log file on Linux.
 ///
-/// Linux has no universal GUI log viewer (no equivalent to macOS Console.app),
-/// but every Linux system with a display has *some* terminal emulator, and
-/// `less` is POSIX-standard.  The terminal path is therefore tried first.
+/// Every Linux desktop ships with a text editor registered for `text/plain`,
+/// so `xdg-open` on a `.txt` file is the primary — and usually sufficient —
+/// approach.  `.log` files often have no MIME handler registered, so a
+/// `/tmp/messengerx-log.txt` symlink is used instead of the real path.
 ///
 /// All spawns strip `LD_LIBRARY_PATH`/`LD_PRELOAD` — the AppImage runtime
 /// injects these with stale paths, causing child processes to fail silently
-/// (same root cause fixed for `notify-send` in v1.4.1).
+/// (same root cause as the `notify-send` fix in v1.4.1).
 ///
 /// Strategy — first success wins:
-///   1. **Terminal + `less`** — `x-terminal-emulator` (Debian/Ubuntu/Mint
-///      update-alternatives standard), then `xterm` (X11 base, near-universal),
-///      then desktop-specific emulators.  Always works on any Linux with a
-///      display; `less` is always available.
-///   2. **`xdg-open` on a `/tmp/messengerx-log.txt` symlink** — `.log` files
-///      often have no xdg MIME handler, but `.txt` (`text/plain`) is always
-///      associated with the user's default text editor regardless of which
-///      DE or editor they use (GNOME, KDE, Xfce, Cinnamon, MATE, LXQt…).
-///   3. **`xdg-open` on the log directory** — opens the file manager; always
-///      works as an absolute last resort.
+///   1. **`xdg-open` on `/tmp/messengerx-log.txt` symlink** — opens in the
+///      user's default text editor (gedit, kate, mousepad, xed, VS Code, …)
+///      regardless of which DE or editor they have installed.
+///   2. **Terminal + `less`** — fallback if `xdg-open` is absent or fails.
+///      `x-terminal-emulator` (Debian/Ubuntu/Mint update-alternatives standard)
+///      then `xterm` (X11 base, near-universal), then others.
+///   3. **`xdg-open` on the log directory** — file-manager last resort.
 #[cfg(target_os = "linux")]
 fn open_log_on_linux(log_dir: &std::path::Path, log_file: &std::path::Path) {
     let file_exists = log_file.exists();
@@ -2884,85 +2882,81 @@ fn open_log_on_linux(log_dir: &std::path::Path, log_file: &std::path::Path) {
 
     if file_exists {
         // -------------------------------------------------------------------
-        // 1.  Terminal + less  — universal primary path.
+        // 1.  xdg-open via .txt symlink — opens in the default text editor.
         //
-        // x-terminal-emulator is the Debian/Ubuntu/Mint update-alternatives
-        // entry; it points to whatever terminal the user has configured as
-        // default, so it works across distros without knowing the exact binary.
-        // xterm is in the X11 base and is available on virtually every Linux
-        // desktop installation as a fallback.
-        //
-        // The log file path is passed as a direct argument (no sh -c wrapping
-        // needed; Command::arg handles spaces correctly without shell quoting).
+        // Every Linux desktop distro registers a text editor for text/plain.
+        // .log files often have no handler, so we symlink to .txt so that
+        // xdg-open picks the correct MIME type and launches the editor the
+        // user already has (gedit, kate, mousepad, xed, VS Code, etc.).
+        // AppImage env vars are stripped so xdg-open loads system libraries.
         // -------------------------------------------------------------------
-        let terminals: &[(&str, &[&str])] = &[
-            ("x-terminal-emulator", &["-e", "less"]),
-            ("xterm",               &["-e", "less"]),
-            ("gnome-terminal",      &["--", "less"]),
-            ("xfce4-terminal",      &["-e", "less"]),
-            ("konsole",             &["-e", "less"]),
-            ("mate-terminal",       &["-e", "less"]),
-            ("lxterminal",          &["-e", "less"]),
-            ("tilix",               &["-e", "less"]),
-        ];
-        for (term, pre) in terminals {
-            match std::process::Command::new(term)
-                .args(*pre)
-                .arg(log_file)
-                .env_remove("LD_LIBRARY_PATH")
-                .env_remove("LD_PRELOAD")
-                .spawn()
-            {
-                Ok(_) => {
-                    log::info!("[MessengerX] view_logs: opened in terminal {term}");
-                    opened = true;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!("[MessengerX] view_logs: {term} error: {e}"),
+        let tmp_link = std::env::temp_dir().join("messengerx-log.txt");
+        let _ = std::fs::remove_file(&tmp_link);
+        let target = if std::os::unix::fs::symlink(log_file, &tmp_link).is_ok() {
+            log::info!("[MessengerX] view_logs: created .txt symlink");
+            tmp_link.as_path()
+        } else {
+            log::warn!("[MessengerX] view_logs: symlink failed, using .log directly");
+            log_file
+        };
+        match std::process::Command::new("xdg-open")
+            .arg(target)
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .spawn()
+        {
+            Ok(_) => {
+                log::info!("[MessengerX] view_logs: xdg-open on {}", target.display());
+                opened = true;
+            }
+            Err(e) => {
+                log::warn!("[MessengerX] view_logs: xdg-open failed: {e}");
+                let _ = std::fs::remove_file(&tmp_link);
             }
         }
 
         // -------------------------------------------------------------------
-        // 2.  xdg-open via a .txt symlink — GUI text editor fallback.
+        // 2.  Terminal + less — fallback when xdg-open is absent or fails.
         //
-        // .log files often have no registered xdg MIME handler so
-        // xdg-open on the real file silently does nothing.  A symlink named
-        // .txt causes xdg-open to detect text/plain MIME and open the file
-        // in whatever the user's default text editor is — no hard-coded editor
-        // names needed, works with VS Code, gedit, kate, xed, mousepad, etc.
+        // x-terminal-emulator is the Debian/Ubuntu/Mint update-alternatives
+        // entry pointing to the user's configured default terminal.
+        // xterm is in the X11 base and is available on virtually every Linux
+        // desktop installation.  The log file path is passed as a direct arg
+        // (Command::arg handles spaces; no sh -c quoting needed).
         // -------------------------------------------------------------------
         if !opened {
-            let tmp_link = std::env::temp_dir().join("messengerx-log.txt");
-            let _ = std::fs::remove_file(&tmp_link);
-            let target = if std::os::unix::fs::symlink(log_file, &tmp_link).is_ok() {
-                log::info!("[MessengerX] view_logs: created .txt symlink");
-                tmp_link.as_path()
-            } else {
-                log::warn!("[MessengerX] view_logs: symlink failed, using .log directly");
-                log_file
-            };
-            match std::process::Command::new("xdg-open")
-                .arg(target)
-                .env_remove("LD_LIBRARY_PATH")
-                .env_remove("LD_PRELOAD")
-                .spawn()
-            {
-                Ok(_) => {
-                    log::info!("[MessengerX] view_logs: xdg-open on {}", target.display());
-                    opened = true;
-                }
-                Err(e) => {
-                    log::warn!("[MessengerX] view_logs: xdg-open failed: {e}");
-                    let _ = std::fs::remove_file(&tmp_link);
+            let terminals: &[(&str, &[&str])] = &[
+                ("x-terminal-emulator", &["-e", "less"]),
+                ("xterm",               &["-e", "less"]),
+                ("gnome-terminal",      &["--", "less"]),
+                ("xfce4-terminal",      &["-e", "less"]),
+                ("konsole",             &["-e", "less"]),
+                ("mate-terminal",       &["-e", "less"]),
+                ("lxterminal",          &["-e", "less"]),
+                ("tilix",               &["-e", "less"]),
+            ];
+            for (term, pre) in terminals {
+                match std::process::Command::new(term)
+                    .args(*pre)
+                    .arg(log_file)
+                    .env_remove("LD_LIBRARY_PATH")
+                    .env_remove("LD_PRELOAD")
+                    .spawn()
+                {
+                    Ok(_) => {
+                        log::info!("[MessengerX] view_logs: opened in terminal {term}");
+                        opened = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("[MessengerX] view_logs: {term} error: {e}"),
                 }
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // 3.  Open the log directory in the file manager — absolute last resort.
-    //     xdg-open on a directory always works on any desktop.
+    // 3.  Open the log directory — file manager, absolute last resort.
     // -----------------------------------------------------------------------
     if !opened {
         let _ = std::fs::create_dir_all(log_dir);
