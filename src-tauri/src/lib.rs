@@ -2856,6 +2856,107 @@ struct SenderHintCache {
     retained: Option<(String, std::time::Instant)>,
 }
 
+/// Opens the Messenger X log file on Linux, working around AppImage
+/// `LD_LIBRARY_PATH`/`LD_PRELOAD` environment contamination that causes
+/// `xdg-open` (and `tauri-plugin-opener`) to fail silently (same root cause
+/// fixed for `notify-send` in v1.4.1).
+///
+/// Strategy — first success wins:
+///   1. Known text editors: `xed`, `gedit`, `kate`, `mousepad`, `pluma`, `geany`
+///   2. Terminal emulator running `less`: `x-terminal-emulator`, `xterm`,
+///      `gnome-terminal`, `xfce4-terminal`, `konsole`, `tilix`
+///   3. `xdg-open` on the log file (best-effort; may silently no-op if no MIME handler)
+///   4. `xdg-open` on the log directory (file-manager fallback — always works)
+#[cfg(target_os = "linux")]
+fn open_log_on_linux(log_dir: &std::path::Path, log_file: &std::path::Path) {
+    let file_exists = log_file.exists();
+    let mut opened = false;
+
+    if file_exists {
+        // 1. Try text editors (clean env to strip AppImage LD_LIBRARY_PATH).
+        for editor in &["xed", "gedit", "kate", "mousepad", "pluma", "geany"] {
+            match std::process::Command::new(editor)
+                .arg(log_file)
+                .env_remove("LD_LIBRARY_PATH")
+                .env_remove("LD_PRELOAD")
+                .spawn()
+            {
+                Ok(_) => {
+                    log::info!("[MessengerX] view_logs: opened with {editor}");
+                    opened = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!("[MessengerX] view_logs: {editor} error: {e}"),
+            }
+        }
+
+        // 2. Terminal fallback — run `less` inside whatever terminal is available.
+        //    MESSENGERX_LOG env var avoids shell-quoting issues with spaces in paths.
+        if !opened {
+            let sh_cmd =
+                "less \"$MESSENGERX_LOG\"; read -rp 'Press Enter to close...'";
+            let terminals: &[(&str, &[&str])] = &[
+                ("x-terminal-emulator", &["-e", "sh", "-c"]),
+                ("xterm", &["-e", "sh", "-c"]),
+                ("gnome-terminal", &["--", "sh", "-c"]),
+                ("xfce4-terminal", &["-e", "sh", "-c"]),
+                ("konsole", &["-e", "sh", "-c"]),
+                ("tilix", &["-e", "sh", "-c"]),
+            ];
+            for (term, pre) in terminals {
+                match std::process::Command::new(term)
+                    .args(*pre)
+                    .arg(sh_cmd)
+                    .env("MESSENGERX_LOG", log_file)
+                    .env_remove("LD_LIBRARY_PATH")
+                    .env_remove("LD_PRELOAD")
+                    .spawn()
+                {
+                    Ok(_) => {
+                        log::info!("[MessengerX] view_logs: opened in terminal {term}");
+                        opened = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => log::warn!("[MessengerX] view_logs: {term} error: {e}"),
+                }
+            }
+        }
+
+        // 3. xdg-open on the file (best-effort; silently no-ops if no MIME handler
+        //    but AppImage env is stripped so at least the binary itself can run).
+        if !opened {
+            match std::process::Command::new("xdg-open")
+                .arg(log_file)
+                .env_remove("LD_LIBRARY_PATH")
+                .env_remove("LD_PRELOAD")
+                .spawn()
+            {
+                Ok(_) => {
+                    log::info!("[MessengerX] view_logs: xdg-open on file (best-effort)");
+                    opened = true;
+                }
+                Err(e) => log::warn!("[MessengerX] view_logs: xdg-open file failed: {e}"),
+            }
+        }
+    }
+
+    // 4. Open the log directory in the file manager (always works on any desktop).
+    if !opened {
+        let _ = std::fs::create_dir_all(log_dir);
+        match std::process::Command::new("xdg-open")
+            .arg(log_dir)
+            .env_remove("LD_LIBRARY_PATH")
+            .env_remove("LD_PRELOAD")
+            .spawn()
+        {
+            Ok(_) => log::info!("[MessengerX] view_logs: opened log directory in file manager"),
+            Err(e) => log::warn!("[MessengerX] view_logs: xdg-open dir failed: {e}"),
+        }
+    }
+}
+
 /// Run the Tauri application.
 ///
 /// Registers all plugins, builds the main webview window with JS injection
@@ -4621,20 +4722,35 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
                     // ---- View Logs ----
                     "view_logs" => {
-                        use tauri_plugin_opener::OpenerExt;
                         if let Ok(log_dir) = handle.path().app_log_dir() {
                             let log_file = log_dir.join("messengerx.log");
-                            if log_file.exists() {
-                                let _ = handle.opener().open_path(
-                                    log_file.to_string_lossy().into_owned(),
-                                    None::<&str>,
-                                );
-                            } else {
-                                let _ = std::fs::create_dir_all(&log_dir);
-                                let _ = handle.opener().open_path(
-                                    log_dir.to_string_lossy().into_owned(),
-                                    None::<&str>,
-                                );
+                            log::info!(
+                                "[MessengerX] view_logs: path={} exists={}",
+                                log_file.display(),
+                                log_file.exists()
+                            );
+                            // On Linux (AppImage): use open_log_on_linux() which
+                            // strips LD_LIBRARY_PATH/LD_PRELOAD before spawning
+                            // and tries text editors + terminal before xdg-open.
+                            #[cfg(target_os = "linux")]
+                            open_log_on_linux(&log_dir, &log_file);
+
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                use tauri_plugin_opener::OpenerExt;
+                                let p = if log_file.exists() {
+                                    log_file.to_string_lossy().into_owned()
+                                } else {
+                                    let _ = std::fs::create_dir_all(&log_dir);
+                                    log_dir.to_string_lossy().into_owned()
+                                };
+                                if let Err(e) =
+                                    handle.opener().open_path(p, None::<&str>)
+                                {
+                                    log::warn!(
+                                        "[MessengerX] view_logs: opener failed: {e}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -5119,15 +5235,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     use tauri_plugin_opener::OpenerExt;
                     if let Ok(log_dir) = h.path().app_log_dir() {
                         let log_file = log_dir.join("messengerx.log");
-                        if log_file.exists() {
-                            let _ = h
-                                .opener()
-                                .open_path(log_file.to_string_lossy().into_owned(), None::<&str>);
+                        log::info!(
+                            "[MessengerX] view_logs: path={} exists={}",
+                            log_file.display(),
+                            log_file.exists()
+                        );
+                        let p = if log_file.exists() {
+                            log_file.to_string_lossy().into_owned()
                         } else {
                             let _ = std::fs::create_dir_all(&log_dir);
-                            let _ = h
-                                .opener()
-                                .open_path(log_dir.to_string_lossy().into_owned(), None::<&str>);
+                            log_dir.to_string_lossy().into_owned()
+                        };
+                        if let Err(e) = h.opener().open_path(p, None::<&str>) {
+                            log::warn!("[MessengerX] view_logs: opener failed: {e}");
                         }
                     }
                 }
