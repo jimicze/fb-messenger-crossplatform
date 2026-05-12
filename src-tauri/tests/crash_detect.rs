@@ -174,3 +174,42 @@ fn good_title_recovery_sets_page_load_stable_when_finished_not_received() {
          is seen but page_load_stable is still false (on_page_load::Finished not received)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cinnamon XUrgency blink — LAST_RESTORED_FROM_MINIMIZED_SECS false-stamp fix
+// ---------------------------------------------------------------------------
+
+/// The poll thread must guard `LAST_RESTORED_FROM_MINIMIZED_SECS` stamps with
+/// `was_minimized`.  Without this guard, Cinnamon/Muffin XUrgency blinks
+/// (triggered by `request_user_attention()`) produce rapid not-focused→focused
+/// transitions that re-stamp the restore timestamp on every blink cycle.  Each
+/// re-stamp resets the 3-second `RESTORE_GRACE_SECS` window, holding
+/// `came_from_background=true` for seconds and allowing `sig_changed` to fire
+/// duplicate notifications from a single group message (observed: 4 banners).
+///
+/// The fix: only stamp when `was_minimized` is true so that ordinary
+/// background→focus transitions (including urgency blinks, which never involve
+/// a minimize) do not count as "restored from minimized".
+#[test]
+fn blink_stamp_requires_was_minimized() {
+    assert!(
+        SOURCE.contains("is_visible && !was_visible && was_minimized"),
+        "LAST_RESTORED_FROM_MINIMIZED_SECS must only be stamped when was_minimized \
+         is true; stamping on any not-visible→visible edge (including Cinnamon \
+         XUrgency blinks) causes 4× duplicate notifications from a single message"
+    );
+}
+
+/// The poll thread must keep `was_minimized` up to date after every poll
+/// cycle — not only when visibility changes.  Without this, a
+/// minimize→unminimize (without focus) followed by a focus gain would see
+/// `was_minimized=true` stale from a much earlier cycle and may incorrectly
+/// stamp or miss the stamp.
+#[test]
+fn was_minimized_is_updated_every_poll_cycle() {
+    assert!(
+        SOURCE.contains("was_minimized = is_minimized;"),
+        "was_minimized must be assigned from is_minimized each poll iteration \
+         (not only on visibility changes) so the stamp guard stays accurate"
+    );
+}

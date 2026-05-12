@@ -4188,6 +4188,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 return;
             };
             let mut was_visible = initially_focused && !initially_minimized;
+            // Track minimized state separately so that LAST_RESTORED_FROM_MINIMIZED_SECS
+            // is only stamped on a genuine minimize→restore transition.  Without this,
+            // Cinnamon/Muffin XUrgency blinks (triggered by request_user_attention) flip
+            // is_focused true/false rapidly; the poll thread would see a not-visible→visible
+            // edge on every blink and keep re-stamping, holding came_from_background=true
+            // across many seconds and allowing sig_changed to fire 4+ duplicate notifications
+            // from a single group message.
+            let mut was_minimized = initially_minimized;
             log::info!(
                 "[MessengerX][Visibility] Poll thread started: focused={} minimized={} visible={}",
                 initially_focused,
@@ -4216,7 +4224,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // Fix 1: stamp the restore-from-minimized timestamp so that
                     // update_unread_count_core can detect the came_from_background
                     // condition within RESTORE_GRACE_SECS.
-                    if is_visible && !was_visible {
+                    // Guard: only stamp when the window was actually minimized before
+                    // this transition.  Cinnamon XUrgency blinks produce rapid
+                    // not-focused→focused edges WITHOUT a preceding minimize; stamping
+                    // on those would hold came_from_background=true through the entire
+                    // blink sequence and let sig_changed fire duplicate notifications.
+                    if is_visible && !was_visible && was_minimized {
                         let restore_ts = crate::commands::now_secs();
                         crate::commands::LAST_RESTORED_FROM_MINIMIZED_SECS
                             .store(restore_ts, std::sync::atomic::Ordering::SeqCst);
@@ -4244,6 +4257,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
+                // Always update was_minimized so the next iteration knows the true
+                // prior minimized state regardless of whether visibility changed.
+                was_minimized = is_minimized;
             }
         });
     }
