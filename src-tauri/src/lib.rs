@@ -2987,6 +2987,20 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // macOS WKWebView.
     let messenger_com_navigated =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // On macOS WKWebView the document title briefly becomes `""` during
+    // EVERY SPA navigation (not only after a real WebKit crash).  To avoid
+    // false-positive CrashDetect fires we track whether the page has
+    // finished loading:
+    //   • Reset to `false` in `on_navigation` for www.messenger.com
+    //     (navigation has started, page is not yet stable).
+    //   • Set to `true` in `on_page_load::Finished` for www.messenger.com
+    //     (DOMContentLoaded-equivalent; page is now stable).
+    // `had_good_title` may only be set on macOS when `page_load_stable`
+    // is `true`, and CrashDetect may only fire on macOS when it is `true`.
+    // On Linux/Windows the old behaviour is preserved (WebKitGTK /
+    // WebView2 do NOT emit `""` title during normal SPA navigation).
+    let page_load_stable =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // ------------------------------------------------------------------
     // Sender-hint cache.
     //
@@ -3160,6 +3174,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let pending_sender_hint = pending_sender_hint.clone();
             let post_crash_proxy_block = post_crash_proxy_block.clone();
             let messenger_com_navigated = messenger_com_navigated.clone();
+            let page_load_stable = page_load_stable.clone();
             move |webview_window, title| {
                 const SENDER_HINT_PREFIX: &str = "__MX_SENDER_V1__?";
                 if let Some(query) = title.strip_prefix(SENDER_HINT_PREFIX) {
@@ -3340,6 +3355,18 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 //
                 // Guard: had_good_title is reset before each reload so that
                 // a series of back-to-back crashes doesn't bypass the count.
+                //
+                // macOS vs Linux/Windows:
+                //   • macOS WKWebView emits title="" during EVERY SPA
+                //     navigation (not only on crash) → page_load_stable
+                //     gate prevents false-positive CrashDetect fires during
+                //     normal thread navigation.
+                //   • Linux WebKitGTK / Windows WebView2 do NOT clear the
+                //     title during clean SPA navigation — title="" appears
+                //     only on a real WebKitWebProcess crash → the
+                //     page_load_stable gate short-circuits to `true` there
+                //     (!cfg!(target_os = "macos") == true) so crash
+                //     detection is unchanged on Linux/Windows.
                 // ---------------------------------------------------------
                 // Only count a title as "good" once a real messenger.com
                 // navigation has been allowed.  The loading.html splash page
@@ -3347,17 +3374,30 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // this guard it would arm the crash detector — causing a false-
                 // positive CrashDetect when the title briefly clears during the
                 // initial SPA navigation on macOS WKWebView.
+                //
+                // On macOS we additionally require `page_load_stable == true`
+                // (set by on_page_load::Finished) because WKWebView emits
+                // title="" during EVERY SPA navigation, not only after a crash.
+                // On Linux/Windows this extra guard is skipped — WebKitGTK and
+                // WebView2 only emit title="" after real crashes.
                 if title.contains("Messenger")
                     && !title.trim().is_empty()
                     && messenger_com_navigated
                         .load(std::sync::atomic::Ordering::Relaxed)
+                    && (!cfg!(target_os = "macos")
+                        || page_load_stable.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     had_good_title.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 const MAX_CRASH_RELOADS: u32 = 3;
+                // On macOS also require page_load_stable so we don't fire
+                // during normal SPA navigation (WKWebView clears the title on
+                // every navigation, not just on crash).
                 if title.trim().is_empty()
                     && had_good_title.load(std::sync::atomic::Ordering::Relaxed)
+                    && (!cfg!(target_os = "macos")
+                        || page_load_stable.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     let prev_count =
                         crash_reload_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3391,9 +3431,17 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     } else {
+                        // Reset had_good_title (all platforms) so that
+                        // subsequent empty-title events — whether from a
+                        // real crash before the recovery page sets its
+                        // title (Linux: GStreamer crash mid-load) or from
+                        // a macOS SPA navigation — do not immediately
+                        // re-trigger this else branch, creating an
+                        // infinite navigate-to-root loop.
+                        had_good_title.store(false, std::sync::atomic::Ordering::Relaxed);
                         log::warn!(
                             "[MessengerX][CrashDetect] Max crash reloads ({MAX_CRASH_RELOADS}) \
-                             reached — navigating to messenger.com root to restore usability."
+                              reached — navigating to messenger.com root to restore usability."
                         );
                         // Navigate to root so the user is not left with a
                         // blank / crashed window.  We do not increment the
@@ -3430,24 +3478,49 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         // (DOMContentLoaded equivalent) with milliseconds since app launch.
         // This lets us pinpoint which phase accounts for the 27-second white-
         // screen gap observed on Win11 (WebView2 boot timing diagnostic).
+        //
+        // On macOS, `Finished` for www.messenger.com additionally marks
+        // `page_load_stable = true` so the CrashDetect gate is re-armed
+        // only after the SPA has fully settled (WKWebView emits title=""
+        // during every SPA navigation; we must not treat that as a crash).
         // ------------------------------------------------------------------
-        .on_page_load(move |_webview_window, payload| {
-            use tauri::webview::PageLoadEvent;
-            let event_str = match payload.event() {
-                PageLoadEvent::Started => "Started",
-                PageLoadEvent::Finished => "Finished",
-            };
-            log::info!(
-                "[MessengerX][PageLoad] event={event_str} url={} t={}ms",
-                payload.url(),
-                setup_started.elapsed().as_millis(),
-            );
+        .on_page_load({
+            let page_load_stable_pl = page_load_stable.clone();
+            move |_webview_window, payload| {
+                use tauri::webview::PageLoadEvent;
+                let event_str = match payload.event() {
+                    PageLoadEvent::Started => "Started",
+                    PageLoadEvent::Finished => "Finished",
+                };
+                log::info!(
+                    "[MessengerX][PageLoad] event={event_str} url={} t={}ms",
+                    payload.url(),
+                    setup_started.elapsed().as_millis(),
+                );
+                // macOS only: re-arm the crash-detect stable flag once the
+                // page has finished loading for messenger.com.  Using
+                // `cfg!(target_os = "macos")` (a runtime bool) rather than
+                // `#[cfg(...)]` keeps `page_load_stable_pl` referenced in
+                // the closure body on all platforms, avoiding an
+                // unused-variable warning on Linux/Windows.
+                if cfg!(target_os = "macos") && matches!(payload.event(), PageLoadEvent::Finished) {
+                    let host = payload.url().host_str().unwrap_or("");
+                    if host == "www.messenger.com" {
+                        page_load_stable_pl.store(true, std::sync::atomic::Ordering::Relaxed);
+                        log::info!(
+                            "[MessengerX][CrashDetect] page_load_stable=true (Finished, \
+                             www.messenger.com)"
+                        );
+                    }
+                }
+            }
         })
         // Navigation policy: allow Messenger / Facebook CDN domains;
         // open everything else in the system browser.
         .on_navigation({
             let post_crash_proxy_block = post_crash_proxy_block.clone();
             let messenger_com_navigated_nav = messenger_com_navigated.clone();
+            let page_load_stable_nav = page_load_stable.clone();
             move |url| {
                 let scheme = url.scheme();
                 // Pass through non-HTTP schemes (blob:, data:, about:, tauri:, etc.).
@@ -3476,6 +3549,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if host == "www.messenger.com" {
                     messenger_com_navigated_nav
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                    // On macOS, mark the page as not yet stable so the
+                    // empty-title SPA transition doesn't trigger CrashDetect.
+                    // Stability is restored by on_page_load::Finished.
+                    if cfg!(target_os = "macos") {
+                        page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
 
                 // Post-crash fbsbx proxy block (Linux only).
