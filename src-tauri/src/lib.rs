@@ -2250,7 +2250,7 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
                 mlog('failed <' + t.tagName.toLowerCase() + '> src=' +
                      JSON.stringify(src) + ' v=' + APP_VERSION);
             } catch(_) {}
-        }, true /* capture phase — catches errors from all descendant frames */);
+        }, true /* capture phase — catches errors from same-origin frames; cross-origin iframes excluded by browser SOP */);
         mlog('listener registered v=' + APP_VERSION);
     } catch(e) {
         mlog('register FAILED: ' + (e && e.message ? e.message : String(e)));
@@ -3419,8 +3419,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // Guard: had_good_title is reset before each reload so that
                 // a series of back-to-back crashes doesn't bypass the count.
                 //
-                // macOS vs Linux/Windows:
-                //   • macOS WKWebView emits title="" during EVERY SPA
                 // ---------------------------------------------------------
                 // CrashDetect: `had_good_title` arming and fire condition.
                 //
@@ -3447,6 +3445,23 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // this guard it would arm the crash detector — causing a false-
                 // positive CrashDetect when the title briefly clears during the
                 // initial navigation.
+                //
+                // Recovery: if `on_page_load::Finished` was not received (e.g.,
+                // WebKitGTK SPA thread navigation may not fire Finished), a good
+                // Messenger title re-arms `page_load_stable` so CrashDetect is
+                // not permanently disarmed on Linux after the first SPA nav.
+                if title.contains("Messenger")
+                    && !title.trim().is_empty()
+                    && messenger_com_navigated
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    && !page_load_stable.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    page_load_stable.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "[MessengerX][CrashDetect] page_load_stable=true \
+                         (good-title recovery — on_page_load::Finished not received)"
+                    );
+                }
                 if title.contains("Messenger")
                     && !title.trim().is_empty()
                     && messenger_com_navigated

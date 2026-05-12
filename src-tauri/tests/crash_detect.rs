@@ -153,3 +153,18 @@ fn max_reloads_else_resets_had_good_title_to_break_loop() {
          the max-reloads else branch to prevent the infinite loop; found {count} occurrence(s)"
     );
 }
+
+/// `on_document_title_changed` must recover `page_load_stable` to `true` when a
+/// good Messenger title is seen but `page_load_stable` is still `false` (i.e.,
+/// `on_page_load::Finished` was not received — possible on WebKitGTK where SPA
+/// thread navigation may not fire the `Finished` event).  Without this recovery,
+/// CrashDetect would be permanently disarmed on Linux after the first thread nav
+/// because `page_load_stable` would stay `false` for the rest of the session.
+#[test]
+fn good_title_recovery_sets_page_load_stable_when_finished_not_received() {
+    assert!(
+        SOURCE.contains("&& !page_load_stable.load"),
+        "on_document_title_changed must recover page_load_stable=true when a good title \
+         is seen but page_load_stable is still false (on_page_load::Finished not received)"
+    );
+}
