@@ -16,7 +16,6 @@
   <img src="https://img.shields.io/badge/Rust-2021-brown?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/TypeScript-5-blue?style=flat-square&logo=typescript" alt="TypeScript" />
   <br />
-  <a href="https://formulae.brew.sh/cask/messenger-x"><img src="https://img.shields.io/badge/Homebrew-messenger--x-FBB040?style=flat-square&logo=homebrew" alt="Homebrew" /></a>
   <img src="https://img.shields.io/badge/winget-jimicze.MessengerX-0078D4?style=flat-square&logo=windows" alt="winget" />
 </p>
 
@@ -37,7 +36,7 @@
 ### Package managers
 
 ```sh
-# macOS — Homebrew
+# macOS — Homebrew (custom tap, not in official homebrew/cask)
 brew tap jimicze/tap
 brew install --cask messenger-x
 
@@ -305,7 +304,7 @@ This triggers builds for **6 parallel jobs** (macOS arm64 + x64, Windows x64 + a
 - [x] **Enhanced notifications** — Platform-specific sounds, silent mode, tray click handler
 - [x] **Auto-updates** — Built-in update checker & installer via Tauri updater plugin
 - [ ] Code signing — [SignPath Foundation](https://signpath.org) (Windows) + Apple notarization (macOS)
-- [x] **Package managers** — Homebrew tap (`brew install --cask messenger-x`) + winget (`winget install jimicze.MessengerX`)
+- [x] **Package managers** — winget (`winget install jimicze.MessengerX`) + Homebrew custom tap (`brew tap jimicze/tap && brew install --cask messenger-x`, not in official homebrew/cask)
 - [ ] Cross-platform testing (Windows, Linux Mint, Fedora, Arch)
 - [ ] Keyboard shortcuts customization
 - [ ] Multiple account support
