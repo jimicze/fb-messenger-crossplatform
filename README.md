@@ -105,35 +105,26 @@ Pick the right installer for your platform:
 
 ## ✨ Features
 
-#### 🌐 Native WebView Client
-Loads `messenger.com` in a system WebView — no bundled browser engine. Uses your OS's native web renderer for minimal resource usage.
+<table>
+  <tr>
+    <td>
 
-#### 🔔 Native Notifications
-Web notifications are intercepted and forwarded to your OS notification system. Works with notification centers on all platforms.
+| | |
+|---|---|
+| 🌐 **Native WebView Client** | Loads `messenger.com` in a system WebView — no bundled browser engine. Uses your OS's native web renderer for minimal resource usage. |
+| 🔔 **Native Notifications** | Web notifications are intercepted and forwarded to your OS notification system. Works with notification centers on all platforms. |
+| 🔢 **Unread Badge** | Parses the unread count from the page title and displays it on your dock/taskbar icon and system tray tooltip. |
+| 🔐 **Persistent Sessions** | Your login session persists across app restarts. Toggle "Stay logged in" in Settings, or log out and wipe all data with one click. |
+| 📴 **Offline Mode** | Automatic HTML snapshots every 60 seconds. When you go offline, the app shows cached content with a non-intrusive banner — no blank screens. |
+| 🔄 **Auto-Updates** | Built-in update checker in Settings. One-click download, install, and restart — no manual re-downloading needed. |
+| 🌍 **Localization** | Automatically detects your system language. Currently supports English and Czech, with easy extensibility for more languages. |
+| 🔍 **Zoom Controls** | Zoom from 50% to 300%. Zoom level persists across sessions. |
+| 🪟 **Window Management** | Window size and position are saved and restored. Default: 1200×800, minimum: 400×300. |
+| 🔗 **Smart Link Handling** | Facebook/Messenger URLs stay in-app. External links open in your default system browser automatically. |
 
-#### 🔢 Unread Badge
-Parses the unread count from the page title and displays it on your dock/taskbar icon and system tray tooltip.
-
-#### 🔐 Persistent Sessions
-Your login session persists across app restarts. Toggle "Stay logged in" in Settings, or log out and wipe all data with one click.
-
-#### 📴 Offline Mode
-Automatic HTML snapshots every 60 seconds. When you go offline, the app shows cached content with a non-intrusive banner — no blank screens.
-
-#### 🔄 Auto-Updates
-Built-in update checker in Settings. One-click download, install, and restart — no manual re-downloading needed.
-
-#### 🌍 Localization
-Automatically detects your system language. Currently supports English and Czech, with easy extensibility for more languages.
-
-#### 🔍 Zoom Controls
-Zoom from 50% to 300%. Zoom level persists across sessions.
-
-#### 🪟 Window Management
-Window size and position are saved and restored. Default: 1200×800, minimum: 400×300.
-
-#### 🔗 Smart Link Handling
-Facebook/Messenger URLs stay in-app. External links open in your default system browser automatically.
+  </td>
+  </tr>
+</table>
 
 <details>
 <summary><strong>Platform notes — notifications &amp; startup</strong></summary>
