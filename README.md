@@ -102,6 +102,30 @@ Pick the right installer for your platform:
 
 </details>
 
+<details>
+<summary><strong>🪟 Windows SmartScreen warning</strong></summary>
+<br />
+
+Messenger X is an open-source project and is **not yet code-signed**. Windows SmartScreen may show a warning when running the installer for the first time. This is expected and safe to bypass.
+
+**Direct installer (`.exe`):**
+
+1. Download the installer from the [Latest Release](https://github.com/jimicze/fb-messanger-crossplatform/releases/latest)
+2. When SmartScreen shows **"Windows protected your PC"**, click **More info**
+3. Click **Run anyway**
+
+**Via winget** — if `winget install jimicze.MessengerX` hangs or fails:
+
+```powershell
+# Download the installer manually, then run with bypass:
+winget download jimicze.MessengerX --download-directory .
+# Then double-click the downloaded .exe and follow the steps above
+```
+
+> The app binary is built and published directly from [this repository](https://github.com/jimicze/fb-messanger-crossplatform) via GitHub Actions. You can verify the build provenance in the [Actions tab](https://github.com/jimicze/fb-messanger-crossplatform/actions).
+
+</details>
+
 ## ✨ Features
 
 - 🌐 **Native WebView Client** — Loads `messenger.com` in a system WebView — no bundled browser engine. Uses your OS's native web renderer for minimal resource usage.
