@@ -15,6 +15,9 @@
   <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square&logo=tauri" alt="Tauri v2" />
   <img src="https://img.shields.io/badge/Rust-2021-brown?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/TypeScript-5-blue?style=flat-square&logo=typescript" alt="TypeScript" />
+  <br />
+  <a href="https://formulae.brew.sh/cask/messenger-x"><img src="https://img.shields.io/badge/Homebrew-messenger--x-FBB040?style=flat-square&logo=homebrew" alt="Homebrew" /></a>
+  <img src="https://img.shields.io/badge/winget-jimicze.MessengerX-0078D4?style=flat-square&logo=windows" alt="winget" />
 </p>
 
 <p align="center">
@@ -38,7 +41,7 @@
 brew tap jimicze/tap
 brew install --cask messenger-x
 
-# Windows — winget  (pending registry approval)
+# Windows — winget
 winget install jimicze.MessengerX
 ```
 
@@ -322,7 +325,7 @@ This triggers builds for **6 parallel jobs** (macOS arm64 + x64, Windows x64 + a
 - [x] **Enhanced notifications** — Platform-specific sounds, silent mode, tray click handler
 - [x] **Auto-updates** — Built-in update checker & installer via Tauri updater plugin
 - [ ] Code signing — [SignPath Foundation](https://signpath.org) (Windows) + Apple notarization (macOS)
-- [x] **Package managers** — Homebrew tap (`brew install --cask messenger-x`) + winget (`winget install jimicze.MessengerX`, pending approval)
+- [x] **Package managers** — Homebrew tap (`brew install --cask messenger-x`) + winget (`winget install jimicze.MessengerX`)
 - [ ] Cross-platform testing (Windows, Linux Mint, Fedora, Arch)
 - [ ] Keyboard shortcuts customization
 - [ ] Multiple account support
