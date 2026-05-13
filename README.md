@@ -15,6 +15,8 @@
   <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square&logo=tauri" alt="Tauri v2" />
   <img src="https://img.shields.io/badge/Rust-2021-brown?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/TypeScript-5-blue?style=flat-square&logo=typescript" alt="TypeScript" />
+  <br />
+  <img src="https://img.shields.io/badge/winget-jimicze.MessengerX-0078D4?style=flat-square&logo=windows" alt="winget" />
 </p>
 
 <p align="center">
@@ -34,11 +36,11 @@
 ### Package managers
 
 ```sh
-# macOS — Homebrew
+# macOS — Homebrew (custom tap, not in official homebrew/cask)
 brew tap jimicze/tap
 brew install --cask messenger-x
 
-# Windows — winget  (pending registry approval)
+# Windows — winget
 winget install jimicze.MessengerX
 ```
 
@@ -102,46 +104,16 @@ Pick the right installer for your platform:
 
 ## ✨ Features
 
-<table>
-  <tr>
-    <td width="50%">
-
-#### 🌐 Native WebView Client
-Loads `messenger.com` in a system WebView — no bundled browser engine. Uses your OS's native web renderer for minimal resource usage.
-
-#### 🔔 Native Notifications
-Web notifications are intercepted and forwarded to your OS notification system. Works with notification centers on all platforms.
-
-#### 🔢 Unread Badge
-Parses the unread count from the page title and displays it on your dock/taskbar icon and system tray tooltip.
-
-#### 🔐 Persistent Sessions
-Your login session persists across app restarts. Toggle "Stay logged in" in Settings, or log out and wipe all data with one click.
-
-</td>
-<td width="50%">
-
-#### 📴 Offline Mode
-Automatic HTML snapshots every 60 seconds. When you go offline, the app shows cached content with a non-intrusive banner — no blank screens.
-
-#### 🔄 Auto-Updates
-Built-in update checker in Settings. One-click download, install, and restart — no manual re-downloading needed.
-
-#### 🌍 Localization
-Automatically detects your system language. Currently supports English and Czech, with easy extensibility for more languages.
-
-#### 🔍 Zoom Controls
-Zoom from 50% to 300%. Zoom level persists across sessions.
-
-#### 🪟 Window Management
-Window size and position are saved and restored. Default: 1200×800, minimum: 400×300.
-
-#### 🔗 Smart Link Handling
-Facebook/Messenger URLs stay in-app. External links open in your default system browser automatically.
-
-</td>
-  </tr>
-</table>
+- 🌐 **Native WebView Client** — Loads `messenger.com` in a system WebView — no bundled browser engine. Uses your OS's native web renderer for minimal resource usage.
+- 🔔 **Native Notifications** — Web notifications are intercepted and forwarded to your OS notification system. Works with notification centers on all platforms.
+- 🔢 **Unread Badge** — Parses the unread count from the page title and displays it on your dock/taskbar icon and system tray tooltip.
+- 🔐 **Persistent Sessions** — Your login session persists across app restarts. Toggle "Stay logged in" in Settings, or log out and wipe all data with one click.
+- 📴 **Offline Mode** — Automatic HTML snapshots every 60 seconds. When you go offline, the app shows cached content with a non-intrusive banner — no blank screens.
+- 🔄 **Auto-Updates** — Built-in update checker in Settings. One-click download, install, and restart — no manual re-downloading needed.
+- 🌍 **Localization** — Automatically detects your system language. Currently supports English and Czech, with easy extensibility for more languages.
+- 🔍 **Zoom Controls** — Zoom from 50% to 300%. Zoom level persists across sessions.
+- 🪟 **Window Management** — Window size and position are saved and restored. Default: 1200×800, minimum: 400×300.
+- 🔗 **Smart Link Handling** — Facebook/Messenger URLs stay in-app. External links open in your default system browser automatically.
 
 <details>
 <summary><strong>Platform notes — notifications &amp; startup</strong></summary>
@@ -322,7 +294,7 @@ This triggers builds for **6 parallel jobs** (macOS arm64 + x64, Windows x64 + a
 - [x] **Enhanced notifications** — Platform-specific sounds, silent mode, tray click handler
 - [x] **Auto-updates** — Built-in update checker & installer via Tauri updater plugin
 - [ ] Code signing — [SignPath Foundation](https://signpath.org) (Windows) + Apple notarization (macOS)
-- [x] **Package managers** — Homebrew tap (`brew install --cask messenger-x`) + winget (`winget install jimicze.MessengerX`, pending approval)
+- [x] **Package managers** — winget (`winget install jimicze.MessengerX`) + Homebrew custom tap (`brew tap jimicze/tap && brew install --cask messenger-x`, not in official homebrew/cask)
 - [ ] Cross-platform testing (Windows, Linux Mint, Fedora, Arch)
 - [ ] Keyboard shortcuts customization
 - [ ] Multiple account support
