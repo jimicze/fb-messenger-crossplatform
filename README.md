@@ -107,7 +107,7 @@ Pick the right installer for your platform:
 
 <table>
   <tr>
-    <td width="50%">
+    <td width="50%" valign="top">
 
 #### 🌐 Native WebView Client
 Loads `messenger.com` in a system WebView — no bundled browser engine. Uses your OS's native web renderer for minimal resource usage.
@@ -122,7 +122,7 @@ Parses the unread count from the page title and displays it on your dock/taskbar
 Your login session persists across app restarts. Toggle "Stay logged in" in Settings, or log out and wipe all data with one click.
 
 </td>
-<td width="50%">
+<td width="50%" valign="top">
 
 #### 📴 Offline Mode
 Automatic HTML snapshots every 60 seconds. When you go offline, the app shows cached content with a non-intrusive banner — no blank screens.
