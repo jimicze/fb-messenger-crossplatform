@@ -13,7 +13,7 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 /// Monotonically increasing counter used to generate unique window labels for
 /// popup windows spawned via `window.open()` (e.g. Messenger video/audio call
 /// UI).  Wraps at `u32::MAX` but that is effectively unreachable in practice.
-static POPUP_WINDOW_COUNTER: std::sync::atomic::AtomicU32 =
+pub(crate) static POPUP_WINDOW_COUNTER: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ static POPUP_WINDOW_COUNTER: std::sync::atomic::AtomicU32 =
 ///    time succeeds via IPC because we are now in the allowed origin context.
 ///
 /// Injected **at document-start** (before the page HTML is parsed).
-const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
+pub(crate) const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
     r#"
 (function() {
 
@@ -1680,7 +1680,7 @@ fn is_safe_messenger_startup_url(value: &str) -> bool {
 /// Injected **at document-start** on all platforms.  WebView2 (Windows) is
 /// already Chromium and has `window.chrome`, so the guard `if (!window.chrome)`
 /// makes the injection a no-op there.
-const CALL_COMPAT_SCRIPT: &str = r#"(function() {
+pub(crate) const CALL_COMPAT_SCRIPT: &str = r#"(function() {
     // Helper: forward a message to the Rust log file.
     // Retries once after 2 s in case Tauri IPC is not yet ready at document-start.
     function diag(msg) {
@@ -1777,7 +1777,139 @@ const CALL_COMPAT_SCRIPT: &str = r#"(function() {
     } catch(e) { diag('mediaDevices shim error: ' + e); }
 
     // -----------------------------------------------------------------------
-    // 4. Diagnostic snapshot — logged once IPC is ready (100 ms delay covers
+    // 4. navigator.userAgentData stub (User Agent Client Hints)
+    //    Chrome exposes navigator.userAgentData with a `brands` array that
+    //    includes "Google Chrome".  WKWebView (macOS) and WebKitGTK (Linux)
+    //    do not expose this API even when the UA string is set to Chrome.
+    //    Messenger's e2ee call UI checks for a Chrome brand entry to decide
+    //    whether to enable encrypted call buttons — without it, the buttons
+    //    are greyed out with "unsupported browser" in all e2ee (private) DMs.
+    //    Guard: no-op on WebView2 (Windows) where the real object already
+    //    exists.
+    // -----------------------------------------------------------------------
+    try {
+        if (!navigator.userAgentData) {
+            var _brands = [
+                { brand: 'Chromium',      version: '136' },
+                { brand: 'Google Chrome', version: '136' },
+                { brand: 'Not_A Brand',   version: '24'  }
+            ];
+            var _uaData = {
+                brands:   _brands,
+                mobile:   false,
+                platform: 'Windows',
+                getHighEntropyValues: function() {
+                    return Promise.resolve({
+                        architecture:    'x86',
+                        bitness:         '64',
+                        brands:          _brands,
+                        fullVersionList: [
+                            { brand: 'Chromium',      version: '136.0.7103.113' },
+                            { brand: 'Google Chrome', version: '136.0.7103.113' },
+                            { brand: 'Not_A Brand',   version: '24.0.0.0' }
+                        ],
+                        mobile:          false,
+                        model:           '',
+                        platform:        'Windows',
+                        platformVersion: '10.0.0',
+                        uaFullVersion:   '136.0.7103.113',
+                        wow64:           false
+                    });
+                },
+                toJSON: function() {
+                    return { brands: _brands, mobile: false, platform: 'Windows' };
+                }
+            };
+            Object.defineProperty(navigator, 'userAgentData', {
+                value: _uaData,
+                writable: false,
+                configurable: true,
+                enumerable: true
+            });
+            diag('navigator.userAgentData stub installed');
+        } else {
+            diag('navigator.userAgentData already present (WebView2)');
+        }
+    } catch(e) { diag('userAgentData stub error: ' + e); }
+
+    // -----------------------------------------------------------------------
+    // 5. navigator.vendor + navigator.platform spoof
+    //    Chrome on Windows reports:  vendor="Google Inc.", platform="Win32".
+    //    WKWebView (macOS) always reports vendor="Apple Computer, Inc." and
+    //    platform="MacIntel" regardless of the spoofed UA string.
+    //    Messenger checks both as secondary browser fingerprints — a mismatch
+    //    causes Chrome detection to fail even when UA + window.chrome +
+    //    navigator.userAgentData are all correct.
+    //    Guard: no-op if the vendor already looks like Google (WebView2/Win).
+    // -----------------------------------------------------------------------
+    try {
+        if (navigator.vendor && navigator.vendor.indexOf('Apple') !== -1) {
+            Object.defineProperty(navigator, 'vendor', {
+                get: function() { return 'Google Inc.'; },
+                configurable: true
+            });
+            diag('navigator.vendor spoofed to Google Inc.');
+        } else {
+            diag('navigator.vendor: ' + navigator.vendor);
+        }
+    } catch(e) { diag('vendor spoof error: ' + e); }
+
+    try {
+        if (navigator.platform && navigator.platform !== 'Win32') {
+            Object.defineProperty(navigator, 'platform', {
+                get: function() { return 'Win32'; },
+                configurable: true
+            });
+            diag('navigator.platform spoofed to Win32');
+        } else {
+            diag('navigator.platform: ' + navigator.platform);
+        }
+    } catch(e) { diag('platform spoof error: ' + e); }
+
+    // -----------------------------------------------------------------------
+    // 5b. RTCRtpSender / RTCRtpReceiver.prototype.createEncodedStreams stub
+    //    The old Chrome Insertable Streams API (pre-W3C) exposed:
+    //      sender.createEncodedStreams() → { readable, writable }
+    //    WKWebView does NOT have this method but DOES implement the newer W3C
+    //    transform property (hasRtpTransform=true in diagnostics).  Messenger
+    //    may check `typeof createEncodedStreams === 'function'` before deciding
+    //    to use e2ee encoding.  Installing a stub that returns a TransformStream
+    //    pair passes that check; the actual e2ee encoding path will use the W3C
+    //    RTCRtpScriptTransform API (available as .transform on WKWebView).
+    //    Guard: no-op if already present (WebView2 / real Chrome have it natively).
+    // -----------------------------------------------------------------------
+    try {
+        if (typeof RTCRtpSender !== 'undefined' &&
+                typeof RTCRtpSender.prototype.createEncodedStreams !== 'function') {
+            RTCRtpSender.prototype.createEncodedStreams = function() {
+                var ts = new TransformStream();
+                return { readable: ts.readable, writable: ts.writable };
+            };
+            diag('RTCRtpSender.prototype.createEncodedStreams stub installed');
+        } else if (typeof RTCRtpSender !== 'undefined') {
+            diag('RTCRtpSender.prototype.createEncodedStreams already present');
+        } else {
+            diag('RTCRtpSender MISSING');
+        }
+    } catch(e) { diag('createEncodedStreams sender stub error: ' + e); }
+
+    try {
+        if (typeof RTCRtpReceiver !== 'undefined' &&
+                typeof RTCRtpReceiver.prototype.createEncodedStreams !== 'function') {
+            RTCRtpReceiver.prototype.createEncodedStreams = function() {
+                var ts = new TransformStream();
+                return { readable: ts.readable, writable: ts.writable };
+            };
+            diag('RTCRtpReceiver.prototype.createEncodedStreams stub installed');
+        } else if (typeof RTCRtpReceiver !== 'undefined') {
+            diag('RTCRtpReceiver.prototype.createEncodedStreams already present');
+        } else {
+            diag('RTCRtpReceiver MISSING');
+        }
+    } catch(e) { diag('createEncodedStreams receiver stub error: ' + e); }
+
+    // -----------------------------------------------------------------------
+    // 6. Diagnostic snapshot — logged once IPC is ready (100 ms delay covers
     //    the document-start → first tick window).
     // -----------------------------------------------------------------------
     setTimeout(function() {
@@ -1790,7 +1922,16 @@ const CALL_COMPAT_SCRIPT: &str = r#"(function() {
                 hasRTC:      (typeof window.RTCPeerConnection),
                 hasMediaDevices: !!(navigator.mediaDevices),
                 hasGUM:      !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
-                secureCxt:   (typeof window.isSecureContext !== 'undefined' ? window.isSecureContext : 'n/a')
+                hasUAData:   !!(navigator.userAgentData),
+                uaBrands:    navigator.userAgentData
+                                 ? navigator.userAgentData.brands.map(function(b){return b.brand+'/'+b.version;}).join(',')
+                                 : 'none',
+                navVendor:   navigator.vendor,
+                navPlatform: navigator.platform,
+                hasEncodedStreams: typeof RTCRtpSender !== 'undefined' && typeof RTCRtpSender.prototype.createEncodedStreams === 'function',
+                hasRtpTransform:  typeof RTCRtpSender !== 'undefined' && 'transform' in RTCRtpSender.prototype,
+                secureCxt:   (typeof window.isSecureContext !== 'undefined' ? window.isSecureContext : 'n/a'),
+                hasCryptoSubtle: !!(window.crypto && window.crypto.subtle)
             };
             diag('snapshot ' + JSON.stringify(snap));
         } catch(e) { diag('snapshot error: ' + e); }
@@ -1869,7 +2010,8 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
     var _originalOpen = window.open;
     window.open = function(url, target, features) {
         var urlStr = url ? String(url) : '';
-        jlog('window.open intercepted: url=' + urlStr + ' target=' + target);
+        var featStr = features ? String(features) : '';
+        jlog('window.open intercepted: url=' + urlStr + ' target=' + (target||'') + ' features=' + featStr);
 
         if (urlStr && (urlStr.startsWith('http://') || urlStr.startsWith('https://'))) {
             // Check for the Facebook/Messenger link shim BEFORE isAllowedUrl,
@@ -1887,7 +2029,71 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
                 return null;
             }
         }
-        return _originalOpen.call(this, url, target, features);
+
+        var result = _originalOpen.call(this, url, target, features);
+        jlog('window.open result: ' + (result ? 'WindowProxy' : 'null'));
+
+        // WKWebView does not call createWebViewWith for blank-URL opens so
+        // _originalOpen returns null.  Messenger uses window.open('','') or
+        // window.open('about:blank','') to get a window handle synchronously,
+        // then navigates it via popup.location.href once call signalling
+        // completes.  Install a Proxy that intercepts that navigation and
+        // delegates to the open_popup IPC command so Rust creates a proper
+        // Tauri window.
+        var isBlankOpen = result === null && (!urlStr || urlStr === 'about:blank');
+        if (isBlankOpen) {
+            jlog('[CallPopup] blank window.open returned null — installing popup proxy');
+            var proxyNavigated = false;
+            function navigatePopup(dest) {
+                if (proxyNavigated || !dest || typeof dest !== 'string') return;
+                // Resolve relative URLs (e.g. /groupcall/ROOM:/?...) against
+                // the current page origin so they become absolute https:// URLs.
+                try { dest = new URL(dest, window.location.href).toString(); } catch(e) {}
+                if (!dest.startsWith('http://') && !dest.startsWith('https://')) return;
+                proxyNavigated = true;
+                jlog('[CallPopup] popup proxy navigating to: ' + dest);
+                try {
+                    window.__TAURI__.core.invoke('open_popup', { url: dest });
+                } catch(e) {
+                    jlog('[CallPopup] open_popup IPC failed: ' + e);
+                }
+            }
+            var locationProxy = new Proxy({}, {
+                get: function(obj, prop) {
+                    if (prop === 'assign')  return function(u) { navigatePopup(String(u)); };
+                    if (prop === 'replace') return function(u) { navigatePopup(String(u)); };
+                    if (prop === 'href')    return obj.href || '';
+                    return obj[prop];
+                },
+                set: function(obj, prop, value) {
+                    jlog('[CallPopup] location.' + String(prop) + ' = ' + String(value));
+                    if (prop === 'href') navigatePopup(String(value));
+                    obj[prop] = value;
+                    return true;
+                }
+            });
+            return new Proxy({}, {
+                get: function(obj, prop) {
+                    if (prop === 'location')    return locationProxy;
+                    if (prop === 'closed')      return false;
+                    if (prop === 'close')       return function() { jlog('[CallPopup] popup proxy close()'); };
+                    if (prop === 'focus')       return function() {};
+                    if (prop === 'postMessage') return function(msg) { jlog('[CallPopup] postMessage: ' + JSON.stringify(msg)); };
+                    return obj[prop];
+                },
+                set: function(obj, prop, value) {
+                    jlog('[CallPopup] popup proxy set: ' + String(prop));
+                    if (prop === 'location') {
+                        if (typeof value === 'string') navigatePopup(value);
+                        else if (value && typeof value.href === 'string') navigatePopup(value.href);
+                    }
+                    obj[prop] = value;
+                    return true;
+                }
+            });
+        }
+
+        return result;
     };
 
     // -----------------------------------------------------------------------
@@ -3207,6 +3413,7 @@ pub fn run() {
             commands::get_window_focused,
             commands::pick_save_path,
             commands::write_file_bytes,
+            commands::open_popup,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4256,6 +4463,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     url.as_str()
                 );
 
+                // Clone the app handle so the nested on_new_window handler
+                // (call UI popup opened from within the participant-selection
+                // popup) can also create a Tauri window.
+                let nested_app = popup_app_handle.clone();
+
                 // Use the URL directly so the new window loads the call page.
                 let target_url = tauri::WebviewUrl::External(url.clone());
                 let builder = tauri::WebviewWindowBuilder::new(
@@ -4269,9 +4481,78 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 .title("Messenger X")
                 .inner_size(960.0, 640.0)
                 .resizable(true)
+                // Must match the main window UA — Messenger checks the UA
+                // string on the call page and blocks non-Chrome browsers.
+                // E2EE calls open on facebook.com via this path (non-blank
+                // window.open), so this is critical for e2ee call support.
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+                // Inject browser-compat shims so the call page has access to
+                // window.chrome, RTCPeerConnection, navigator.mediaDevices and
+                // the permissions.query override that returns 'granted'.
+                .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
+                .initialization_script(CALL_COMPAT_SCRIPT)
                 // Keep the title bar in sync with what the page reports.
                 .on_document_title_changed(|window, title| {
                     let _ = window.set_title(&title);
+                })
+                // Handle nested window.open() calls from within this popup.
+                // Messenger's participant-selection dialog opens the actual
+                // call UI as a second popup via window.open(); without this
+                // handler WKWebView/WebKitGTK silently drops it.
+                .on_new_window(move |nested_url, nested_features| {
+                    let host = nested_url.host_str().unwrap_or("");
+                    let allowed = host == "messenger.com"
+                        || host.ends_with(".messenger.com")
+                        || host == "facebook.com"
+                        || host.ends_with(".facebook.com")
+                        || host == "fbcdn.net"
+                        || host.ends_with(".fbcdn.net");
+
+                    if !allowed {
+                        log::info!(
+                            "[MessengerX][Popup][Nested] Denied non-FB url={}",
+                            nested_url.as_str()
+                        );
+                        return tauri::webview::NewWindowResponse::Deny;
+                    }
+
+                    let nested_label = format!(
+                        "popup-{}",
+                        POPUP_WINDOW_COUNTER
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    );
+                    log::info!(
+                        "[MessengerX][Popup][Nested] Opening call window label={nested_label} url={}",
+                        nested_url.as_str()
+                    );
+
+                    let nested_target =
+                        tauri::WebviewUrl::External(nested_url.clone());
+                    let nested_builder = tauri::WebviewWindowBuilder::new(
+                        &nested_app,
+                        &nested_label,
+                        nested_target,
+                    )
+                    .window_features(nested_features)
+                    .title("Messenger X — Call")
+                    .inner_size(960.0, 640.0)
+                    .resizable(true)
+                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+                    .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
+                    .initialization_script(CALL_COMPAT_SCRIPT)
+                    .on_document_title_changed(|w, t| {
+                        let _ = w.set_title(&t);
+                    });
+
+                    match nested_builder.build() {
+                        Ok(w) => tauri::webview::NewWindowResponse::Create { window: w },
+                        Err(e) => {
+                            log::warn!(
+                                "[MessengerX][Popup][Nested] Failed to build call window label={nested_label}: {e}"
+                            );
+                            tauri::webview::NewWindowResponse::Deny
+                        }
+                    }
                 });
 
                 match builder.build() {
