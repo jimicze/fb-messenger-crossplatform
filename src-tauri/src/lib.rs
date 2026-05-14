@@ -10,6 +10,12 @@ mod services;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+/// Monotonically increasing counter used to generate unique window labels for
+/// popup windows spawned via `window.open()` (e.g. Messenger video/audio call
+/// UI).  Wraps at `u32::MAX` but that is effectively unreachable in practice.
+static POPUP_WINDOW_COUNTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 // ---------------------------------------------------------------------------
 // JavaScript injection scripts
 // ---------------------------------------------------------------------------
@@ -3338,6 +3344,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Pre-clone the app handle for the download-completion notification.
     // `nav_app_handle` is moved into the `on_navigation` closure below.
     let dl_app_handle = nav_app_handle.clone();
+    // Pre-clone for the `on_new_window` popup handler.
+    let popup_app_handle = nav_app_handle.clone();
 
     let webview = builder
         // Spoof a desktop Chrome UA so Messenger serves its full web-app.
@@ -4031,7 +4039,91 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         true
                     }
-                    _ => true,
+                _ => true,
+            }
+        }
+        })
+        // ------------------------------------------------------------------
+        // on_new_window — allow Messenger/Facebook popup windows (e.g. video
+        // and audio call UI) to open as native Tauri windows.
+        //
+        // Background: WRY does not install a `createWebViewWith` UI delegate by
+        // default, so any `window.open()` call that survives the JS
+        // WINDOW_OPEN_OVERRIDE_SCRIPT and reaches the native layer is silently
+        // dropped on WKWebView.  For Messenger call UI the site opens the call
+        // widget in a popup on messenger.com / facebook.com — which our JS
+        // override correctly allows through to `_originalOpen`.  Without this
+        // handler those calls are lost and no video/audio call window appears.
+        //
+        // Security: only messenger.com / facebook.com / fbcdn.net URLs are
+        // allowed.  Anything else is denied here; the JS override already
+        // routes external URLs to the system browser before they even reach
+        // this native handler.
+        //
+        // Cross-platform notes:
+        //   macOS  — `.window_features(features)` propagates the parent's
+        //            `WKWebViewConfiguration`, which shares the session store
+        //            (cookies + storage) so the popup is authenticated.
+        //   Linux  — `.window_features(features)` sets `related_view` so the
+        //            new WebKitGTK WebView shares the same WebContext.
+        //   Windows — `.window_features(features)` ties the popup to the same
+        //            WebView2 environment (shared cookies / session).
+        // ------------------------------------------------------------------
+        .on_new_window({
+            move |url, features| {
+                let host = url.host_str().unwrap_or("");
+                let allowed = host == "messenger.com"
+                    || host.ends_with(".messenger.com")
+                    || host == "facebook.com"
+                    || host.ends_with(".facebook.com")
+                    || host == "fbcdn.net"
+                    || host.ends_with(".fbcdn.net");
+
+                if !allowed {
+                    log::info!(
+                        "[MessengerX][Popup] Denied popup for non-FB url={}",
+                        url.as_str()
+                    );
+                    return tauri::webview::NewWindowResponse::Deny;
+                }
+
+                let label = format!(
+                    "popup-{}",
+                    POPUP_WINDOW_COUNTER
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+
+                log::info!(
+                    "[MessengerX][Popup] Opening popup label={label} url={}",
+                    url.as_str()
+                );
+
+                // Use the URL directly so the new window loads the call page.
+                let target_url = tauri::WebviewUrl::External(url.clone());
+                let builder = tauri::WebviewWindowBuilder::new(
+                    &popup_app_handle,
+                    &label,
+                    target_url,
+                )
+                // Propagates parent's WKWebViewConfiguration / WebContext /
+                // WebView2 environment so cookies and session are shared.
+                .window_features(features)
+                .title("Messenger X")
+                .inner_size(960.0, 640.0)
+                .resizable(true)
+                // Keep the title bar in sync with what the page reports.
+                .on_document_title_changed(|window, title| {
+                    let _ = window.set_title(&title);
+                });
+
+                match builder.build() {
+                    Ok(window) => tauri::webview::NewWindowResponse::Create { window },
+                    Err(e) => {
+                        log::warn!(
+                            "[MessengerX][Popup] Failed to build popup window label={label}: {e}"
+                        );
+                        tauri::webview::NewWindowResponse::Deny
+                    }
                 }
             }
         })

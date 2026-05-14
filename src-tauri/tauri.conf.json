@@ -40,7 +40,9 @@
           "libgtk-3-0",
           "libayatana-appindicator3-1",
           "gstreamer1.0-plugins-base",
-          "gstreamer1.0-plugins-good"
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-plugins-bad",
+          "gstreamer1.0-libav"
         ],
         "section": "web",
         "priority": "optional",
