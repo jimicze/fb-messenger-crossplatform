@@ -1939,6 +1939,91 @@ pub(crate) const CALL_COMPAT_SCRIPT: &str = r#"(function() {
 })();
 "#;
 
+/// Force-enables call/video buttons that Messenger renders as
+/// `aria-disabled="true"` when it believes the browser does not support
+/// calls.  Our `CALL_COMPAT_SCRIPT` installs all required stubs before
+/// React mounts, so Messenger's capability checks should pass natively.
+/// This script is a second layer of defence: if a button is still
+/// rendered as disabled (e.g. because of a timing gap or an un-stubbed
+/// check), a `MutationObserver` immediately re-enables it.
+///
+/// Matches buttons whose `aria-label` / `title` / `data-tooltip` contains
+/// call/video keywords in Czech, English and several other locales.
+///
+/// Injected **at document-start** into both the main window and all call
+/// popup windows.
+pub(crate) const CALL_BUTTON_UNLOCK_SCRIPT: &str = r#"(function() {
+    var CALL_KEYS = [
+        // Czech
+        'hovor','vol\u00e1n\u00ed','video',
+        // English
+        'call','audio','voice',
+        // German / French / Spanish / Italian / Portuguese / Polish
+        'anruf','appel','llamada','chiamata','chamada','po\u0142\u0105czenie',
+        // Generic fallbacks
+        'phone','mic','microphone','camera'
+    ];
+
+    function matchesCall(el) {
+        var t = (
+            el.getAttribute('aria-label') ||
+            el.getAttribute('title') ||
+            el.getAttribute('data-tooltip') ||
+            el.getAttribute('data-testid') || ''
+        ).toLowerCase();
+        for (var i = 0; i < CALL_KEYS.length; i++) {
+            if (t.indexOf(CALL_KEYS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    function unlock(el) {
+        if (el.getAttribute('aria-disabled') !== 'true' && !el.disabled) return;
+        el.setAttribute('aria-disabled', 'false');
+        el.removeAttribute('disabled');
+        if (el.getAttribute('tabindex') === '-1') el.setAttribute('tabindex', '0');
+        el.style.pointerEvents = 'auto';
+        el.style.cursor = 'pointer';
+        try {
+            window.__TAURI__.core.invoke('js_log', {
+                message: '[CallUnlock] unlocked: ' + (el.getAttribute('aria-label') || el.tagName)
+            });
+        } catch(_) {}
+    }
+
+    function scan() {
+        var sel = '[role="button"][aria-disabled="true"], button[disabled], button[aria-disabled="true"]';
+        document.querySelectorAll(sel).forEach(function(el) {
+            if (matchesCall(el)) unlock(el);
+        });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', scan);
+    } else {
+        scan();
+    }
+
+    function startObs() {
+        if (!document.body) { setTimeout(startObs, 50); return; }
+        new MutationObserver(function(muts) {
+            for (var i = 0; i < muts.length; i++) {
+                var m = muts[i];
+                if (m.type === 'childList' && m.addedNodes.length > 0) { scan(); return; }
+                if (m.type === 'attributes' && m.attributeName === 'aria-disabled') {
+                    if (matchesCall(m.target)) unlock(m.target);
+                    return;
+                }
+            }
+        }).observe(document.body, {
+            childList: true, subtree: true,
+            attributes: true, attributeFilter: ['aria-disabled', 'disabled']
+        });
+    }
+    startObs();
+})();
+"#;
+
 /// Overrides `window.open()` to intercept external links that Messenger opens
 /// in a new tab/window.  Messenger is a React SPA that calls `window.open()`
 /// for external URLs rather than navigating the main frame, so the Tauri
@@ -3671,6 +3756,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(&scrollbar_fix_script)
         .initialization_script(&appearance_script)
         .initialization_script(CALL_COMPAT_SCRIPT)
+        .initialization_script(CALL_BUTTON_UNLOCK_SCRIPT)
         .initialization_script(WINDOW_OPEN_OVERRIDE_SCRIPT);
 
     // On Linux, inject the Visibility API shim so that Rust can push the real
@@ -4491,6 +4577,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // the permissions.query override that returns 'granted'.
                 .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
                 .initialization_script(CALL_COMPAT_SCRIPT)
+                .initialization_script(CALL_BUTTON_UNLOCK_SCRIPT)
                 // Keep the title bar in sync with what the page reports.
                 .on_document_title_changed(|window, title| {
                     let _ = window.set_title(&title);
@@ -4540,6 +4627,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
                     .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
                     .initialization_script(CALL_COMPAT_SCRIPT)
+                    .initialization_script(CALL_BUTTON_UNLOCK_SCRIPT)
                     .on_document_title_changed(|w, t| {
                         let _ = w.set_title(&t);
                     });
