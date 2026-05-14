@@ -1681,56 +1681,120 @@ fn is_safe_messenger_startup_url(value: &str) -> bool {
 /// already Chromium and has `window.chrome`, so the guard `if (!window.chrome)`
 /// makes the injection a no-op there.
 const CALL_COMPAT_SCRIPT: &str = r#"(function() {
+    // Helper: forward a message to the Rust log file.
+    // Retries once after 2 s in case Tauri IPC is not yet ready at document-start.
+    function diag(msg) {
+        function send() {
+            try { window.__TAURI__.core.invoke('js_log', { message: '[CallCompat] ' + msg }); } catch(_) {}
+        }
+        send();
+        setTimeout(send, 2000);
+    }
+
     // -----------------------------------------------------------------------
     // 1. window.chrome stub
-    //    Real Chrome exposes window.chrome with at minimum a runtime/app object.
-    //    Messenger uses `'chrome' in window` or `!!window.chrome` to gate the
-    //    call capability check on Chromium-based browsers.  We provide a minimal
-    //    stub so the check passes on WebKit-based WebViews.
-    //    Guard: skip if already present (WebView2 on Windows).
+    //    Messenger uses `'chrome' in window` (or `!!window.chrome`) to confirm
+    //    the browser is Chromium-based.  WKWebView (macOS) and WebKitGTK (Linux)
+    //    do not expose this object.  Provide a minimal stub that satisfies the
+    //    most common checks without breaking anything.
+    //    Guard: no-op on WebView2 (Windows) where window.chrome already exists.
     // -----------------------------------------------------------------------
     try {
         if (!window.chrome) {
             window.chrome = {
-                runtime: {},
-                app: { isInstalled: false }
+                runtime: {
+                    // No-op stub; Messenger may check typeof sendMessage.
+                    sendMessage: function() {},
+                    onMessage: { addListener: function() {}, removeListener: function() {} },
+                    id: undefined
+                },
+                app: {
+                    isInstalled: false,
+                    InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                    RunningState:  { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+                },
+                loadTimes: function() { return {}; },
+                csi: function() { return {}; }
             };
+            diag('window.chrome stub installed');
+        } else {
+            diag('window.chrome already present (WebView2)');
         }
-    } catch(e) {}
+    } catch(e) { diag('chrome stub error: ' + e); }
 
     // -----------------------------------------------------------------------
-    // 2. navigator.mediaDevices shim
+    // 2. RTCPeerConnection — unprefixed alias
+    //    Older WebKit versions (some WebKitGTK builds) ship RTCPeerConnection
+    //    under the `webkit` prefix only.  Messenger checks `window.RTCPeerConnection`
+    //    directly; if it is undefined the call feature is disabled.
+    // -----------------------------------------------------------------------
+    try {
+        if (typeof window.RTCPeerConnection === 'undefined') {
+            if (typeof window.webkitRTCPeerConnection !== 'undefined') {
+                window.RTCPeerConnection  = window.webkitRTCPeerConnection;
+                window.RTCIceCandidate    = window.webkitRTCIceCandidate    || window.RTCIceCandidate;
+                window.RTCSessionDescription = window.webkitRTCSessionDescription || window.RTCSessionDescription;
+                diag('RTCPeerConnection alias from webkitRTCPeerConnection');
+            } else {
+                diag('RTCPeerConnection MISSING — WebRTC likely not compiled in this WebKit build');
+            }
+        } else {
+            diag('RTCPeerConnection present');
+        }
+    } catch(e) { diag('RTCPeerConnection alias error: ' + e); }
+
+    // -----------------------------------------------------------------------
+    // 3. navigator.mediaDevices shim
     //    On older WebKit, mediaDevices can be undefined even in a secure context.
     //    Provide a shim that delegates getUserMedia to the legacy
-    //    navigator.getUserMedia / webkitGetUserMedia API so that Messenger's
-    //    feature detection (`navigator.mediaDevices && navigator.mediaDevices
-    //    .getUserMedia`) evaluates to truthy.
-    //    Guard: skip if already present (any modern WebKit / Chromium).
+    //    navigator.getUserMedia / webkitGetUserMedia API.
+    //    Guard: skip if already present.
     // -----------------------------------------------------------------------
     try {
         if (!navigator.mediaDevices) {
             Object.defineProperty(navigator, 'mediaDevices', {
                 value: {
                     getUserMedia: function(constraints) {
-                        var gUM = (navigator.getUserMedia ||
-                                   navigator.webkitGetUserMedia ||
-                                   navigator.mozGetUserMedia ||
-                                   navigator.msGetUserMedia);
+                        var gUM = navigator.getUserMedia ||
+                                  navigator.webkitGetUserMedia ||
+                                  navigator.mozGetUserMedia;
                         if (!gUM) {
-                            return Promise.reject(new Error('getUserMedia not available'));
+                            return Promise.reject(new DOMException('getUserMedia not available', 'NotSupportedError'));
                         }
                         return new Promise(function(resolve, reject) {
                             gUM.call(navigator, constraints, resolve, reject);
                         });
                     },
-                    enumerateDevices: function() {
-                        return Promise.resolve([]);
-                    }
+                    enumerateDevices: function() { return Promise.resolve([]); },
+                    getSupportedConstraints: function() { return {}; }
                 },
                 writable: false, configurable: true
             });
+            diag('navigator.mediaDevices shim installed');
+        } else {
+            diag('navigator.mediaDevices present');
         }
-    } catch(e) {}
+    } catch(e) { diag('mediaDevices shim error: ' + e); }
+
+    // -----------------------------------------------------------------------
+    // 4. Diagnostic snapshot — logged once IPC is ready (100 ms delay covers
+    //    the document-start → first tick window).
+    // -----------------------------------------------------------------------
+    setTimeout(function() {
+        try {
+            var snap = {
+                ua:          navigator.userAgent.substring(0, 120),
+                hasChrome:   ('chrome' in window),
+                hasWebkit:   ('webkit' in window),
+                webkitMH:    !!(window.webkit && window.webkit.messageHandlers),
+                hasRTC:      (typeof window.RTCPeerConnection),
+                hasMediaDevices: !!(navigator.mediaDevices),
+                hasGUM:      !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+                secureCxt:   (typeof window.isSecureContext !== 'undefined' ? window.isSecureContext : 'n/a')
+            };
+            diag('snapshot ' + JSON.stringify(snap));
+        } catch(e) { diag('snapshot error: ' + e); }
+    }, 100);
 })();
 "#;
 
