@@ -922,6 +922,106 @@ pub fn open_external(url: String, app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// IPC command — create a Messenger call popup window.
+///
+/// WKWebView (macOS) does not invoke `createWebViewWith` for blank-URL
+/// `window.open('', '')` calls — those return `null`.  Messenger uses that
+/// pattern to acquire a window handle synchronously, then navigates it to
+/// the call URL via `popup.location.href = callUrl`.  The JS proxy in
+/// `WINDOW_OPEN_OVERRIDE_SCRIPT` intercepts that assignment and delegates
+/// here so Rust can create a proper Tauri window with browser-compat shims.
+#[tauri::command]
+pub fn open_popup(url: String, app: AppHandle) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let parsed_url = url::Url::parse(&url).map_err(|e| format!("Invalid URL: {e}"))?;
+    let host = parsed_url.host_str().unwrap_or("");
+    let allowed = host == "messenger.com"
+        || host.ends_with(".messenger.com")
+        || host == "facebook.com"
+        || host.ends_with(".facebook.com")
+        || host == "fbcdn.net"
+        || host.ends_with(".fbcdn.net");
+
+    if !allowed {
+        log::warn!("[MessengerX][Popup][IPC] Denied non-FB url={url}");
+        return Err(format!("URL not allowed: {url}"));
+    }
+
+    let label = format!(
+        "popup-{}",
+        crate::POPUP_WINDOW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+
+    log::info!("[MessengerX][Popup][IPC] Creating call popup label={label} url={url}");
+
+    let target_url = WebviewUrl::External(parsed_url);
+    let nested_app = app.clone();
+
+    let builder = WebviewWindowBuilder::new(&app, &label, target_url)
+        .title("Messenger X — Call")
+        .inner_size(960.0, 640.0)
+        .resizable(true)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+        .initialization_script(crate::NOTIFICATION_OVERRIDE_SCRIPT)
+        .initialization_script(crate::CALL_COMPAT_SCRIPT)
+        .on_document_title_changed(|w, t| {
+            let _ = w.set_title(&t);
+        })
+        // Handle further window.open() calls from within the call window.
+        .on_new_window(move |nested_url, nested_features| {
+            let h = nested_url.host_str().unwrap_or("");
+            let ok = h == "messenger.com"
+                || h.ends_with(".messenger.com")
+                || h == "facebook.com"
+                || h.ends_with(".facebook.com")
+                || h == "fbcdn.net"
+                || h.ends_with(".fbcdn.net");
+            if !ok {
+                log::info!(
+                    "[MessengerX][Popup][IPC][Nested] Denied non-FB url={}",
+                    nested_url.as_str()
+                );
+                return tauri::webview::NewWindowResponse::Deny;
+            }
+            let nested_label = format!(
+                "popup-{}",
+                crate::POPUP_WINDOW_COUNTER
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            log::info!(
+                "[MessengerX][Popup][IPC][Nested] Opening label={nested_label} url={}",
+                nested_url.as_str()
+            );
+            let nested_target = WebviewUrl::External(nested_url);
+            let b = WebviewWindowBuilder::new(&nested_app, &nested_label, nested_target)
+                .window_features(nested_features)
+                .title("Messenger X — Call")
+                .inner_size(960.0, 640.0)
+                .resizable(true)
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+                .initialization_script(crate::NOTIFICATION_OVERRIDE_SCRIPT)
+                .initialization_script(crate::CALL_COMPAT_SCRIPT)
+                .on_document_title_changed(|w, t| {
+                    let _ = w.set_title(&t);
+                });
+            match b.build() {
+                Ok(w) => tauri::webview::NewWindowResponse::Create { window: w },
+                Err(e) => {
+                    log::warn!(
+                        "[MessengerX][Popup][IPC][Nested] Failed to build: {e}"
+                    );
+                    tauri::webview::NewWindowResponse::Deny
+                }
+            }
+        });
+
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to create popup: {e}"))
+}
+
 /// Set and persist the webview zoom level.
 ///
 /// The level is clamped to [0.6, 1.2].  The new level is saved to settings and
