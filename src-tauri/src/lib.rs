@@ -258,14 +258,27 @@ const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
     //    if the result is not 'granted' it skips the entire notification path.
     //    We intercept the call and return a fake PermissionStatus that always
     //    reports 'granted', so Messenger proceeds to fire new Notification().
+    //
+    //    Also intercepts 'microphone' and 'camera' — Messenger checks these
+    //    before enabling 1:1 voice/video call UI.  On WKWebView / WebKitGTK
+    //    without a prior user grant the Permissions API returns 'prompt' (or
+    //    throws on older WebKit versions).  Messenger interprets anything other
+    //    than 'granted' as "browser does not support calls" and shows the
+    //    "Calls not supported on this browser" banner.
+    //
+    //    Returning 'granted' here does NOT bypass the OS permission dialog —
+    //    getUserMedia() still triggers the system camera/mic prompt on first
+    //    use.  We are only signalling to Messenger that the browser is capable
+    //    so it enables the call UI rather than hiding it.
     // -----------------------------------------------------------------------
     try {
         if (navigator.permissions && typeof navigator.permissions.query === 'function') {
             var _origPermsQuery = navigator.permissions.query.bind(navigator.permissions);
             navigator.permissions.query = function(descriptor) {
-                if (descriptor && descriptor.name === 'notifications') {
+                var name = descriptor && descriptor.name;
+                if (name === 'notifications' || name === 'microphone' || name === 'camera') {
                     if (window === window.top) {
-                        jlog('permissions.query({notifications}) intercepted -> returning granted');
+                        jlog('permissions.query({' + name + '}) intercepted -> returning granted');
                     }
                     return Promise.resolve({
                         state: 'granted',
@@ -1640,6 +1653,86 @@ fn is_safe_messenger_startup_url(value: &str) -> bool {
     let path = parsed.path();
     path.starts_with("/t/")
 }
+
+/// Browser compatibility shims that make Messenger treat the embedded WebView
+/// as a fully capable Chrome instance for audio and video calls.
+///
+/// **Problem 1 — `window.chrome` missing on WKWebView / WebKitGTK:**
+/// We spoof a Chrome user-agent string so Messenger serves its full web-app.
+/// However, on non-Chromium WebViews (macOS WKWebView, Linux WebKitGTK) the
+/// `window.chrome` object that real Chrome exposes is absent.  Messenger (and
+/// other React apps) detect this to decide whether to enable the WebRTC call
+/// UI.  Without the stub, 1-to-1 voice/video call buttons remain disabled even
+/// though the WebView supports WebRTC.
+///
+/// **Problem 2 — `navigator.mediaDevices` availability:**
+/// Some older WebKit versions expose `navigator.mediaDevices` as `undefined`
+/// (it requires a secure context AND the browser to have opted into media
+/// devices support).  We expose a thin `getUserMedia` shim that delegates to
+/// `webkitGetUserMedia` (still present on older WebKit) as a fallback so that
+/// Messenger's capability detection does not give up prematurely.
+///
+/// Note: The `navigator.permissions.query` hook in `NOTIFICATION_OVERRIDE_SCRIPT`
+/// already returns `'granted'` for `'microphone'` and `'camera'` — that is the
+/// primary signal Messenger checks.  This script provides a second layer for
+/// platforms / versions where the property existence check fires first.
+///
+/// Injected **at document-start** on all platforms.  WebView2 (Windows) is
+/// already Chromium and has `window.chrome`, so the guard `if (!window.chrome)`
+/// makes the injection a no-op there.
+const CALL_COMPAT_SCRIPT: &str = r#"(function() {
+    // -----------------------------------------------------------------------
+    // 1. window.chrome stub
+    //    Real Chrome exposes window.chrome with at minimum a runtime/app object.
+    //    Messenger uses `'chrome' in window` or `!!window.chrome` to gate the
+    //    call capability check on Chromium-based browsers.  We provide a minimal
+    //    stub so the check passes on WebKit-based WebViews.
+    //    Guard: skip if already present (WebView2 on Windows).
+    // -----------------------------------------------------------------------
+    try {
+        if (!window.chrome) {
+            window.chrome = {
+                runtime: {},
+                app: { isInstalled: false }
+            };
+        }
+    } catch(e) {}
+
+    // -----------------------------------------------------------------------
+    // 2. navigator.mediaDevices shim
+    //    On older WebKit, mediaDevices can be undefined even in a secure context.
+    //    Provide a shim that delegates getUserMedia to the legacy
+    //    navigator.getUserMedia / webkitGetUserMedia API so that Messenger's
+    //    feature detection (`navigator.mediaDevices && navigator.mediaDevices
+    //    .getUserMedia`) evaluates to truthy.
+    //    Guard: skip if already present (any modern WebKit / Chromium).
+    // -----------------------------------------------------------------------
+    try {
+        if (!navigator.mediaDevices) {
+            Object.defineProperty(navigator, 'mediaDevices', {
+                value: {
+                    getUserMedia: function(constraints) {
+                        var gUM = (navigator.getUserMedia ||
+                                   navigator.webkitGetUserMedia ||
+                                   navigator.mozGetUserMedia ||
+                                   navigator.msGetUserMedia);
+                        if (!gUM) {
+                            return Promise.reject(new Error('getUserMedia not available'));
+                        }
+                        return new Promise(function(resolve, reject) {
+                            gUM.call(navigator, constraints, resolve, reject);
+                        });
+                    },
+                    enumerateDevices: function() {
+                        return Promise.resolve([]);
+                    }
+                },
+                writable: false, configurable: true
+            });
+        }
+    } catch(e) {}
+})();
+"#;
 
 /// Overrides `window.open()` to intercept external links that Messenger opens
 /// in a new tab/window.  Messenger is a React SPA that calls `window.open()`
@@ -3306,6 +3399,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(&zoom_init_script)
         .initialization_script(&scrollbar_fix_script)
         .initialization_script(&appearance_script)
+        .initialization_script(CALL_COMPAT_SCRIPT)
         .initialization_script(WINDOW_OPEN_OVERRIDE_SCRIPT);
 
     // On Linux, inject the Visibility API shim so that Rust can push the real
