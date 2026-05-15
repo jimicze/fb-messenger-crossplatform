@@ -723,6 +723,21 @@ jobs:
             exit 0
           }
 
+          # Sync the fork (jimicze/winget-pkgs) with upstream (microsoft/winget-pkgs)
+          # before calling wingetcreate — otherwise wingetcreate fails with
+          # "The forked repository could not be synced with the upstream commits."
+          try {
+            $syncResult = Invoke-RestMethod -Method POST `
+              -Uri "https://api.github.com/repos/jimicze/winget-pkgs/merge-upstream" `
+              -Headers @{ Authorization = "Bearer $env:WINGET_PAT"; "User-Agent" = "github-actions" } `
+              -Body '{"branch":"master"}' `
+              -ContentType "application/json" `
+              -ErrorAction Stop
+            Write-Host "Fork synced: $($syncResult.merge_type) — $($syncResult.message)"
+          } catch {
+            Write-Host "Fork sync warning (non-fatal): $_"
+          }
+
           # Download wingetcreate
           Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" `
             -OutFile wingetcreate.exe -UseBasicParsing
