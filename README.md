@@ -106,6 +106,7 @@ Pick the right installer for your platform:
 
 - 🌐 **Native WebView Client** — Loads `messenger.com` in a system WebView — no bundled browser engine. Uses your OS's native web renderer for minimal resource usage.
 - 🔔 **Native Notifications** — Web notifications are intercepted and forwarded to your OS notification system. Works with notification centers on all platforms.
+- 📞 **Voice & Video Calls** — Full voice and video call support for direct messages, including end-to-end encrypted (e2ee) calls. Calls open in a native app window powered by WebRTC. Works on macOS, Windows, and Linux.
 - 🔢 **Unread Badge** — Parses the unread count from the page title and displays it on your dock/taskbar icon and system tray tooltip.
 - 🔐 **Persistent Sessions** — Your login session persists across app restarts. Toggle "Stay logged in" in Settings, or log out and wipe all data with one click.
 - 📴 **Offline Mode** — Automatic HTML snapshots every 60 seconds. When you go offline, the app shows cached content with a non-intrusive banner — no blank screens.
@@ -293,7 +294,8 @@ This triggers builds for **6 parallel jobs** (macOS arm64 + x64, Windows x64 + a
 - [x] **i18n** — System language detection, English + Czech localization
 - [x] **Enhanced notifications** — Platform-specific sounds, silent mode, tray click handler
 - [x] **Auto-updates** — Built-in update checker & installer via Tauri updater plugin
-- [ ] Code signing — [SignPath Foundation](https://signpath.org) (Windows) + Apple notarization (macOS)
+- [x] **Voice & video calls** — Native call windows for DMs (voice + video, regular and e2ee)
+- [ ] Code signing — Apple notarization (macOS) + Windows Authenticode
 - [x] **Package managers** — winget (`winget install jimicze.MessengerX`) + Homebrew custom tap (`brew tap jimicze/tap && brew install --cask messenger-x`, not in official homebrew/cask)
 - [ ] Cross-platform testing (Windows, Linux Mint, Fedora, Arch)
 - [ ] Keyboard shortcuts customization

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required so macOS shows the system permission dialog for camera access.
+         Without this key the OS silently denies getUserMedia({video:true}). -->
+    <key>NSCameraUsageDescription</key>
+    <string>Messenger X needs camera access for video calls.</string>
+    <!-- Required so macOS shows the system permission dialog for microphone access.
+         Without this key the OS silently denies getUserMedia({audio:true}). -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Messenger X needs microphone access for audio and video calls.</string>
+</dict>
+</plist>
