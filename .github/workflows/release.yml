@@ -742,13 +742,37 @@ jobs:
           Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" `
             -OutFile wingetcreate.exe -UseBasicParsing
 
-          # wingetcreate update auto-downloads installers, computes SHA256, and opens a PR
+          # Generate manifest to disk (without submitting) so we can patch it first.
+          # wingetcreate carries locale fields (URLs) over from the previous version's
+          # manifest — this means a typo in an old manifest would propagate forever.
+          $manifestDir = ".\winget-manifests"
           .\wingetcreate.exe update jimicze.MessengerX `
             --version $VERSION `
             --urls "$BASE/Messenger.X_${VERSION}_x64-setup.exe" `
                    "$BASE/Messenger.X_${VERSION}_arm64-setup.exe" `
             --token $env:WINGET_PAT `
-            --submit
+            --out $manifestDir
+
+          # Fix typo in repo name that was carried over from the initial v1.3.1 manifest.
+          # Old (typo): fb-messanger-crossplatform
+          # Correct:    fb-messenger-crossplatform
+          $localePath = "$manifestDir\j\jimicze\MessengerX\$VERSION\jimicze.MessengerX.locale.en-US.yaml"
+          if (Test-Path $localePath) {
+            $content = Get-Content $localePath -Raw
+            $fixed   = $content -replace 'fb-messanger-crossplatform', 'fb-messenger-crossplatform'
+            if ($content -ne $fixed) {
+              Set-Content -Path $localePath -Value $fixed -NoNewline
+              Write-Host "Patched typo URL in locale manifest"
+            } else {
+              Write-Host "No typo URL found in locale manifest (already correct)"
+            }
+          } else {
+            Write-Host "WARNING: locale manifest not found at $localePath"
+          }
+
+          # Submit the patched manifest as a PR to microsoft/winget-pkgs
+          .\wingetcreate.exe submit "$manifestDir\j\jimicze\MessengerX\$VERSION" `
+            --token $env:WINGET_PAT
 
           Write-Host "winget manifest submitted for ${VERSION}"
 
