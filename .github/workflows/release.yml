@@ -645,7 +645,7 @@ jobs:
       always() &&
       needs.publish-updater.result == 'success' &&
       needs.create-release.outputs.is-backbuild != 'true' &&
-      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries == true)
+      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries == 'true')
     runs-on: ubuntu-latest
 
     steps:
@@ -705,7 +705,7 @@ jobs:
       always() &&
       needs.publish-updater.result == 'success' &&
       needs.create-release.outputs.is-backbuild != 'true' &&
-      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries == true)
+      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries == 'true')
     runs-on: windows-latest
 
     steps:
