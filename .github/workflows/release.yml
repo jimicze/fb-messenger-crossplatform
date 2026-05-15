@@ -21,6 +21,11 @@ on:
         required: false
         type: string
         default: ''
+      update_registries:
+        description: 'Submit winget + Homebrew updates (auto-enabled for major/minor; use this to force update on a patch release)'
+        required: false
+        type: boolean
+        default: false
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -640,7 +645,7 @@ jobs:
       always() &&
       needs.publish-updater.result == 'success' &&
       needs.create-release.outputs.is-backbuild != 'true' &&
-      endsWith(needs.create-release.outputs.tag-name, '.0')
+      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries == true)
     runs-on: ubuntu-latest
 
     steps:
@@ -700,7 +705,7 @@ jobs:
       always() &&
       needs.publish-updater.result == 'success' &&
       needs.create-release.outputs.is-backbuild != 'true' &&
-      endsWith(needs.create-release.outputs.tag-name, '.0')
+      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries == true)
     runs-on: windows-latest
 
     steps:
