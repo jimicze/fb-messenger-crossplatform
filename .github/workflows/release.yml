@@ -636,7 +636,11 @@ jobs:
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   update-homebrew:
     needs: [create-release, publish-updater]
-    if: always() && needs.publish-updater.result == 'success' && needs.create-release.outputs.is-backbuild != 'true'
+    if: |
+      always() &&
+      needs.publish-updater.result == 'success' &&
+      needs.create-release.outputs.is-backbuild != 'true' &&
+      endsWith(needs.create-release.outputs.tag-name, '.0')
     runs-on: ubuntu-latest
 
     steps:
@@ -692,7 +696,11 @@ jobs:
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   update-winget:
     needs: [create-release, publish-updater]
-    if: always() && needs.publish-updater.result == 'success' && needs.create-release.outputs.is-backbuild != 'true'
+    if: |
+      always() &&
+      needs.publish-updater.result == 'success' &&
+      needs.create-release.outputs.is-backbuild != 'true' &&
+      endsWith(needs.create-release.outputs.tag-name, '.0')
     runs-on: windows-latest
 
     steps:
