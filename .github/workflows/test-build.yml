@@ -37,6 +37,12 @@ jobs:
             rust-targets: 'aarch64-apple-darwin'
             label: 'macOS-arm64'
 
+          # ── macOS Intel ───────────────────────────────────────────────────
+          - platform: 'macos-latest'
+            args: '--target x86_64-apple-darwin'
+            rust-targets: 'x86_64-apple-darwin'
+            label: 'macOS-x64'
+
           # ── Windows x64 ───────────────────────────────────────────────────
           - platform: 'windows-latest'
             args: ''
@@ -54,6 +60,8 @@ jobs:
     steps:
       - name: Checkout branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-tags: true
 
       - name: Install Linux system dependencies
         if: contains(matrix.platform, 'ubuntu')
@@ -75,6 +83,59 @@ jobs:
         with:
           node-version: 'lts/*'
           cache: 'npm'
+
+      # Patch version files to match the latest release tag so debug
+      # artifacts carry a meaningful version instead of the stale value
+      # committed in the source tree.  Mirrors the "Sync source versions
+      # to release tag" step in release.yml (idempotent; safe to re-run).
+      - name: Sync source versions to latest release tag
+        shell: bash
+        run: |
+          git fetch --tags --quiet 2>/dev/null || true
+          # Use grep -m 1 (stop after first match) instead of grep | head -1
+          # to avoid SIGPIPE causing a non-zero exit under pipefail. The || true
+          # guards against grep exiting 1 when no tag matches, ensuring the
+          # empty-tag check below always gets a chance to run.
+          LATEST_TAG=$(git tag --sort=-v:refname \
+            | grep -m 1 -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          if [[ -z "$LATEST_TAG" ]]; then
+            echo "Error: no vX.Y.Z release tag found in repository — cannot determine base version for test build."
+            echo "Create at least one release tag (e.g. v0.1.0) before running the test-build workflow."
+            exit 1
+          fi
+          BASE_VERSION="${LATEST_TAG#v}"
+          # Sanitize branch name for use as a semver pre-release identifier.
+          # Replace non-alphanumeric chars with '-', collapse runs, strip
+          # leading/trailing dashes, then fall back to 'dev' if nothing remains.
+          # If the result starts with a digit, prefix with 'b' — semver allows
+          # numeric pre-release identifiers but forbids leading zeroes (e.g.
+          # branch '01' would produce '1.5.2-01' which Cargo rejects).
+          SAFE_BRANCH=$(echo "${GITHUB_REF_NAME}" \
+            | sed 's/[^a-zA-Z0-9]/-/g' \
+            | sed -E 's/-+/-/g'         \
+            | sed 's/^-//;s/-$//')
+          SAFE_BRANCH="${SAFE_BRANCH:-dev}"
+          [[ "$SAFE_BRANCH" =~ ^[0-9] ]] && SAFE_BRANCH="b${SAFE_BRANCH}"
+          VERSION="${BASE_VERSION}-${SAFE_BRANCH}"
+          echo "Test build version: ${VERSION}  (base: ${BASE_VERSION}, branch: ${GITHUB_REF_NAME})"
+          node -e "
+            const fs = require('fs');
+            const v = '${VERSION}';
+
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = v;
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+
+            const tc = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+            tc.version = v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(tc, null, 2) + '\n');
+
+            let cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+            cargo = cargo.replace(/^version = \"[^\"]*\"/m, 'version = \"' + v + '\"');
+            fs.writeFileSync('src-tauri/Cargo.toml', cargo);
+
+            console.log('All source versions set to ' + v);
+          "
 
       - name: Install Rust stable toolchain (Linux / macOS)
         if: runner.os != 'Windows'
