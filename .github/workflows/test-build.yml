@@ -93,8 +93,16 @@ jobs:
         run: |
           git fetch --tags --quiet 2>/dev/null || true
           LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-          VERSION="${LATEST_TAG#v}"
-          echo "Latest release tag: ${LATEST_TAG} → version ${VERSION}"
+          BASE_VERSION="${LATEST_TAG#v}"
+          # Append sanitized branch name as a semver pre-release identifier so
+          # test artifacts are immediately distinguishable from production builds
+          # (e.g. 1.5.2-fix-release-warnings, 1.5.2-main).
+          SAFE_BRANCH=$(echo "${GITHUB_REF_NAME}" \
+            | sed 's/[^a-zA-Z0-9]/-/g' \
+            | sed 's/-\+/-/g'          \
+            | sed 's/^-//;s/-$//')
+          VERSION="${BASE_VERSION}-${SAFE_BRANCH}"
+          echo "Test build version: ${VERSION}  (base: ${BASE_VERSION}, branch: ${GITHUB_REF_NAME})"
           node -e "
             const fs = require('fs');
             const v = '${VERSION}';
