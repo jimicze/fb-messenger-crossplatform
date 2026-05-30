@@ -493,20 +493,23 @@ fn decide_notification(
                     "zero-bounce-oscillation-suppressed"
                 };
                 // Compute whether the new Notified entry should block future rearms:
-                //   - typing_rearm fire:     set to true  — consumed the one
-                //     allowed rearm for this Notified entry.
-                //   - count_increased fire:  reset to false — genuine new message,
-                //     fresh baseline; allow rearm on the next typing cycle.
-                //   - time_rearm or suppressed: carry forward prev so the
-                //     exhausted flag survives 60-s reminder cycles.  Previously
-                //     time_rearm reset to false, which re-opened the rearm door
-                //     and caused spam during prolonged typing sessions.
-                let new_typing_rearm_exhausted = if typing_rearm {
-                    true // consumed the one allowed rearm for this Notified entry
-                } else if count_increased {
-                    false // genuine new message — allow rearm from fresh baseline
+                //   - should_fire && typing_rearm:    true  — rearm notification actually
+                //     fired; the one allowed slot for this Notified entry is consumed.
+                //   - should_fire && count_increased: false — genuine new message fired;
+                //     allow rearm from a fresh baseline on the next typing cycle.
+                //   - everything else (time_rearm, sig-only, or should_fire=false):
+                //     carry forward prev so the exhausted flag is not touched.
+                //
+                // Guarding behind `should_fire` is critical: `typing_rearm` can be
+                // true while `should_fire` is false (e.g. window focused, notifications
+                // disabled).  Without the guard, the slot would be consumed without a
+                // notification ever reaching the user.
+                let new_typing_rearm_exhausted = if should_fire && typing_rearm {
+                    true // consumed: typing-rearm notification actually fired
+                } else if should_fire && count_increased {
+                    false // genuine new message fired — allow rearm from fresh baseline
                 } else {
-                    prev_typing_rearm_exhausted // time-rearm, sig-change, or suppressed — carry forward
+                    prev_typing_rearm_exhausted // carry forward in all other cases
                 };
                 *state = NotifState::Notified {
                     count,
@@ -1887,6 +1890,36 @@ mod tests {
             !d.should_fire,
             "typing-rearm must stay blocked even after time-rearm-60s fires — time-rearm must not reopen the typing-rearm door"
         );
+    }
+
+    /// If typing_rearm conditions are met but should_fire=false (e.g. window focused),
+    /// the rearm slot must NOT be consumed — it must fire when conditions allow.
+    #[test]
+    fn test_typing_rearm_not_consumed_when_suppressed_by_focus() {
+        // T=100: initial notification fires → Notified{exhausted=false}.
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+
+        // T=106: typing indicator → ZeroPending{prev_exhausted=false}.
+        let _ = decide_notification(&mut state, 0, "", false, true, true, 106);
+
+        // T=112: count returns but window IS focused → typing_rearm conditions met,
+        //        but should_fire=false because is_focused=true.  Slot must NOT be consumed.
+        let d = decide_notification(&mut state, 1, "", true /* focused */, true, false, 112);
+        assert!(!d.should_fire, "focused window suppresses fire");
+
+        // T=118: typing indicator again → ZeroPending.
+        let _ = decide_notification(&mut state, 0, "", false, true, true, 118);
+
+        // T=124: count returns, window no longer focused → rearm must fire
+        //        (slot was not consumed at T=112).
+        let d = decide_notification(&mut state, 1, "", false, true, false, 124);
+        assert!(
+            d.should_fire,
+            "typing-rearm must fire: slot was not consumed when suppressed by focus"
+        );
+        assert_eq!(d.reason, "typing-indicator-rearm");
     }
 
     /// Verify TYPING_REARM_SECS constant is within a sensible range.
