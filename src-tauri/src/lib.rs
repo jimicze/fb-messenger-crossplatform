@@ -6249,9 +6249,10 @@ mod tests {
         #[test]
         fn windows_startup_activation_runs_in_ready_event() {
             assert!(
-                SOURCE.contains("#[cfg(target_os = \"windows\")]")
+                SOURCE.contains("if cfg!(target_os = \"windows\")")
                     && SOURCE.contains("if let tauri::RunEvent::Ready = event"),
-                "Windows startup activation must remain in RunEvent::Ready"
+                "Windows startup activation must remain in RunEvent::Ready, \
+                 guarded by if cfg!(target_os = \"windows\")"
             );
         }
 
