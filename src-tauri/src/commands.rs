@@ -492,22 +492,25 @@ fn decide_notification(
                 } else {
                     "zero-bounce-oscillation-suppressed"
                 };
-                // Compute whether the new Notified entry should block future rearms:
-                //   - should_fire && typing_rearm:    true  — rearm notification actually
-                //     fired; the one allowed slot for this Notified entry is consumed.
-                //   - should_fire && count_increased: false — genuine new message fired;
-                //     allow rearm from a fresh baseline on the next typing cycle.
-                //   - everything else (time_rearm, sig-only, or should_fire=false):
-                //     carry forward prev so the exhausted flag is not touched.
+                // Compute whether the new Notified entry should block future rearms.
+                // Priority mirrors the `reason` chain above (count_increased first):
                 //
-                // Guarding behind `should_fire` is critical: `typing_rearm` can be
-                // true while `should_fire` is false (e.g. window focused, notifications
-                // disabled).  Without the guard, the slot would be consumed without a
-                // notification ever reaching the user.
-                let new_typing_rearm_exhausted = if should_fire && typing_rearm {
+                //   - should_fire && count_increased: false — genuine new message fired;
+                //     reset to allow rearm on the next typing cycle.  Takes priority
+                //     over typing_rearm: if both are true, a real message arrived so
+                //     the exhausted slot must not be consumed.
+                //   - should_fire && typing_rearm:    true  — rearm notification actually
+                //     fired (no count increase); the one allowed slot is consumed.
+                //   - everything else (time_rearm, sig-only, should_fire=false):
+                //     carry forward prev so the flag is not touched.
+                //
+                // Guarding both branches behind `should_fire` is critical: `typing_rearm`
+                // can be true while `should_fire` is false (window focused, notifications
+                // disabled).  Without the guard the slot would be consumed silently.
+                let new_typing_rearm_exhausted = if should_fire && count_increased {
+                    false // genuine new message fired — reset; allow rearm from fresh baseline
+                } else if should_fire && typing_rearm {
                     true // consumed: typing-rearm notification actually fired
-                } else if should_fire && count_increased {
-                    false // genuine new message fired — allow rearm from fresh baseline
                 } else {
                     prev_typing_rearm_exhausted // carry forward in all other cases
                 };
@@ -1918,6 +1921,41 @@ mod tests {
         assert!(
             d.should_fire,
             "typing-rearm must fire: slot was not consumed when suppressed by focus"
+        );
+        assert_eq!(d.reason, "typing-indicator-rearm");
+    }
+
+    /// When count_increased AND typing_rearm are both true (new message arrives
+    /// exactly when the typing-indicator elapsed threshold is met), count_increased
+    /// must take priority: exhausted resets to false so the next typing cycle can rearm.
+    #[test]
+    fn test_count_increased_takes_priority_over_typing_rearm_for_exhausted_flag() {
+        // T=100: initial notification fires → Notified{count=1, exhausted=false}.
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+
+        // T=106: typing indicator → ZeroPending{prev_count=1, prev_exhausted=false,
+        //        zero_from_typing=true, zero_since=106, prev_fired_at=100}.
+        let _ = decide_notification(&mut state, 0, "", false, true, true, 106);
+
+        // T=112: count=2 arrives (new message from same or different sender) while
+        //        typing_rearm conditions are also met (elapsed=12 ≥ 5, !exhausted).
+        //        count_increased=true must win: reason="zero-bounce-count-increased",
+        //        exhausted must reset to false (not be set to true by typing_rearm).
+        let d = decide_notification(&mut state, 2, "", false, true, false, 112);
+        assert!(d.should_fire, "count_increased must fire");
+        assert_eq!(d.reason, "zero-bounce-count-increased");
+
+        // T=118: typing indicator again → ZeroPending.
+        let _ = decide_notification(&mut state, 0, "", false, true, true, 118);
+
+        // T=124: count returns to 2 — exhausted must be false (count_increased reset it),
+        //        so typing-rearm fires.
+        let d = decide_notification(&mut state, 2, "", false, true, false, 124);
+        assert!(
+            d.should_fire,
+            "typing-rearm must be available: count_increased should have reset exhausted=false"
         );
         assert_eq!(d.reason, "typing-indicator-rearm");
     }
