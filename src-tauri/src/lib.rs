@@ -3514,19 +3514,25 @@ pub fn run() {
             // startup foreground workaround after the runtime reports Ready,
             // but only for a window that setup has already decided should be
             // visible.
-            #[cfg(target_os = "windows")]
-            if let tauri::RunEvent::Ready = event {
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    if matches!(window.is_visible(), Ok(true)) {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
+            // Use if cfg!() instead of #[cfg()] so that app_handle is
+            // referenced on all platforms, avoiding an unused-variable warning
+            // on Linux where no cfg-gated block references it.
+            if cfg!(target_os = "windows") {
+                if let tauri::RunEvent::Ready = event {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        if matches!(window.is_visible(), Ok(true)) {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
                     }
                 }
             }
 
             // macOS: clicking the Dock icon while all windows are hidden should
             // bring the main window back (applicationShouldHandleReopen).
+            // Must stay #[cfg()] — RunEvent::Reopen is a macOS-only enum
+            // variant that does not exist on other platforms.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen {
                 has_visible_windows,
