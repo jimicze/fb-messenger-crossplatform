@@ -6248,11 +6248,17 @@ mod tests {
 
         #[test]
         fn windows_startup_activation_runs_in_ready_event() {
+            // Assert a contiguous three-line snippet so the test cannot be
+            // satisfied by other RunEvent::Ready matches (e.g. the diagnostic
+            // log block that runs on all platforms) or by the Windows guard
+            // and Ready match existing independently in unrelated locations.
             assert!(
-                SOURCE.contains("if cfg!(target_os = \"windows\")")
-                    && SOURCE.contains("if let tauri::RunEvent::Ready = event"),
-                "Windows startup activation must remain in RunEvent::Ready, \
-                 guarded by if cfg!(target_os = \"windows\")"
+                SOURCE.contains(
+                    "if cfg!(target_os = \"windows\") {\n                if let tauri::RunEvent::Ready = event {\n                    if let Some(window) = app_handle.get_webview_window(\"main\")"
+                ),
+                "Windows startup activation must remain inside RunEvent::Ready, \
+                 guarded by if cfg!(target_os = \"windows\"), and must call \
+                 app_handle.get_webview_window(\"main\")"
             );
         }
 
