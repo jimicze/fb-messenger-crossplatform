@@ -1885,7 +1885,7 @@ mod tests {
         let d = decide_notification(&mut state, 1, "", false, true, false, 187);
         assert!(
             !d.should_fire,
-            "typing-rearm must stay blocked after time-rearm-60s reset — was spam bug"
+            "typing-rearm must stay blocked even after time-rearm-60s fires — time-rearm must not reopen the typing-rearm door"
         );
     }
 
