@@ -229,6 +229,15 @@ const TYPING_REARM_SECS: u64 = 5;
 /// indefinitely (production spam).  The cap resets on a genuine new message.
 const NOTIF_REARM_SECS: u64 = 60;
 
+/// Master switch for the time-based re-arm (`time_rearm`) feature.
+///
+/// **Temporarily disabled** (`false`) at the user's request: even with the
+/// cap-to-one-fire fix (`time_rearm_exhausted`), the 60-second reminder is
+/// undesirable in practice, so it is turned off completely for now.  The full
+/// `time_rearm` logic (and its regression tests) is left in place so it can be
+/// re-enabled by flipping this flag back to `true`.
+const TIME_REARM_ENABLED: bool = false;
+
 /// Grace period after a window restore-from-minimized during which a notification
 /// is fired even if `is_focused()` returns true.  Cinnamon/Muffin focuses the
 /// window instantly on un-iconify, so without this gate the user would see
@@ -407,7 +416,8 @@ fn decide_notification(
                 // `prev_time_exhausted`: without the cap a single unread message
                 // whose title oscillates re-fired every 60 s indefinitely (~85
                 // banners/85 min in production).
-                let time_rearm = elapsed >= NOTIF_REARM_SECS && !prev_time_exhausted;
+                let time_rearm =
+                    TIME_REARM_ENABLED && elapsed >= NOTIF_REARM_SECS && !prev_time_exhausted;
                 let should_fire = notifications_enabled
                     && !is_focused
                     && (count_increased || (sig_changed && !sig_under_floor) || time_rearm);
@@ -548,7 +558,9 @@ fn decide_notification(
                 // still hasn't read the message, fire ONE more reminder.  Capped
                 // per Notified entry via `prev_time_rearm_exhausted` so an
                 // oscillating title does not re-fire every 60 s forever.
-                let time_rearm = elapsed >= NOTIF_REARM_SECS && !prev_time_rearm_exhausted;
+                let time_rearm = TIME_REARM_ENABLED
+                    && elapsed >= NOTIF_REARM_SECS
+                    && !prev_time_rearm_exhausted;
                 let should_fire = notifications_enabled
                     && !is_focused
                     && (count_increased
@@ -1979,6 +1991,9 @@ mod tests {
     /// `typing-indicator-rearm` ~5 s later → 2 notifications/minute spam.
     #[test]
     fn test_typing_indicator_rearm_not_reset_by_time_rearm() {
+        if !TIME_REARM_ENABLED {
+            return; // time-rearm temporarily disabled — see TIME_REARM_ENABLED
+        }
         // T=100: initial notification fires → Notified{exhausted=false}.
         let mut state = NotifState::Idle;
         let d = decide_notification(&mut state, 1, "", false, true, false, 100);
@@ -2023,6 +2038,9 @@ mod tests {
     /// arrives.
     #[test]
     fn test_time_rearm_fires_only_once() {
+        if !TIME_REARM_ENABLED {
+            return; // time-rearm temporarily disabled — see TIME_REARM_ENABLED
+        }
         // T=100: message arrives → initial notification (Idle → Notified).
         let mut state = NotifState::Idle;
         let d = decide_notification(&mut state, 1, "", false, true, false, 100);
@@ -2050,6 +2068,9 @@ mod tests {
     /// so a brand-new message still gets its own single reminder.
     #[test]
     fn test_time_rearm_cap_reset_by_count_increase() {
+        if !TIME_REARM_ENABLED {
+            return; // time-rearm temporarily disabled — see TIME_REARM_ENABLED
+        }
         let mut state = NotifState::Idle;
         let d = decide_notification(&mut state, 1, "", false, true, false, 100);
         assert!(d.should_fire);
@@ -2079,6 +2100,9 @@ mod tests {
     /// then stay exhausted across subsequent zero-bounces.
     #[test]
     fn test_time_rearm_only_once_through_zero_bounce() {
+        if !TIME_REARM_ENABLED {
+            return; // time-rearm temporarily disabled — see TIME_REARM_ENABLED
+        }
         let mut state = NotifState::Idle;
         let d = decide_notification(&mut state, 1, "", false, true, false, 100);
         assert!(d.should_fire);
@@ -2304,6 +2328,9 @@ mod tests {
     /// After NOTIF_REARM_SECS with the same count the notification must re-fire.
     #[test]
     fn test_time_rearm_60s_fires_after_elapsed() {
+        if !TIME_REARM_ENABLED {
+            return; // time-rearm temporarily disabled — see TIME_REARM_ENABLED
+        }
         let mut state = NotifState::Notified {
             count: 1,
             sig: String::new(),
@@ -2349,6 +2376,9 @@ mod tests {
     /// immediate call must be suppressed (anti-spam guard).
     #[test]
     fn test_time_rearm_60s_resets_timer_after_fire() {
+        if !TIME_REARM_ENABLED {
+            return; // time-rearm temporarily disabled — see TIME_REARM_ENABLED
+        }
         let mut state = NotifState::Notified {
             count: 1,
             sig: String::new(),
@@ -2388,6 +2418,9 @@ mod tests {
     /// but a new message arrives 60 s after the original notification.
     #[test]
     fn test_time_rearm_60s_from_zero_pending_fires() {
+        if !TIME_REARM_ENABLED {
+            return; // time-rearm temporarily disabled — see TIME_REARM_ENABLED
+        }
         // Original notif fired at T=100, user read at T=103 (ZeroPending entered
         // via unfocused path to keep the test independent of fix 1).
         let mut state = NotifState::ZeroPending {
