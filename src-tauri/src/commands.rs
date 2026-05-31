@@ -82,6 +82,17 @@ const MAX_ZOOM: f64 = 1.2;
 /// Last known unread count; `u32::MAX` forces an update on first call.
 pub(crate) static LAST_UNREAD_COUNT: AtomicU32 = AtomicU32::new(u32::MAX);
 
+/// Last value actually rendered on the dock badge / tray tooltip.
+///
+/// `u32::MAX` = unknown (forces the first update).  This is tracked separately
+/// from [`LAST_UNREAD_COUNT`] because the badge clear is **deferred**: when the
+/// count drops to 0 the state machine first enters `ZeroPending` (badge kept) and
+/// only emits `clear_badge=true` after the zero is sustained for 7 s.  By then
+/// `LAST_UNREAD_COUNT` already equals 0, so a `count_changed` guard would skip the
+/// clear and leave a stale `[1]` badge forever.  Comparing against what is actually
+/// shown fixes that and also prevents redundant tray/badge writes.
+static BADGE_SHOWN_COUNT: AtomicU32 = AtomicU32::new(u32::MAX);
+
 /// Unix-second timestamp of the last window-restore-from-minimized event (Linux only).
 /// Written by the Linux visibility poll thread; read in `update_unread_count_core`
 /// for the `came_from_background` gate.  Zero means "never restored".
@@ -126,6 +137,20 @@ pub(crate) enum NotifState {
         /// Reset to `false` when a genuine `count_increased` or `sig_changed`
         /// notification fires, indicating a truly new message (not a re-arm).
         typing_rearm_exhausted: bool,
+        /// Whether the time-based re-arm (`time-rearm-60s`) has already fired
+        /// once for this `Notified` entry.
+        ///
+        /// The `time-rearm-60s` path re-fires every `NOTIF_REARM_SECS` while the
+        /// message stays unread and the window unfocused.  Without this cap, a
+        /// single unread message whose title oscillates (e.g. a group typing
+        /// indicator flickering the `(1)` count) produces one notification per
+        /// minute indefinitely (observed in production: ~85 banners over 85 min).
+        ///
+        /// Capped at **one** re-arm per `Notified` entry — enough to surface a
+        /// message the user opened the app to see, without the runaway spam.
+        /// Reset to `false` only on a genuine `count_increased` fire (a truly
+        /// new message), mirroring `typing_rearm_exhausted`.
+        time_rearm_exhausted: bool,
     },
     /// Count just dropped to 0 after a notification.  We wait for zero to be
     /// sustained before treating it as a real read-all reset.
@@ -152,6 +177,10 @@ pub(crate) enum NotifState {
         /// prevents the infinite-spam loop described in
         /// `Notified::typing_rearm_exhausted`.
         prev_typing_rearm_exhausted: bool,
+        /// Carried forward from `Notified::time_rearm_exhausted` so the
+        /// `time-rearm-60s` cap survives count oscillation through `ZeroPending`
+        /// (the real production path: title flickers count 1↔0).
+        prev_time_rearm_exhausted: bool,
     },
 }
 
@@ -190,9 +219,11 @@ const TYPING_REARM_SECS: u64 = 5;
 /// unconditionally, even when the unread count has not changed.
 ///
 /// Use case: user ignores a notification (doesn't read it); after this many
-/// seconds the next title-change event — regardless of count — will fire a
-/// new banner.  The fired timestamp is refreshed on each re-arm so the cadence
-/// is at most once per `NOTIF_REARM_SECS`, not once per event.
+/// seconds one more banner is fired so a message they opened the app to see is
+/// not silently missed.  This re-arm is capped at **one** fire per `Notified`
+/// entry (see `Notified::time_rearm_exhausted`) — without the cap a single
+/// unread message whose title oscillates produced one banner per minute
+/// indefinitely (production spam).  The cap resets on a genuine new message.
 const NOTIF_REARM_SECS: u64 = 60;
 
 /// Grace period after a window restore-from-minimized during which a notification
@@ -207,6 +238,28 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Computes the value the dock badge / tray tooltip should display.
+///
+/// * `Some(0)`  → clear the badge (read-all confirmed).
+/// * `Some(n)`  → show count `n` (n > 0).
+/// * `None`     → leave the badge unchanged.  This is the deferred zero case:
+///   the count just dropped to 0 but the read is not yet confirmed
+///   (`ZeroPending`), so the previous badge must stay visible until the state
+///   machine emits `clear_badge` (after the 7 s sustain) — otherwise an
+///   oscillating title would flicker the badge off and on.
+///
+/// `clear_badge` takes priority over a stale positive `count` so a confirmed
+/// read-all always clears even if the title momentarily reports a count.
+fn desired_badge_value(clear_badge: bool, count: u32) -> Option<u32> {
+    if clear_badge {
+        Some(0)
+    } else if count > 0 {
+        Some(count)
+    } else {
+        None
+    }
 }
 
 /// Decision returned by the notification state machine.
@@ -263,6 +316,7 @@ fn decide_notification(
                     sig: activity_sig.to_owned(),
                     fired_at_secs: now,
                     typing_rearm_exhausted: false,
+                    time_rearm_exhausted: false,
                 };
                 NotificationDecision {
                     should_fire: true,
@@ -289,6 +343,7 @@ fn decide_notification(
             sig: prev_sig,
             fired_at_secs,
             typing_rearm_exhausted: prev_exhausted,
+            time_rearm_exhausted: prev_time_exhausted,
         } => {
             if count == 0 {
                 // If the window is focused the user is actively looking at the
@@ -315,6 +370,7 @@ fn decide_notification(
                     zero_since_secs: now,
                     zero_from_typing: is_typing_indicator,
                     prev_typing_rearm_exhausted: prev_exhausted,
+                    prev_time_rearm_exhausted: prev_time_exhausted,
                 };
                 NotificationDecision {
                     should_fire: false,
@@ -343,10 +399,12 @@ fn decide_notification(
                     sig_changed && !count_increased && elapsed < MIN_SIG_CHANGE_NOTIFY_SECS;
                 // Time-based re-arm: if the user has been ignoring the notification
                 // for NOTIF_REARM_SECS without reading (window never became focused
-                // while count was 0), fire once more so the message isn't silently
-                // missed.  The fired timestamp is updated on each re-arm, bounding
-                // the repeat rate to at most once per NOTIF_REARM_SECS (anti-spam).
-                let time_rearm = elapsed >= NOTIF_REARM_SECS;
+                // while count was 0), fire ONE more reminder so the message isn't
+                // silently missed.  Capped at a single fire per Notified entry via
+                // `prev_time_exhausted`: without the cap a single unread message
+                // whose title oscillates re-fired every 60 s indefinitely (~85
+                // banners/85 min in production).
+                let time_rearm = elapsed >= NOTIF_REARM_SECS && !prev_time_exhausted;
                 let should_fire = notifications_enabled
                     && !is_focused
                     && (count_increased || (sig_changed && !sig_under_floor) || time_rearm);
@@ -372,11 +430,23 @@ fn decide_notification(
                     } else {
                         prev_exhausted // time-rearm or sig-only — carry forward exhausted state
                     };
+                    // Time-rearm cap: consumed when a time-rearm actually fires;
+                    // reset by a genuine new message so the next message gets its
+                    // own single reminder.  count_increased takes priority (a real
+                    // message must not consume/leave the slot exhausted).
+                    let new_time_exhausted = if count_increased {
+                        false
+                    } else if time_rearm {
+                        true // the one allowed time-rearm just fired — block further repeats
+                    } else {
+                        prev_time_exhausted
+                    };
                     *state = NotifState::Notified {
                         count,
                         sig: activity_sig.to_owned(),
                         fired_at_secs: now,
                         typing_rearm_exhausted: new_exhausted,
+                        time_rearm_exhausted: new_time_exhausted,
                     };
                 } else if prev_sig.is_empty() && !activity_sig.is_empty()
                     && count == prev_count
@@ -406,6 +476,7 @@ fn decide_notification(
             zero_since_secs,
             zero_from_typing,
             prev_typing_rearm_exhausted,
+            prev_time_rearm_exhausted,
         } => {
             if count == 0 {
                 // Same focused-read-all shortcut as in the Notified arm: if the
@@ -471,8 +542,10 @@ fn decide_notification(
                     && !prev_typing_rearm_exhausted;
                 // Time-based re-arm: same semantics as in the Notified arm — if
                 // NOTIF_REARM_SECS have elapsed since the last fire and the user
-                // still hasn't read the message, fire once more.
-                let time_rearm = elapsed >= NOTIF_REARM_SECS;
+                // still hasn't read the message, fire ONE more reminder.  Capped
+                // per Notified entry via `prev_time_rearm_exhausted` so an
+                // oscillating title does not re-fire every 60 s forever.
+                let time_rearm = elapsed >= NOTIF_REARM_SECS && !prev_time_rearm_exhausted;
                 let should_fire = notifications_enabled
                     && !is_focused
                     && (count_increased
@@ -514,11 +587,22 @@ fn decide_notification(
                 } else {
                     prev_typing_rearm_exhausted // carry forward in all other cases
                 };
+                // Time-rearm cap, same priority chain: a genuine new message resets
+                // it; an actually-fired time-rearm consumes the one allowed slot;
+                // everything else carries the flag forward unchanged.
+                let new_time_rearm_exhausted = if should_fire && count_increased {
+                    false
+                } else if should_fire && time_rearm {
+                    true
+                } else {
+                    prev_time_rearm_exhausted
+                };
                 *state = NotifState::Notified {
                     count,
                     sig: activity_sig.to_owned(),
                     fired_at_secs: if should_fire { now } else { prev_fired_at_secs },
                     typing_rearm_exhausted: new_typing_rearm_exhausted,
+                    time_rearm_exhausted: new_time_rearm_exhausted,
                 };
                 NotificationDecision {
                     should_fire,
@@ -691,6 +775,7 @@ fn update_unread_count_core(
                 sig: activity_sig.clone(),
                 fired_at_secs: now,
                 typing_rearm_exhausted: false,
+                time_rearm_exhausted: false,
             };
             log::info!(
                 "[MessengerX][Notification][DECISION] startup-baseline: \
@@ -836,31 +921,40 @@ fn update_unread_count_core(
     }
 
     // ------------------------------------------------------------------
-    // 3. Tray tooltip update (only when count changed to avoid flicker).
-    //    Badge and tray are now cleared unconditionally on count=0 — the
-    //    cooldown in the notification path handles oscillation spam instead.
+    // 3. Tray tooltip + dock badge update.
+    //
+    //    Driven by the *displayed* badge value ([`BADGE_SHOWN_COUNT`]) rather
+    //    than `count_changed`.  The clear is deferred: when the count drops to 0
+    //    the state machine keeps the badge during `ZeroPending` and only emits
+    //    `clear_badge=true` after the 7 s sustain — by which point the count has
+    //    not changed (already 0), so a `count_changed` guard would skip the clear
+    //    and leave a stale `[1]` badge forever.  Comparing against the rendered
+    //    value fixes that and still avoids redundant writes / flicker.
     // ------------------------------------------------------------------
-    if count_changed && (count > 0 || decision.clear_badge) {
-        if let Some(tray) = app.tray_by_id("messengerx-tray") {
-            let tooltip = if count > 0 {
-                format!("Messenger X ({})", count)
-            } else {
-                "Messenger X".to_string()
-            };
-            tray.set_tooltip(Some(&tooltip))
-                .map_err(|e| e.to_string())?;
-        }
+    if let Some(target) = desired_badge_value(decision.clear_badge, count) {
+        let prev_shown = BADGE_SHOWN_COUNT.swap(target, Ordering::SeqCst);
+        if prev_shown != target {
+            if let Some(tray) = app.tray_by_id("messengerx-tray") {
+                let tooltip = if target > 0 {
+                    format!("Messenger X ({})", target)
+                } else {
+                    "Messenger X".to_string()
+                };
+                tray.set_tooltip(Some(&tooltip))
+                    .map_err(|e| e.to_string())?;
+            }
 
-        // Update macOS Dock badge label — cleared unconditionally on count=0.
-        #[cfg(target_os = "macos")]
-        if let Some(webview) = app.get_webview_window("main") {
-            let label = if count > 0 {
-                Some(count.to_string())
-            } else {
-                None
-            };
-            if let Err(e) = webview.set_badge_label(label) {
-                log::warn!("[MessengerX][Badge] Failed to set dock badge: {e}");
+            // Update macOS Dock badge label — `None` clears it.
+            #[cfg(target_os = "macos")]
+            if let Some(webview) = app.get_webview_window("main") {
+                let label = if target > 0 {
+                    Some(target.to_string())
+                } else {
+                    None
+                };
+                if let Err(e) = webview.set_badge_label(label) {
+                    log::warn!("[MessengerX][Badge] Failed to set dock badge: {e}");
+                }
             }
         }
     }
@@ -1419,6 +1513,7 @@ mod tests {
                 sig: String::new(),
                 fired_at_secs: 100,
                 typing_rearm_exhausted: false,
+                time_rearm_exhausted: false,
             }
         );
     }
@@ -1430,6 +1525,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
 
         let zero = decide_notification(&mut state, 0, "", false, true, false, 103);
@@ -1447,6 +1543,7 @@ mod tests {
                 sig: String::new(),
                 fired_at_secs: 100,
                 typing_rearm_exhausted: false,
+                time_rearm_exhausted: false,
             }
         );
     }
@@ -1458,6 +1555,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
 
         let _ = decide_notification(&mut state, 0, "", false, true, false, 103);
@@ -1475,6 +1573,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
 
         let _ = decide_notification(&mut state, 0, "", false, true, false, 103);
@@ -1493,6 +1592,7 @@ mod tests {
             zero_since_secs: 103,
             zero_from_typing: false,
             prev_typing_rearm_exhausted: false,
+            prev_time_rearm_exhausted: false,
         };
 
         let decision = decide_notification(&mut state, 1, "1:1:Alice", false, true, false, 104);
@@ -1511,6 +1611,7 @@ mod tests {
             sig: String::new(), // empty — from typing-indicator transition
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
 
         // Same count, prev_sig is empty, activity_sig arrives non-empty.
@@ -1541,6 +1642,7 @@ mod tests {
             zero_since_secs: 103,
             zero_from_typing: true,
             prev_typing_rearm_exhausted: false,
+            prev_time_rearm_exhausted: false,
         };
 
         let decision = decide_notification(
@@ -1577,6 +1679,7 @@ mod tests {
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         // elapsed = 100+MIN_SIG_CHANGE_NOTIFY_SECS — exactly at the boundary → allow
         let now = 100 + MIN_SIG_CHANGE_NOTIFY_SECS;
@@ -1594,6 +1697,7 @@ mod tests {
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         let decision = decide_notification(&mut state, 1, "1:1:Alice", false, true, false, 101);
         assert!(!decision.should_fire, "under-floor sig_changed should NOT fire");
@@ -1615,6 +1719,7 @@ mod tests {
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         // elapsed = MIN_SIG_CHANGE_NOTIFY_SECS - 1 → below floor → suppress
         let now = 100 + MIN_SIG_CHANGE_NOTIFY_SECS - 1;
@@ -1634,6 +1739,7 @@ mod tests {
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         // elapsed = 0 — well under the floor, but count increased → must fire
         let decision = decide_notification(&mut state, 2, "2:0:Alice", false, true, false, 100);
@@ -1682,6 +1788,7 @@ mod tests {
             sig: "1:0:Alice".to_string(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         // Same count, empty sig — must not fire.
         // Use now=159 so elapsed=59 < NOTIF_REARM_SECS=60 (time-rearm must not kick in).
@@ -1711,6 +1818,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
 
         // Typing indicator fires — count drops to 0, is_typing_indicator=true.
@@ -1727,6 +1835,7 @@ mod tests {
                 zero_since_secs: 106,
                 zero_from_typing: true,
                 prev_typing_rearm_exhausted: false,
+                prev_time_rearm_exhausted: false,
             }
         );
 
@@ -1745,6 +1854,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
 
         // Typing indicator at T=101 (elapsed so far: 1s).
@@ -1768,6 +1878,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
 
         // Regular zero (not typing indicator) at T=103.
@@ -1895,6 +2006,91 @@ mod tests {
         );
     }
 
+    /// PRODUCTION REGRESSION (v1.5.3): a single unread group message ("InV- Putin
+    /// is scum") with an active typing indicator made the title oscillate count
+    /// 1↔0 while the window stayed unfocused.  `time-rearm-60s` re-fired every 60 s
+    /// for 85+ minutes (~85 notifications).  The time-based re-arm must fire AT
+    /// MOST ONCE per `Notified` entry, then stay silent until a genuine new message
+    /// arrives.
+    #[test]
+    fn test_time_rearm_fires_only_once() {
+        // T=100: message arrives → initial notification (Idle → Notified).
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+        assert_eq!(d.reason, "idle-count-positive");
+
+        // T=161: 61 s elapsed, still unread & unfocused → first time-rearm fires.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 161);
+        assert!(d.should_fire, "first time-rearm must fire");
+        assert_eq!(d.reason, "time-rearm-60s");
+
+        // T=222: another 61 s → must NOT fire again (capped at one reminder).
+        let d = decide_notification(&mut state, 1, "", false, true, false, 222);
+        assert!(
+            !d.should_fire,
+            "time-rearm must fire at most once per Notified entry (anti-spam)"
+        );
+
+        // T=283: a third interval → still silent.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 283);
+        assert!(!d.should_fire, "time-rearm stays exhausted");
+    }
+
+    /// The time-rearm cap resets when a genuine new message arrives (count up),
+    /// so a brand-new message still gets its own single reminder.
+    #[test]
+    fn test_time_rearm_cap_reset_by_count_increase() {
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+
+        // First time-rearm fires at T=161 → exhausted.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 161);
+        assert_eq!(d.reason, "time-rearm-60s");
+
+        // Blocked at T=222.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 222);
+        assert!(!d.should_fire);
+
+        // T=230: genuine new message (count=2) → fires, resets the time-rearm cap.
+        let d = decide_notification(&mut state, 2, "", false, true, false, 230);
+        assert!(d.should_fire);
+        assert_eq!(d.reason, "count-increased");
+
+        // T=291: 61 s after the new message → one fresh time-rearm allowed.
+        let d = decide_notification(&mut state, 2, "", false, true, false, 291);
+        assert!(d.should_fire, "new message re-enables one time-rearm");
+        assert_eq!(d.reason, "time-rearm-60s");
+    }
+
+    /// The cap also holds when the count oscillates through `ZeroPending` — the
+    /// real production path where a (non-typing) title flicker drops count to 0
+    /// then it returns past the 60 s window.  `time-rearm-60s` must fire once and
+    /// then stay exhausted across subsequent zero-bounces.
+    #[test]
+    fn test_time_rearm_only_once_through_zero_bounce() {
+        let mut state = NotifState::Idle;
+        let d = decide_notification(&mut state, 1, "", false, true, false, 100);
+        assert!(d.should_fire);
+
+        // T=165: count drops to 0 (non-typing flicker) → ZeroPending.
+        let _ = decide_notification(&mut state, 0, "", false, true, false, 165);
+        // T=166: count returns, elapsed since fire = 66 ≥ 60 → time-rearm fires once.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 166);
+        assert!(d.should_fire, "first time-rearm via ZeroPending must fire");
+        assert_eq!(d.reason, "time-rearm-60s");
+
+        // T=232: count drops to 0 again → ZeroPending.
+        let _ = decide_notification(&mut state, 0, "", false, true, false, 232);
+        // T=233: count returns, elapsed = 67 ≥ 60 — but exhausted → must NOT fire.
+        let d = decide_notification(&mut state, 1, "", false, true, false, 233);
+        assert!(
+            !d.should_fire,
+            "time-rearm via ZeroPending must stay capped at one fire"
+        );
+    }
+
     /// If typing_rearm conditions are met but should_fire=false (e.g. window focused),
     /// the rearm slot must NOT be consumed — it must fire when conditions allow.
     #[test]
@@ -2015,6 +2211,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         // is_focused=true, count=0 → must go straight to Idle.
         let d = decide_notification(&mut state, 0, "", true, true, false, 102);
@@ -2035,6 +2232,7 @@ mod tests {
             zero_since_secs: 102,
             zero_from_typing: false,
             prev_typing_rearm_exhausted: false,
+            prev_time_rearm_exhausted: false,
         };
         let d = decide_notification(&mut state, 0, "", true, true, false, 104);
         assert!(!d.should_fire);
@@ -2077,6 +2275,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: true, // previously exhausted
+            time_rearm_exhausted: false,
         };
         let d = decide_notification(&mut state, 0, "", true, true, false, 110);
         assert!(!d.should_fire);
@@ -2101,13 +2300,14 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         // exactly at the boundary (elapsed == NOTIF_REARM_SECS) → fire
         let now = 100 + NOTIF_REARM_SECS;
         let d = decide_notification(&mut state, 1, "", false, true, false, now);
         assert!(d.should_fire, "time-rearm must fire at the 60 s boundary");
         assert_eq!(d.reason, "time-rearm-60s");
-        // fired_at_secs must be refreshed to now.
+        // fired_at_secs must be refreshed to now; time-rearm cap now consumed.
         assert_eq!(
             state,
             NotifState::Notified {
@@ -2115,6 +2315,7 @@ mod tests {
                 sig: String::new(),
                 fired_at_secs: now,
                 typing_rearm_exhausted: false,
+                time_rearm_exhausted: true,
             }
         );
     }
@@ -2127,6 +2328,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         let now = 100 + NOTIF_REARM_SECS - 1;
         let d = decide_notification(&mut state, 1, "", false, true, false, now);
@@ -2143,6 +2345,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         let t1 = 100 + NOTIF_REARM_SECS;
         // First re-arm fires.
@@ -2164,6 +2367,7 @@ mod tests {
             sig: String::new(),
             fired_at_secs: 100,
             typing_rearm_exhausted: false,
+            time_rearm_exhausted: false,
         };
         let now = 100 + NOTIF_REARM_SECS;
         // is_focused=true
@@ -2184,6 +2388,7 @@ mod tests {
             zero_since_secs: 103,
             zero_from_typing: false,
             prev_typing_rearm_exhausted: false,
+            prev_time_rearm_exhausted: false,
         };
         // New message arrives at T=162 (elapsed from original fire = 62 >= 60).
         let d = decide_notification(&mut state, 1, "", false, true, false, 162);
@@ -2201,6 +2406,7 @@ mod tests {
             zero_since_secs: 103,
             zero_from_typing: false,
             prev_typing_rearm_exhausted: false,
+            prev_time_rearm_exhausted: false,
         };
         // Only 50 s since fire → still suppressed.
         let d = decide_notification(&mut state, 1, "", false, true, false, 150);
@@ -2221,5 +2427,65 @@ mod tests {
                 "rearm must be at most 5 min to remain useful"
             );
         };
+    }
+
+    // -----------------------------------------------------------------------
+    // Dock badge / tray value tests (stale [1] badge fix)
+    // -----------------------------------------------------------------------
+
+    /// A confirmed read-all (`clear_badge=true`) always clears, even if the
+    /// title momentarily still reports a positive count.
+    #[test]
+    fn test_desired_badge_clear_takes_priority() {
+        assert_eq!(desired_badge_value(true, 0), Some(0));
+        assert_eq!(desired_badge_value(true, 5), Some(0));
+    }
+
+    /// A positive count shows that count.
+    #[test]
+    fn test_desired_badge_shows_positive_count() {
+        assert_eq!(desired_badge_value(false, 1), Some(1));
+        assert_eq!(desired_badge_value(false, 42), Some(42));
+    }
+
+    /// A bare `count==0` without `clear_badge` is the deferred `ZeroPending`
+    /// case — the badge must be left unchanged (keep showing the prior count)
+    /// until the read is confirmed, so an oscillating title does not flicker it.
+    #[test]
+    fn test_desired_badge_deferred_zero_keeps_badge() {
+        assert_eq!(desired_badge_value(false, 0), None);
+    }
+
+    /// PRODUCTION REGRESSION: stale `[1]` dock badge after read-all.
+    ///
+    /// Reproduces the wiring bug where the badge clear was gated by
+    /// `count_changed`: count 1→0 first enters `ZeroPending` (badge kept), and
+    /// the eventual `zero-sustained-read-all` clear arrives when the count is
+    /// already 0 (`count_changed=false`).  Driving the badge from the *displayed*
+    /// value instead guarantees the clear is applied.
+    #[test]
+    fn test_badge_clears_on_deferred_read_all() {
+        // Simulate the displayed-badge tracking used in update_unread_count_core:
+        // only overwrite `shown` when desired_badge_value yields Some.
+        fn apply(shown: &mut Option<u32>, clear_badge: bool, count: u32) {
+            if let Some(target) = desired_badge_value(clear_badge, count) {
+                *shown = Some(target);
+            }
+        }
+        let mut shown: Option<u32> = None;
+
+        // count=1 fires → badge shows 1.
+        apply(&mut shown, false, 1);
+        assert_eq!(shown, Some(1));
+
+        // count drops to 0, unfocused → zero-pending-start (clear_badge=false).
+        // Badge must stay at 1 (deferred).
+        apply(&mut shown, false, 0);
+        assert_eq!(shown, Some(1), "badge must persist during ZeroPending");
+
+        // 7 s later, still 0 → zero-sustained-read-all (clear_badge=true) while
+        // the count has NOT changed.  Badge must now clear.
+        apply(&mut shown, true, 0);
+        assert_eq!(shown, Some(0), "deferred read-all must clear the stale badge");
     }
 }

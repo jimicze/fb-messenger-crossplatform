@@ -3327,6 +3327,99 @@ struct SenderHintCache {
     retained: Option<(String, std::time::Instant)>,
 }
 
+/// Format a single log line in the app's standard desktop format using a
+/// caller-supplied timestamp.
+///
+/// This mirrors `tauri-plugin-log`'s default desktop format
+/// (`[date][time][target][LEVEL] message`) but is driven by the timestamp we
+/// pass in, so we can use **local** time instead of UTC. The plugin's built-in
+/// `TimezoneStrategy::UseLocal` calls `OffsetDateTime::now_local()` on the
+/// emitting thread; in a multi-threaded process the `time` crate refuses to
+/// determine the local offset and silently falls back to UTC — which is why
+/// our logs were ~1 hour off. `chrono::Local` (backed by `iana-time-zone`) is
+/// thread-safe and resolves the local zone correctly, so the real formatter
+/// passes `chrono::Local::now()` here.
+///
+/// Kept generic and pure so it can be unit-tested with a fixed timestamp.
+fn format_log_line<Tz>(
+    now: &chrono::DateTime<Tz>,
+    target: &str,
+    level: log::Level,
+    message: &str,
+) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    format!(
+        "[{}][{}][{}][{}] {}",
+        now.format("%Y-%m-%d"),
+        now.format("%H:%M:%S"),
+        target,
+        level,
+        message
+    )
+}
+
+/// Number of days of rotated log archives to retain on disk.
+const LOG_RETENTION_DAYS: u64 = 7;
+
+/// Decide whether a file in the log directory is a prunable rotated archive.
+///
+/// `tauri-plugin-log`'s `KeepAll` rotation renames the active file to
+/// `{prefix}_{date}.log` (and a defensive `…log.bak`) when it exceeds the max
+/// size. The active file (`{prefix}.log`) has no `_` after the prefix, so we
+/// only ever target `{prefix}_…` archives and never the live log. Files are
+/// pruned once their age exceeds the retention window.
+///
+/// Pure helper so the age/name policy can be unit-tested without touching the
+/// filesystem.
+fn is_prunable_archived_log(
+    file_name: &str,
+    prefix: &str,
+    age_secs: u64,
+    max_age_secs: u64,
+) -> bool {
+    file_name.starts_with(&format!("{prefix}_")) && age_secs > max_age_secs
+}
+
+/// Delete rotated log archives older than [`LOG_RETENTION_DAYS`].
+///
+/// Runs once at startup. Only `{prefix}_*` archives are considered; the active
+/// `{prefix}.log` is always preserved. Any I/O error is logged and ignored —
+/// log pruning must never block app startup.
+fn prune_old_logs(log_dir: &std::path::Path, prefix: &str, max_age_days: u64) {
+    let max_age_secs = max_age_days.saturating_mul(24 * 60 * 60);
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let age_secs = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if is_prunable_archived_log(&file_name, prefix, age_secs, max_age_secs) {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                log::warn!("[MessengerX][Log] Failed to prune old log {file_name}: {e}");
+            } else {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        log::info!(
+            "[MessengerX][Log] Pruned {removed} log archive(s) older than {max_age_days} days"
+        );
+    }
+}
+
 /// Opens the Messenger X log file on Linux.
 ///
 /// Every Linux desktop ships with a text editor registered for `text/plain`,
@@ -3461,8 +3554,29 @@ pub fn run() {
                         file_name: Some("messengerx".to_string()),
                     }),
                 ])
-                .max_file_size(500_000)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                // Use local time, not UTC. The plugin's built-in `UseLocal`
+                // strategy relies on the `time` crate, which refuses to read the
+                // local offset from a multi-threaded process and silently falls
+                // back to UTC (logs were ~1 h off). `chrono::Local` is
+                // thread-safe and resolves the zone correctly.
+                .format(|out, message, record| {
+                    out.finish(format_args!(
+                        "{}",
+                        format_log_line(
+                            &chrono::Local::now(),
+                            record.target(),
+                            record.level(),
+                            &message.to_string(),
+                        )
+                    ))
+                })
+                // Retain rotated archives (date-stamped) rather than discarding
+                // them on every rotation. `KeepOne` deleted same-day logs as soon
+                // as the file hit `max_file_size`; `KeepAll` + a startup
+                // age-based prune (see `prune_old_logs`) keeps the last
+                // `LOG_RETENTION_DAYS` days instead.
+                .max_file_size(5_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
@@ -3563,6 +3677,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // is initialized (inside setup_app), not from run() where the logger is not yet
     // active. This was the bug that caused all [Env] lines to be silently dropped.
     log_platform_environment();
+
+    // Prune rotated log archives older than the retention window. Runs once at
+    // startup; failures are logged and ignored so this never blocks boot.
+    if let Ok(log_dir) = app.path().app_log_dir() {
+        prune_old_logs(&log_dir, "messengerx", LOG_RETENTION_DAYS);
+    }
 
     if let Err(e) = services::notification::initialize() {
         log::warn!("[MessengerX] Failed to initialize native notifications: {e}");
@@ -6184,6 +6304,75 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    mod log_formatting {
+        use super::super::{format_log_line, is_prunable_archived_log, LOG_RETENTION_DAYS};
+        use chrono::{FixedOffset, TimeZone};
+
+        #[test]
+        fn format_matches_plugin_default_layout() {
+            // +02:00 == CEST, the offset that was being dropped in favour of UTC.
+            let tz = FixedOffset::east_opt(2 * 3600).unwrap();
+            let ts = tz.with_ymd_and_hms(2026, 5, 31, 8, 43, 12).unwrap();
+            let line = format_log_line(&ts, "messengerx", log::Level::Info, "hello world");
+            assert_eq!(line, "[2026-05-31][08:43:12][messengerx][INFO] hello world");
+        }
+
+        #[test]
+        fn format_preserves_local_offset_clock_time() {
+            // Same instant, two zones — the formatted wall-clock must differ,
+            // proving we render the supplied local time rather than UTC.
+            let utc = chrono::Utc.with_ymd_and_hms(2026, 5, 31, 6, 43, 12).unwrap();
+            let cest = utc.with_timezone(&FixedOffset::east_opt(2 * 3600).unwrap());
+            let line = format_log_line(&cest, "t", log::Level::Warn, "m");
+            assert_eq!(line, "[2026-05-31][08:43:12][t][WARN] m");
+        }
+
+        #[test]
+        fn active_log_is_never_prunable() {
+            let max = LOG_RETENTION_DAYS * 24 * 60 * 60;
+            // The live file has no `_` after the prefix, even when very old.
+            assert!(!is_prunable_archived_log(
+                "messengerx.log",
+                "messengerx",
+                max + 1,
+                max
+            ));
+        }
+
+        #[test]
+        fn old_archive_is_prunable() {
+            let max = LOG_RETENTION_DAYS * 24 * 60 * 60;
+            assert!(is_prunable_archived_log(
+                "messengerx_2026-05-20_08-43-12.log",
+                "messengerx",
+                max + 1,
+                max
+            ));
+        }
+
+        #[test]
+        fn recent_archive_is_kept() {
+            let max = LOG_RETENTION_DAYS * 24 * 60 * 60;
+            assert!(!is_prunable_archived_log(
+                "messengerx_2026-05-30_08-43-12.log",
+                "messengerx",
+                max - 1,
+                max
+            ));
+        }
+
+        #[test]
+        fn unrelated_file_is_never_pruned() {
+            let max = LOG_RETENTION_DAYS * 24 * 60 * 60;
+            assert!(!is_prunable_archived_log(
+                "other.log",
+                "messengerx",
+                max + 999,
+                max
+            ));
+        }
+    }
+
     mod sender_hint_cache {
         use super::super::{SenderHintCache, SENDER_HINT_RETAIN};
         use std::time::{Duration, Instant};
