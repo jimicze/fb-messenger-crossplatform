@@ -137,4 +137,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log('release.yml registry conditions allow .0 auto-updates and boolean patch override.');
+console.log('release.yml registry conditions allow .0 auto-updates, patch override, and explicit tag_override force.');

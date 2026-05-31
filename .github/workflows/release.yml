@@ -36,8 +36,10 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 # Seven-phase release:
 #
-#   0. bump-version    — (workflow_dispatch only) bump semver in source files,
-#                        commit to main, push tag; no-op on tag-push trigger
+#   0. bump-version    — (workflow_dispatch only) opens a version bump PR when
+#                        source is stale, releases already-merged version bumps,
+#                        or uses tag_override for an existing tag; no-op on
+#                        tag-push trigger
 #   1. create-release  — create a single GitHub Release (eliminates race)
 #   2. build-tauri     — 6 parallel matrix jobs upload artifacts to that release
 #   3. publish-updater — generate one complete latest.json after all builds
@@ -46,6 +48,8 @@ on:
 #
 # Triggering a release:
 #   • From GitHub UI / gh cli: Actions → Release → Run workflow → pick bump type
+#     to open a version-bump PR when needed; after merge, run it again to tag
+#     and release the already-versioned main commit
 #   • From terminal (minor/major only): git tag vX.Y.0 && git push origin vX.Y.0
 #   • Patch releases: use workflow_dispatch (patch tag push does NOT trigger CI)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,21 +57,25 @@ on:
 jobs:
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  # Phase 0: Bump semver, commit, push tag.
-  # Only runs on workflow_dispatch. On tag-push this job is a no-op (the
-  # bump step is skipped) so downstream jobs always have a job to depend on.
+  # Phase 0: Bump semver through a PR, or tag an already-versioned main commit.
+  # Only runs on workflow_dispatch without tag_override. On tag-push this job is
+  # a no-op so downstream jobs always have a job to depend on. With tag_override,
+  # it exposes the existing tag as a backbuild.
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   bump-version:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     outputs:
-      new-tag:      ${{ steps.bump.outputs.new-tag || steps.override.outputs.new-tag }}
+      new-tag:      ${{ steps.bump.outputs.release-tag || steps.override.outputs.new-tag }}
       is-backbuild: ${{ steps.override.outputs.is-backbuild }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
 
       - name: Use tag_override (no bump)
         id: override
@@ -78,20 +86,32 @@ jobs:
           echo "new-tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "is-backbuild=true" >> "$GITHUB_OUTPUT"
 
-      - name: Bump version, commit and push tag
+      - name: Prepare release or open release PR
         id: bump
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag_override == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          # Ensure we are on the latest main before reading the current version.
-          # Without this, a commit pushed between the workflow trigger and this
-          # step causes "Updates were rejected (fetch first)" on git push.
-          git fetch origin main
+          # Ensure we are on the latest main and have tags before choosing the
+          # bump base. Source files can lag behind release tags because build
+          # jobs sync versions from tags without committing back to main.
+          git fetch origin main --tags
           git rebase origin/main
 
           BUMP="${{ github.event.inputs.bump_type }}"
-          CURRENT=$(jq -r .version package.json)
+
+          BASE_TAG=$(git tag --merged origin/main --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | sed -n '1p' || true)
+          if [[ -n "${BASE_TAG}" ]]; then
+            CURRENT="${BASE_TAG#v}"
+            echo "Using latest merged semver tag as bump base: ${BASE_TAG}"
+          else
+            FALLBACK_VERSION=$(jq -r .version package.json)
+            CURRENT="${FALLBACK_VERSION}"
+            echo "No merged semver tag found; using package.json version as bump base: ${FALLBACK_VERSION}"
+          fi
+
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
 
           case "$BUMP" in
@@ -102,8 +122,36 @@ jobs:
 
           NEW="${MAJOR}.${MINOR}.${PATCH}"
           TAG="v${NEW}"
+          BRANCH="release/${TAG}"
+          SOURCE_VERSION=$(jq -r .version package.json)
+          TAURI_VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          CARGO_VERSION=$(grep -m 1 '^version = ' src-tauri/Cargo.toml | cut -d'"' -f2)
 
           echo "Bumping ${CURRENT} → ${NEW} (${BUMP})"
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists. Refusing to create duplicate release bump PR."
+            exit 1
+          fi
+
+          if [[ "${SOURCE_VERSION}" == "${NEW}" && "${TAURI_VERSION}" == "${NEW}" && "${CARGO_VERSION}" == "${NEW}" ]]; then
+            echo "Source files already carry ${NEW}; tagging current main for release."
+            git tag "${TAG}"
+            git push origin "${TAG}"
+            echo "release-tag=${TAG}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OPEN_PR_COUNT=$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --head "${BRANCH}" \
+            --state open \
+            --json number \
+            --jq 'length')
+          if [[ "${OPEN_PR_COUNT}" != "0" ]]; then
+            echo "::notice::Release bump PR for ${TAG} already exists: ${BRANCH}"
+            exit 0
+          fi
 
           # ── Update version in all three version-carrying files ──────────────
           jq --arg v "$NEW" '.version = $v' package.json \
@@ -122,18 +170,29 @@ jobs:
             git add src-tauri/Cargo.lock
           fi
 
-          # ── Commit and tag ────────────────────────────────────────────────────
+          # ── Commit on release branch and open PR ──────────────────────────────
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          git switch -c "${BRANCH}"
+
           git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
           git commit -m "chore: bump version to ${TAG}"
-          git tag "$TAG"
 
-          git push origin HEAD:main
-          git push origin "$TAG"
+          git push origin "${BRANCH}"
 
-          echo "new-tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if gh pr view "${BRANCH}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release bump PR for ${TAG} already exists: ${BRANCH}"
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base main \
+              --head "${BRANCH}" \
+              --title "chore: bump version to ${TAG}" \
+              --body "Automated version bump for ${TAG}. Merge this PR, then run the Release workflow again with bump_type=${BUMP} to tag and release the already-versioned main commit. For patch releases that should update Homebrew/winget, check update_registries on that second run."
+          fi
+
+          echo "::notice::Opened release bump PR for ${TAG}. Merge it, then rerun this workflow with bump_type=${BUMP} to tag and release."
 
   # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   # Phase 1: Create a single GitHub Release before any builds start.
@@ -144,7 +203,7 @@ jobs:
     if: |
       always() &&
       needs.bump-version.result != 'failure' &&
-      (startsWith(github.ref, 'refs/tags/v') || needs.bump-version.outputs.new-tag != '')
+      (startsWith(github.ref, 'refs/tags/v') || needs.bump-version.outputs.new-tag != '' || needs.bump-version.outputs.is-backbuild == 'true')
     runs-on: ubuntu-latest
     permissions:
       contents: write
