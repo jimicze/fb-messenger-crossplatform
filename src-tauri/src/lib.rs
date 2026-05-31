@@ -3380,7 +3380,12 @@ fn is_prunable_archived_log(
     age_secs: u64,
     max_age_secs: u64,
 ) -> bool {
-    file_name.starts_with(&format!("{prefix}_")) && age_secs > max_age_secs
+    // Check `{prefix}_` without allocating: strip the prefix, then verify the
+    // next character is `_` (the separator used by tauri-plugin-log KeepAll).
+    file_name
+        .strip_prefix(prefix)
+        .map_or(false, |rest| rest.starts_with('_'))
+        && age_secs > max_age_secs
 }
 
 /// Delete rotated log archives older than [`LOG_RETENTION_DAYS`].
@@ -3389,8 +3394,9 @@ fn is_prunable_archived_log(
 /// `{prefix}.log` is always preserved. I/O errors are logged at `debug` (a
 /// not-yet-created log directory on first launch is benign) and silently
 /// skipped — log pruning must never block app startup.  Per-entry
-/// metadata/mtime errors are also logged at `debug`; those files are treated
-/// as age=0 (unknown age → keep) so no data is ever accidentally deleted.
+/// `read_dir` and metadata/mtime errors are also logged at `debug`; files
+/// whose age cannot be determined are treated as age=0 (unknown age → keep)
+/// so no data is ever accidentally deleted.
 fn prune_old_logs(log_dir: &std::path::Path, prefix: &str, max_age_days: u64) {
     let max_age_secs = max_age_days.saturating_mul(24 * 60 * 60);
     let entries = match std::fs::read_dir(log_dir) {
@@ -3405,7 +3411,14 @@ fn prune_old_logs(log_dir: &std::path::Path, prefix: &str, max_age_days: u64) {
     };
     let now = std::time::SystemTime::now();
     let mut removed = 0u32;
-    for entry in entries.flatten() {
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                log::debug!("[MessengerX][Log] Skipping unreadable log dir entry: {e}");
+                continue;
+            }
+        };
         let file_name = entry.file_name().to_string_lossy().into_owned();
         let age_secs = match entry.metadata().and_then(|m| m.modified()) {
             Ok(mtime) => now
