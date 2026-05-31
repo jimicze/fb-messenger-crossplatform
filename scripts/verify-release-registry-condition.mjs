@@ -45,6 +45,17 @@ function registryJobShouldRun({ tagName, updateRegistries, forceTagOverrideRegis
   );
 }
 
+function conditionMatchesExpectedGuard(condition) {
+  const expected = [
+    'always() &&',
+    "needs.publish-updater.result == 'success' &&",
+    "(needs.create-release.outputs.is-backbuild != 'true' || inputs.force_tag_override_registry_update) &&",
+    "(endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries || inputs.force_tag_override_registry_update)",
+  ].join(' ');
+
+  return condition === expected;
+}
+
 if (!workflow.includes('force_tag_override_registry_update:')) {
   failures.push('workflow_dispatch must expose force_tag_override_registry_update checkbox for explicit tag_override registry updates');
 }
@@ -52,6 +63,10 @@ if (!workflow.includes('force_tag_override_registry_update:')) {
 for (const jobName of jobNames) {
   const condition = normalizeCondition(extractJobIfBlock(jobName));
   if (!condition) continue;
+
+  if (!conditionMatchesExpectedGuard(condition)) {
+    failures.push(`${jobName} registry condition must exactly match the expected backbuild-force guard`);
+  }
 
   if (!condition.includes("endsWith(needs.create-release.outputs.tag-name, '.0')")) {
     failures.push(`${jobName} must auto-run for major/minor tags ending in .0`);
