@@ -6,6 +6,10 @@ const workflow = readFileSync(workflowPath, 'utf8');
 const jobNames = ['update-homebrew', 'update-winget'];
 const failures = [];
 
+function normalizeCondition(condition) {
+  return condition.replace(/\s+/g, ' ').trim();
+}
+
 function extractJobIfBlock(jobName) {
   const jobStart = workflow.indexOf(`  ${jobName}:`);
   if (jobStart === -1) {
@@ -33,8 +37,16 @@ function extractJobIfBlock(jobName) {
     .join(' ');
 }
 
+function registryJobShouldRun({ tagName, updateRegistries, isBackbuild, publishUpdaterSucceeded }) {
+  return (
+    publishUpdaterSucceeded &&
+    !isBackbuild &&
+    (tagName.endsWith('.0') || updateRegistries === true)
+  );
+}
+
 for (const jobName of jobNames) {
-  const condition = extractJobIfBlock(jobName);
+  const condition = normalizeCondition(extractJobIfBlock(jobName));
   if (!condition) continue;
 
   if (!condition.includes("endsWith(needs.create-release.outputs.tag-name, '.0')")) {
@@ -53,6 +65,38 @@ for (const jobName of jobNames) {
     failures.push(
       `${jobName} compares boolean workflow_dispatch input update_registries to string 'true'; ` +
         'use boolean truthiness so checked patch-release override enables registry jobs',
+    );
+  }
+}
+
+const scenarios = [
+  {
+    name: 'minor .0 release auto-runs registry updates without manual override',
+    input: { tagName: 'v1.6.0', updateRegistries: false, isBackbuild: false, publishUpdaterSucceeded: true },
+    expected: true,
+  },
+  {
+    name: 'patch release skips registry updates by default',
+    input: { tagName: 'v1.5.7', updateRegistries: false, isBackbuild: false, publishUpdaterSucceeded: true },
+    expected: false,
+  },
+  {
+    name: 'patch release runs registry updates when checkbox is checked',
+    input: { tagName: 'v1.5.7', updateRegistries: true, isBackbuild: false, publishUpdaterSucceeded: true },
+    expected: true,
+  },
+  {
+    name: 'backbuild skips registry updates even when checkbox is checked',
+    input: { tagName: 'v1.5.7', updateRegistries: true, isBackbuild: true, publishUpdaterSucceeded: true },
+    expected: false,
+  },
+];
+
+for (const scenario of scenarios) {
+  const actual = registryJobShouldRun(scenario.input);
+  if (actual !== scenario.expected) {
+    failures.push(
+      `${scenario.name}: expected ${scenario.expected ? 'run' : 'skip'}, got ${actual ? 'run' : 'skip'}`,
     );
   }
 }
