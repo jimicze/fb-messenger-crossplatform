@@ -134,8 +134,11 @@ pub(crate) enum NotifState {
         /// `ZeroPending{prev_fired_at=now}`, and after `TYPING_REARM_SECS`
         /// have elapsed the re-arm fires again — an infinite notification spam.
         ///
-        /// Reset to `false` when a genuine `count_increased` or `sig_changed`
-        /// notification fires, indicating a truly new message (not a re-arm).
+        /// Reset to `false` only on a genuine `count_increased` fire (a truly
+        /// new message, not a re-arm).  Note: a `sig_changed`-only fire carries
+        /// the exhausted state forward — resetting it there reintroduced the
+        /// prolonged-typing spam bug (`time_rearm` would let a fresh
+        /// `typing-indicator-rearm` fire ~5 s after every 60-s reminder).
         typing_rearm_exhausted: bool,
         /// Whether the time-based re-arm (`time-rearm-60s`) has already fired
         /// once for this `Notified` entry.
@@ -932,7 +935,7 @@ fn update_unread_count_core(
     //    value fixes that and still avoids redundant writes / flicker.
     // ------------------------------------------------------------------
     if let Some(target) = desired_badge_value(decision.clear_badge, count) {
-        let prev_shown = BADGE_SHOWN_COUNT.swap(target, Ordering::SeqCst);
+        let prev_shown = BADGE_SHOWN_COUNT.load(Ordering::SeqCst);
         if prev_shown != target {
             if let Some(tray) = app.tray_by_id("messengerx-tray") {
                 let tooltip = if target > 0 {
@@ -956,6 +959,12 @@ fn update_unread_count_core(
                     log::warn!("[MessengerX][Badge] Failed to set dock badge: {e}");
                 }
             }
+
+            // Record the rendered value only *after* the UI updates ran.  If
+            // `set_tooltip` above errored we returned early via `?` without
+            // storing, so `prev_shown` stays unchanged and the next call retries
+            // instead of skipping on a stale "already shown" match.
+            BADGE_SHOWN_COUNT.store(target, Ordering::SeqCst);
         }
     }
 
