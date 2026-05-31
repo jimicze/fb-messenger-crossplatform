@@ -682,8 +682,9 @@ jobs:
           cd homebrew-tap
 
           sed -i "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/messenger-x.rb
-          sed -i "s/arm:   \"[^\"]*\"/arm:   \"${ARM_SHA}\"/"  Casks/messenger-x.rb
-          sed -i "s/intel: \"[^\"]*\"/intel: \"${X64_SHA}\"/"  Casks/messenger-x.rb
+          # Match only the sha256 lines (indented with spaces), not the arch line
+          sed -i "s/^         arm:   \"[^\"]*\"/         arm:   \"${ARM_SHA}\"/"   Casks/messenger-x.rb
+          sed -i "s/^         intel: \"[^\"]*\"/         intel: \"${X64_SHA}\"/"   Casks/messenger-x.rb
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
