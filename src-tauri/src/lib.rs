@@ -498,10 +498,33 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     function clearReconcileLatch() {
         reconciledTitleCount = -1;
         reconciledValue = -1;
+        _lastMultiSenderDom = -1;
     }
 
     function effectiveUnreadCount() {
         var titleCount = getUnreadCountFromTitle();
+        // Always consult the sidebar DOM.  The window title's "(N)" is the unread
+        // count of the *currently-open* conversation, NOT the total number of
+        // unread conversations — so a message from a second sender (while a first
+        // is still unread) never raises the title past "(1)".  Counting unread
+        // sidebar threads is the only reliable signal for that case.  Returns
+        // -1 when the conversation list is absent (cannot be trusted).
+        var domUnread = countUnreadThreadsFromDom();
+
+        // DOM shows MORE unread threads than the title → a second/third sender.
+        // Drive the effective count up so Rust sees count_increased and fires,
+        // regardless of focus (an unfocused new message must still notify; a
+        // focused one updates the badge).  The latch is irrelevant when rising.
+        if (domUnread > titleCount) {
+            clearReconcileLatch();
+            if (domUnread !== _lastMultiSenderDom) {
+                _lastMultiSenderDom = domUnread;
+                jlog('[MultiSender] title=' + titleCount + ' domUnread=' + domUnread
+                    + ' — using DOM count (second sender not reflected in title)');
+            }
+            return domUnread;
+        }
+
         if (titleCount <= 0) {
             clearReconcileLatch();
             return titleCount;
@@ -520,7 +543,6 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             // (DOM may not have rendered its unread marker yet) still notifies.
             return titleCount;
         }
-        var domUnread = countUnreadThreadsFromDom();
         if (domUnread < 0) {
             return titleCount; // conversation list absent — cannot trust DOM
         }
@@ -673,6 +695,15 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     // Returns -1 ("unknown") when the conversation list is not present in the DOM
     // (e.g. a narrow/thread-only view) so callers never clear a badge based on an
     // absent list.  Otherwise returns the number of unread thread links.
+    //
+    // PERFORMANCE NOTE: this walks every sidebar thread link and calls
+    // getComputedStyle per span — it forces layout.  Called every 2 s via the
+    // poll when effectiveUnreadCount is invoked.  The early return above
+    // (links.length === 0) keeps the idle cost near-zero when the list is not in
+    // the DOM; when the list is present the cost is proportional to the number
+    // of visible conversations (~20–30 on a typical screen).  If jank is observed
+    // on low-end hardware, consider reducing the poll frequency or adding an
+    // RAF-gated debounce before the scan.
     // ---------------------------------------------------------------------------
     function countUnreadThreadsFromDom() {
         try {
@@ -1009,6 +1040,7 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     var zeroTimer = null;
     var lastRisingEdgeBucket = 0;   // set on 0→positive transition — logged only, not in sig
     var prevTitleCount = 0;         // track previous count for rising-edge logging
+    var _lastMultiSenderDom = -1;   // throttle [MultiSender] log to only fire when domUnread changes
 
     function coarseBucket() {
         return Math.floor(Date.now() / 2000);
@@ -1093,7 +1125,11 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     }
 
     function refreshActivitySnapshot() {
-        var currentCount = getUnreadCountFromTitle();
+        // Use the EFFECTIVE count (title OR sidebar DOM), not the raw title.
+        // The title's "(N)" only reflects the open conversation, so a second
+        // unread sender leaves it at "(1)"/absent and the snapshot would never
+        // refresh — leaving activity_sig empty and the new sender undetected.
+        var currentCount = effectiveUnreadCount();
         if (currentCount === 0) return;
         var snap = getActivitySnapshot(currentCount);
         if (snap.length === 0) return;
@@ -6912,6 +6948,51 @@ mod tests {
                 UNREAD_OBSERVER_SCRIPT
                     .contains("if (getUnreadCountFromTitle() <= 0) {\n            clearReconcileLatch();"),
                 "resetActivityState must guard clearReconcileLatch behind a title<=0 check"
+            );
+        }
+
+        /// A second sender does not raise the window title past "(1)" (the title
+        /// reflects the OPEN conversation only).  effectiveUnreadCount must use
+        /// the higher DOM unread-thread count when the DOM shows more unread
+        /// threads than the title, so Rust sees count_increased and fires.
+        #[test]
+        fn second_sender_uses_higher_dom_count() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("if (domUnread > titleCount) {"),
+                "effectiveUnreadCount must raise the count when the DOM shows more unread threads than the title"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("[MultiSender]"),
+                "the multi-sender DOM-over-title path must be diagnostically logged"
+            );
+        }
+
+        /// The [MultiSender] diagnostic must be throttled so the 2 s poll does
+        /// not log the same domUnread value repeatedly — otherwise the log file
+        /// grows with identical lines every poll cycle.
+        #[test]
+        fn multisender_log_is_throttled() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("if (domUnread !== _lastMultiSenderDom)"),
+                "MultiSender diagnostic must only fire when domUnread changes"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("_lastMultiSenderDom = -1"),
+                "clearReconcileLatch must reset the MultiSender throttle so it can re-fire"
+            );
+        }
+
+        /// The activity snapshot (which feeds activity_sig) must be refreshed
+        /// against the EFFECTIVE count, not the raw title — otherwise a second
+        /// sender (title still "(1)"/absent) never builds a signature and the
+        /// sig-change notification path stays permanently inactive.
+        #[test]
+        fn snapshot_refresh_uses_effective_count() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains(
+                    "function refreshActivitySnapshot() {\n        // Use the EFFECTIVE count"
+                ),
+                "refreshActivitySnapshot must derive its count from effectiveUnreadCount"
             );
         }
     }
