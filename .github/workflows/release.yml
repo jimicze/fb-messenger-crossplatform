@@ -26,6 +26,11 @@ on:
         required: false
         type: boolean
         default: false
+      force_tag_override_registry_update:
+        description: 'DANGEROUS: also submit winget + Homebrew updates for tag_override/backbuild runs (can republish or downgrade registries)'
+        required: false
+        type: boolean
+        default: false
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -703,8 +708,8 @@ jobs:
     if: |
       always() &&
       needs.publish-updater.result == 'success' &&
-      needs.create-release.outputs.is-backbuild != 'true' &&
-      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries)
+      (needs.create-release.outputs.is-backbuild != 'true' || inputs.force_tag_override_registry_update) &&
+      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries || inputs.force_tag_override_registry_update)
     runs-on: ubuntu-latest
 
     steps:
@@ -764,8 +769,8 @@ jobs:
     if: |
       always() &&
       needs.publish-updater.result == 'success' &&
-      needs.create-release.outputs.is-backbuild != 'true' &&
-      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries)
+      (needs.create-release.outputs.is-backbuild != 'true' || inputs.force_tag_override_registry_update) &&
+      (endsWith(needs.create-release.outputs.tag-name, '.0') || inputs.update_registries || inputs.force_tag_override_registry_update)
     runs-on: windows-latest
 
     steps:
