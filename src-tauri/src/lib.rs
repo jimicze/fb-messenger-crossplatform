@@ -3391,12 +3391,14 @@ fn is_prunable_archived_log(
 /// Delete rotated log archives older than [`LOG_RETENTION_DAYS`].
 ///
 /// Runs once at startup. Only `{prefix}_*` archives are considered; the active
-/// `{prefix}.log` is always preserved. I/O errors are logged at `debug` (a
-/// not-yet-created log directory on first launch is benign) and silently
-/// skipped — log pruning must never block app startup.  Per-entry
-/// `read_dir` and metadata/mtime errors are also logged at `debug`; files
-/// whose age cannot be determined are treated as age=0 (unknown age → keep)
-/// so no data is ever accidentally deleted.
+/// `{prefix}.log` is always preserved.  Errors are never fatal — log pruning
+/// must not block app startup — and are logged at two levels:
+///
+/// * **`debug`** — expected / low-severity: directory not yet created (first
+///   launch), unreadable `read_dir` entry, unreadable metadata/mtime (file
+///   is kept with age=0 so nothing is accidentally deleted).
+/// * **`warn`** — unexpected: `remove_file` failed for an archive that
+///   *should* have been deleted (file still exists after the age check).
 fn prune_old_logs(log_dir: &std::path::Path, prefix: &str, max_age_days: u64) {
     let max_age_secs = max_age_days.saturating_mul(24 * 60 * 60);
     let entries = match std::fs::read_dir(log_dir) {
