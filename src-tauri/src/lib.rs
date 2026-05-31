@@ -478,6 +478,83 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     }
 
     // ---------------------------------------------------------------------------
+    // Read-in-place reconciliation latch.
+    //
+    // Messenger keeps the `(N)` title prefix after the user reads the active
+    // conversation in-place (it only rewrites the title on navigation).  When the
+    // window is focused we cross-check the title against the sidebar DOM
+    // (`countUnreadThreadsFromDom`) and, if the DOM shows fewer unread threads,
+    // use the lower DOM value so the badge clears without a conversation switch.
+    //
+    // The latch remembers the title value at which we last reconciled down, so the
+    // lowered value survives the window losing focus (otherwise an unfocus would
+    // re-raise the badge from the still-stale title).  A genuinely new message
+    // bumps the title beyond the latched value, which invalidates the latch and
+    // restores title-trust — so new-message notifications are never suppressed.
+    // ---------------------------------------------------------------------------
+    var reconciledTitleCount = -1; // title value when we last reconciled down
+    var reconciledValue = -1;      // the lower (DOM-derived) value we pushed
+
+    function clearReconcileLatch() {
+        reconciledTitleCount = -1;
+        reconciledValue = -1;
+    }
+
+    function effectiveUnreadCount() {
+        var titleCount = getUnreadCountFromTitle();
+        // Always consult the sidebar DOM.  The window title's "(N)" is the unread
+        // count of the *currently-open* conversation, NOT the total number of
+        // unread conversations — so a message from a second sender (while a first
+        // is still unread) never raises the title past "(1)".  Counting unread
+        // sidebar threads is the only reliable signal for that case.  Returns
+        // -1 when the conversation list is absent (cannot be trusted).
+        var domUnread = countUnreadThreadsFromDom();
+
+        // DOM shows MORE unread threads than the title → a second/third sender.
+        // Drive the effective count up so Rust sees count_increased and fires,
+        // regardless of focus (an unfocused new message must still notify; a
+        // focused one updates the badge).  The latch is irrelevant when rising.
+        if (domUnread > titleCount) {
+            clearReconcileLatch();
+            jlog('[MultiSender] title=' + titleCount + ' domUnread=' + domUnread
+                + ' — using DOM count (second sender not reflected in title)');
+            return domUnread;
+        }
+
+        if (titleCount <= 0) {
+            clearReconcileLatch();
+            return titleCount;
+        }
+        // Honour an active latch while the title has not grown past it (no new
+        // message): keep showing the reconciled-down value even when unfocused.
+        if (reconciledTitleCount === titleCount
+                && reconciledValue >= 0
+                && reconciledValue < titleCount) {
+            return reconciledValue;
+        }
+        var focused = false;
+        try { focused = typeof document.hasFocus === 'function' && document.hasFocus(); } catch(_) {}
+        if (!focused) {
+            // Unfocused + no active latch → trust the title so a brand-new message
+            // (DOM may not have rendered its unread marker yet) still notifies.
+            return titleCount;
+        }
+        if (domUnread < 0) {
+            return titleCount; // conversation list absent — cannot trust DOM
+        }
+        if (domUnread < titleCount) {
+            reconciledTitleCount = titleCount;
+            reconciledValue = domUnread;
+            jlog('[ReadInPlace] focused; title=' + titleCount
+                + ' domUnread=' + domUnread + ' — reconciling badge to DOM count');
+            return domUnread;
+        }
+        clearReconcileLatch();
+        return titleCount;
+    }
+
+
+    // ---------------------------------------------------------------------------
     // Composite unread-signal detection for a single link element.
     // Returns an object: { isUnread: bool, hasBadge: bool, hasBold: bool, hasDot: bool }
     // ---------------------------------------------------------------------------
@@ -601,7 +678,36 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     }
 
     // ---------------------------------------------------------------------------
-    // Sender lookup — only returns a name when a confirmed unread signal exists.
+    // countUnreadThreadsFromDom() — count conversation threads that still show an
+    // unread signal in the sidebar DOM.
+    //
+    // Why: Messenger keeps the `(N)` prefix in document.title even after the user
+    // reads the active conversation *in-place* (it only rewrites the title on
+    // navigation / conversation switch).  The sidebar DOM, however, drops the
+    // unread markers (bold / badge / dot) for a thread as soon as it is read.
+    // Counting unread thread links therefore reflects the real unread state sooner
+    // than the title does, letting the badge clear without a conversation switch.
+    //
+    // Returns -1 ("unknown") when the conversation list is not present in the DOM
+    // (e.g. a narrow/thread-only view) so callers never clear a badge based on an
+    // absent list.  Otherwise returns the number of unread thread links.
+    // ---------------------------------------------------------------------------
+    function countUnreadThreadsFromDom() {
+        try {
+            var links = getAllThreadLinks();
+            if (links.length === 0) return -1; // list not in DOM — cannot determine
+            var n = 0;
+            for (var i = 0; i < links.length; i++) {
+                try {
+                    if (detectUnreadSignals(links[i]).isUnread) n++;
+                } catch(_) {}
+            }
+            return n;
+        } catch(_) {
+            return -1;
+        }
+    }
+
     // Does NOT fall back to the first conversation; that risks wrong sender name.
     // Uses expanded link selectors via getAllThreadLinks().
     // ---------------------------------------------------------------------------
@@ -958,6 +1064,15 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
         lastThreadMutSeqAt = 0;
         _threadDiagSampleCount = 0;
         _threadDiagLastTs = 0;
+        // Only drop the read-in-place latch when the title itself has returned to
+        // 0.  If the title still shows "(N)" (Messenger keeps the prefix after an
+        // in-place read until navigation), clearing the latch here would let the
+        // next unfocused poll re-raise the badge from the stale title — exactly
+        // the bug the latch prevents.  When the title is genuinely 0 the latch is
+        // a no-op anyway (effectiveUnreadCount clears it on titleCount<=0).
+        if (getUnreadCountFromTitle() <= 0) {
+            clearReconcileLatch();
+        }
         if (activityDebounceTimer !== null) {
             clearTimeout(activityDebounceTimer);
             activityDebounceTimer = null;
@@ -996,7 +1111,11 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     }
 
     function refreshActivitySnapshot() {
-        var currentCount = getUnreadCountFromTitle();
+        // Use the EFFECTIVE count (title OR sidebar DOM), not the raw title.
+        // The title's "(N)" only reflects the open conversation, so a second
+        // unread sender leaves it at "(1)"/absent and the snapshot would never
+        // refresh — leaving activity_sig empty and the new sender undetected.
+        var currentCount = effectiveUnreadCount();
         if (currentCount === 0) return;
         var snap = getActivitySnapshot(currentCount);
         if (snap.length === 0) return;
@@ -1321,7 +1440,7 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
         var prevLastSentSig = lastSentSig;
         lastSentSig = optimisticSig;
         setTimeout(function() {
-            var currentCount = getUnreadCountFromTitle();
+            var currentCount = effectiveUnreadCount();
             if (currentCount === 0) {
                 // Count dropped — revert optimistic sig so next real event fires.
                 lastSentSig = prevLastSentSig;
@@ -1350,14 +1469,14 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     }
 
     function setupObserver() {
-        var lastCount = getUnreadCountFromTitle();
-        prevTitleCount = lastCount;
+        var lastCount = effectiveUnreadCount();
+        prevTitleCount = getUnreadCountFromTitle();
         sendUnreadCount(lastCount);
         setupActivityObserver();
         var titleElement = document.querySelector('title');
         if (titleElement) {
             var observer = new MutationObserver(function() {
-                var newCount = getUnreadCountFromTitle();
+                var newCount = effectiveUnreadCount();
                 if (newCount !== lastCount) {
                     // Track rising edge BEFORE updating lastCount.
                     markRisingEdge(newCount);
@@ -1367,9 +1486,11 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             });
             observer.observe(titleElement, { childList: true, characterData: true, subtree: true });
         }
-        // Polling fallback: also catches sig changes (new message, same count).
+        // Polling fallback: also catches sig changes (new message, same count) and
+        // read-in-place reconciliation (title keeps `(N)` until navigation, but the
+        // sidebar DOM clears the unread marker — effectiveUnreadCount() picks that up).
         setInterval(function() {
-            var newCount = getUnreadCountFromTitle();
+            var newCount = effectiveUnreadCount();
             if (newCount > 0) {
                 refreshActivitySnapshot();
             }
@@ -1381,10 +1502,17 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             }
         }, 2000);
 
-        // When window gains focus and count=0, immediately reset baseline so
-        // the next new message starts fresh.
+        // When the window gains focus, recompute the effective count immediately:
+        //  - an in-place read performed while unfocused is reconciled to the lower
+        //    DOM count without waiting for the 2 s poll, and
+        //  - a count=0 result resets the activity baseline (user has seen messages).
         window.addEventListener('focus', function() {
-            var fc = getUnreadCountFromTitle();
+            var fc = effectiveUnreadCount();
+            if (fc !== lastCount) {
+                markRisingEdge(fc);
+                lastCount = fc;
+                sendUnreadCount(fc);
+            }
             if (fc === 0 && (lastActivitySnapshot.length > 0 || zeroTimer !== null)) {
                 jlog('[Activity] window focused with count=0 — resetting baseline');
                 resetActivityState();
@@ -3364,6 +3492,25 @@ where
 /// Number of days of rotated log archives to retain on disk.
 const LOG_RETENTION_DAYS: u64 = 7;
 
+/// Decide whether an executable path indicates the app is running under macOS
+/// **App Translocation** (Gatekeeper path randomization).
+///
+/// When an ad-hoc-signed / un-notarized `.app` carries the `com.apple.quarantine`
+/// xattr (set automatically when a CI artifact is downloaded via a browser),
+/// Gatekeeper executes it from an ephemeral read-only mount such as
+/// `/private/var/folders/<…>/AppTranslocation/<UUID>/d/Messenger X.app`. In that
+/// mode the persistent log file is not created in `~/Library/Logs/<id>/` and
+/// native notifications do not deliver reliably — making the build appear
+/// completely broken even though the process is running. Detecting the
+/// `/AppTranslocation/` segment lets us warn the tester to dequarantine
+/// (`xattr -dr com.apple.quarantine "/Applications/Messenger X.app"`).
+///
+/// Pure helper so the path policy can be unit-tested without a real bundle.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_translocated_path(exe_path: &str) -> bool {
+    exe_path.contains("/AppTranslocation/")
+}
+
 /// Decide whether a file in the log directory is a prunable rotated archive.
 ///
 /// `tauri-plugin-log`'s `KeepAll` rotation renames the active file to
@@ -3384,7 +3531,7 @@ fn is_prunable_archived_log(
     // next character is `_` (the separator used by tauri-plugin-log KeepAll).
     file_name
         .strip_prefix(prefix)
-        .map_or(false, |rest| rest.starts_with('_'))
+        .is_some_and(|rest| rest.starts_with('_'))
         && age_secs > max_age_secs
 }
 
@@ -3706,6 +3853,39 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // is initialized (inside setup_app), not from run() where the logger is not yet
     // active. This was the bug that caused all [Env] lines to be silently dropped.
     log_platform_environment();
+
+    // macOS App Translocation guard.  A downloaded, ad-hoc-signed / un-notarized
+    // build carries `com.apple.quarantine`, so Gatekeeper runs it from an
+    // ephemeral `/AppTranslocation/<UUID>/…` mount where the log file is never
+    // written and native notifications do not deliver — the app appears broken
+    // for no visible reason.  Detect it, log a prominent warning, and show a
+    // one-time dialog telling the tester how to fix it.  No-op on Linux/Windows
+    // (those platforms have no translocation) and for properly installed builds.
+    #[cfg(target_os = "macos")]
+    {
+        let exe_path = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if is_translocated_path(&exe_path) {
+            log::warn!(
+                "[MessengerX][Translocation] running translocated from {exe_path:?} — \
+                 logs and notifications WILL NOT work. Remove the quarantine attribute: \
+                 xattr -dr com.apple.quarantine \"/Applications/Messenger X.app\""
+            );
+            use tauri_plugin_dialog::DialogExt;
+            app.handle()
+                .dialog()
+                .message(
+                    "Aplikace běží v režimu macOS App Translocation (kvůli karanténě \
+                     u staženého buildu), takže notifikace ani logy nefungují.\n\n\
+                     Oprava: ukonči aplikaci a spusť v Terminálu:\n\
+                     xattr -dr com.apple.quarantine \"/Applications/Messenger X.app\"\n\n\
+                     Poté aplikaci spusť znovu.",
+                )
+                .title("Messenger X — akce potřebná")
+                .show(|_| {});
+        }
+    }
 
     // Prune rotated log archives older than the retention window. Runs once at
     // startup; failures are logged and ignored so this never blocks boot.
@@ -6402,6 +6582,36 @@ mod tests {
         }
     }
 
+    mod translocation {
+        use super::super::is_translocated_path;
+
+        #[test]
+        fn translocated_path_is_detected() {
+            assert!(is_translocated_path(
+                "/private/var/folders/cd/abc123/d/AppTranslocation/1234-UUID/d/Messenger X.app/Contents/MacOS/messengerx"
+            ));
+        }
+
+        #[test]
+        fn real_applications_path_is_not_translocated() {
+            assert!(!is_translocated_path(
+                "/Applications/Messenger X.app/Contents/MacOS/messengerx"
+            ));
+        }
+
+        #[test]
+        fn local_debug_build_path_is_not_translocated() {
+            assert!(!is_translocated_path(
+                "/Users/dev/project/src-tauri/target/debug/bundle/macos/Messenger X.app/Contents/MacOS/messengerx"
+            ));
+        }
+
+        #[test]
+        fn empty_path_is_not_translocated() {
+            assert!(!is_translocated_path(""));
+        }
+    }
+
     mod sender_hint_cache {
         use super::super::{SenderHintCache, SENDER_HINT_RETAIN};
         use std::time::{Duration, Instant};
@@ -6659,6 +6869,101 @@ mod tests {
             assert!(
                 VISIBILITY_OVERRIDE_SCRIPT.contains("get_window_focused"),
                 "script must invoke get_window_focused to resync state on each navigation"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unread observer — read-in-place badge reconciliation regression tests
+    // -----------------------------------------------------------------------
+    mod unread_read_in_place {
+        use super::super::UNREAD_OBSERVER_SCRIPT;
+
+        /// The script must derive an unread count from the sidebar DOM so an
+        /// in-place read can clear the badge even though Messenger keeps the
+        /// `(N)` document.title prefix until the user navigates.
+        #[test]
+        fn counts_unread_threads_from_dom() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function countUnreadThreadsFromDom"),
+                "script must define countUnreadThreadsFromDom"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function effectiveUnreadCount"),
+                "script must define effectiveUnreadCount that reconciles title vs DOM"
+            );
+        }
+
+        /// The DOM count must only be trusted when the window is focused and the
+        /// conversation list is present (returns -1 / unknown when absent), so a
+        /// brand-new message while unfocused still notifies via the title count.
+        #[test]
+        fn dom_reconciliation_is_focus_gated_and_list_guarded() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("if (links.length === 0) return -1"),
+                "countUnreadThreadsFromDom must return -1 when the list is absent"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("if (!focused) {"),
+                "effectiveUnreadCount must fall back to the title when unfocused"
+            );
+        }
+
+        /// The reconciliation latch must survive the window losing focus (so the
+        /// badge does not re-raise from the still-stale title) yet yield to a
+        /// genuinely new message that bumps the title past the latched value.
+        #[test]
+        fn latch_survives_unfocus_but_yields_to_new_message() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("reconciledTitleCount === titleCount"),
+                "effectiveUnreadCount must honour the latch while the title is unchanged"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function clearReconcileLatch"),
+                "script must define clearReconcileLatch to invalidate the latch"
+            );
+        }
+
+        /// `resetActivityState()` must NOT clear the latch while the title still
+        /// shows "(N)" — otherwise the next unfocused poll re-raises the badge
+        /// from the stale title.  The latch may only be dropped once the title
+        /// itself has returned to 0.
+        #[test]
+        fn reset_only_clears_latch_when_title_is_zero() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT
+                    .contains("if (getUnreadCountFromTitle() <= 0) {\n            clearReconcileLatch();"),
+                "resetActivityState must guard clearReconcileLatch behind a title<=0 check"
+            );
+        }
+
+        /// A second sender does not raise the window title past "(1)" (the title
+        /// reflects the OPEN conversation only).  effectiveUnreadCount must use
+        /// the higher DOM unread-thread count when the DOM shows more unread
+        /// threads than the title, so Rust sees count_increased and fires.
+        #[test]
+        fn second_sender_uses_higher_dom_count() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("if (domUnread > titleCount) {"),
+                "effectiveUnreadCount must raise the count when the DOM shows more unread threads than the title"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("[MultiSender]"),
+                "the multi-sender DOM-over-title path must be diagnostically logged"
+            );
+        }
+
+        /// The activity snapshot (which feeds activity_sig) must be refreshed
+        /// against the EFFECTIVE count, not the raw title — otherwise a second
+        /// sender (title still "(1)"/absent) never builds a signature and the
+        /// sig-change notification path stays permanently inactive.
+        #[test]
+        fn snapshot_refresh_uses_effective_count() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains(
+                    "function refreshActivitySnapshot() {\n        // Use the EFFECTIVE count"
+                ),
+                "refreshActivitySnapshot must derive its count from effectiveUnreadCount"
             );
         }
     }
