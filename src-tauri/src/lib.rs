@@ -3345,7 +3345,7 @@ fn format_log_line<Tz>(
     now: &chrono::DateTime<Tz>,
     target: &str,
     level: log::Level,
-    message: &str,
+    message: &dyn std::fmt::Display,
 ) -> String
 where
     Tz: chrono::TimeZone,
@@ -3386,9 +3386,11 @@ fn is_prunable_archived_log(
 /// Delete rotated log archives older than [`LOG_RETENTION_DAYS`].
 ///
 /// Runs once at startup. Only `{prefix}_*` archives are considered; the active
-/// `{prefix}.log` is always preserved. Any I/O error is logged (at `debug`,
-/// since a not-yet-created log directory on first launch is benign) and
-/// ignored — log pruning must never block app startup.
+/// `{prefix}.log` is always preserved. I/O errors are logged at `debug` (a
+/// not-yet-created log directory on first launch is benign) and silently
+/// skipped — log pruning must never block app startup.  Per-entry
+/// metadata/mtime errors are also logged at `debug`; those files are treated
+/// as age=0 (unknown age → keep) so no data is ever accidentally deleted.
 fn prune_old_logs(log_dir: &std::path::Path, prefix: &str, max_age_days: u64) {
     let max_age_secs = max_age_days.saturating_mul(24 * 60 * 60);
     let entries = match std::fs::read_dir(log_dir) {
@@ -3405,13 +3407,18 @@ fn prune_old_logs(log_dir: &std::path::Path, prefix: &str, max_age_days: u64) {
     let mut removed = 0u32;
     for entry in entries.flatten() {
         let file_name = entry.file_name().to_string_lossy().into_owned();
-        let age_secs = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|mtime| now.duration_since(mtime).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let age_secs = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(mtime) => now
+                .duration_since(mtime)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            Err(e) => {
+                log::debug!(
+                    "[MessengerX][Log] Cannot read metadata for {file_name}, skipping: {e}"
+                );
+                0
+            }
+        };
         if is_prunable_archived_log(&file_name, prefix, age_secs, max_age_secs) {
             if let Err(e) = std::fs::remove_file(entry.path()) {
                 log::warn!("[MessengerX][Log] Failed to prune old log {file_name}: {e}");
@@ -3573,7 +3580,7 @@ pub fn run() {
                             &chrono::Local::now(),
                             record.target(),
                             record.level(),
-                            &message.to_string(),
+                            message,
                         )
                     ))
                 })
@@ -6320,7 +6327,7 @@ mod tests {
             // +02:00 == CEST, the offset that was being dropped in favour of UTC.
             let tz = FixedOffset::east_opt(2 * 3600).unwrap();
             let ts = tz.with_ymd_and_hms(2026, 5, 31, 8, 43, 12).unwrap();
-            let line = format_log_line(&ts, "messengerx", log::Level::Info, "hello world");
+            let line = format_log_line(&ts, "messengerx", log::Level::Info, &"hello world");
             assert_eq!(line, "[2026-05-31][08:43:12][messengerx][INFO] hello world");
         }
 
@@ -6330,7 +6337,7 @@ mod tests {
             // proving we render the supplied local time rather than UTC.
             let utc = chrono::Utc.with_ymd_and_hms(2026, 5, 31, 6, 43, 12).unwrap();
             let cest = utc.with_timezone(&FixedOffset::east_opt(2 * 3600).unwrap());
-            let line = format_log_line(&cest, "t", log::Level::Warn, "m");
+            let line = format_log_line(&cest, "t", log::Level::Warn, &"m");
             assert_eq!(line, "[2026-05-31][08:43:12][t][WARN] m");
         }
 
