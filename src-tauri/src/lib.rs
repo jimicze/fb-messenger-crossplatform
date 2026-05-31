@@ -496,9 +496,13 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     var reconciledTitleCount = -1; // title value when we last reconciled down
     var reconciledValue = -1;      // the lower (DOM-derived) value we pushed
 
-    function clearReconcileLatch() {
+    function clearLatchOnly() {
         reconciledTitleCount = -1;
         reconciledValue = -1;
+    }
+
+    function clearReconcileLatch() {
+        clearLatchOnly();
         _lastMultiSenderDom = -1;
     }
 
@@ -517,8 +521,9 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
         // regardless of focus (an unfocused new message must still notify; a
         // focused one updates the badge).  The latch is irrelevant when rising.
         if (domUnread > titleCount) {
-            reconciledTitleCount = -1;
-            reconciledValue = -1;
+            // Clear only the read-in-place latch; keep _lastMultiSenderDom so
+            // repeated 2 s polls do not spam identical [MultiSender] lines.
+            clearLatchOnly();
             if (domUnread !== _lastMultiSenderDom) {
                 _lastMultiSenderDom = domUnread;
                 jlog('[MultiSender] title=' + titleCount + ' domUnread=' + domUnread
@@ -689,12 +694,41 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             }
             return n;
         }
+
+        // Locale-aware but still conservative: explicitly chat-labeled roots may
+        // use broad role-link rows because some Messenger builds omit hrefs.  The
+        // generic navigation/complementary fallback below still requires real
+        // thread hrefs to avoid counting unrelated controls.
+        function isChatListLabel(label) {
+            var l = (label || '').toLowerCase();
+            var keys = [
+                // English, Czech/Slovak, German, French, Spanish, Italian,
+                // Portuguese, Polish, Dutch, Romanian, Hungarian, Russian,
+                // Ukrainian, Croatian/Serbian/Bosnian, Slovenian, Turkish.
+                'chat','konverz','zpr\u00e1v','spr\u00e1v','unterhaltung','nachricht',
+                'discussion','message','mensaje','conversaci','chatta','messagg',
+                'conversa','czat','wiadomo','gesprek','bericht','conversa\u021b',
+                'mesaj','\u00fczenet','besz\u00e9lget','\u0447\u0430\u0442','\u0441\u043e\u043e\u0431\u0449',
+                '\u043f\u043e\u0432\u0456\u0434','razgovor','poruk','sporo\u010d','sohbet'
+            ];
+            for (var ki = 0; ki < keys.length; ki++) {
+                if (l.indexOf(keys[ki]) !== -1) return true;
+            }
+            return false;
+        }
+
         try {
-            var chatRoots = document.querySelectorAll(
-                '[aria-label*="Chats"], [aria-label*="Chaty"], [aria-label*="Konverzace"]'
-            );
+            var chatRoots = document.querySelectorAll('[aria-label], [aria-labelledby]');
             for (var ci = 0; ci < chatRoots.length; ci++) {
-                if (chatRoots[ci] && chatRoots[ci].querySelector(anyThreadLink)) {
+                var label = chatRoots[ci].getAttribute('aria-label') || '';
+                var labelledBy = chatRoots[ci].getAttribute('aria-labelledby') || '';
+                if (labelledBy) {
+                    try {
+                        var labelEl = document.getElementById(labelledBy);
+                        if (labelEl) label += ' ' + (labelEl.textContent || '');
+                    } catch(_) {}
+                }
+                if (chatRoots[ci] && isChatListLabel(label) && chatRoots[ci].querySelector(anyThreadLink)) {
                     return chatRoots[ci];
                 }
             }
@@ -792,7 +826,7 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     //
     // PERFORMANCE NOTE: this walks every sidebar thread link and calls
     // getComputedStyle per span — it forces layout.  Called every 2 s via the
-    // poll when effectiveUnreadCount is invoked.  The early return above
+    // poll when effectiveUnreadCount is invoked.  The early return below
     // (links.length === 0) keeps the idle cost near-zero when the list is not in
     // the DOM; when the list is present the cost is proportional to the number
     // of visible conversations (~20–30 on a typical screen).  If jank is observed
@@ -7085,6 +7119,14 @@ mod tests {
                 !UNREAD_OBSERVER_SCRIPT.contains("if (domUnread > titleCount) {\n            clearReconcileLatch();"),
                 "MultiSender branch must not reset the throttle before checking it"
             );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function clearLatchOnly"),
+                "latch-only reset helper must keep throttle-safe reset logic in one place"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("clearLatchOnly();\n            if (domUnread !== _lastMultiSenderDom)"),
+                "MultiSender branch must clear only the latch before throttle check"
+            );
         }
 
         /// DOM unread scans must be scoped to a conversation-list root, not the
@@ -7107,6 +7149,16 @@ mod tests {
             assert!(
                 UNREAD_OBSERVER_SCRIPT.contains("distinctHrefCount(roots[ri]) > 0"),
                 "generic semantic roots must require real thread hrefs, not broad role links"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function isChatListLabel"),
+                "chat-list root detection must be locale-aware instead of hard-coding only English/Czech selectors"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("discussion")
+                    && UNREAD_OBSERVER_SCRIPT.contains("conversa")
+                    && UNREAD_OBSERVER_SCRIPT.contains("czat"),
+                "chat-list root detection should cover common Messenger locales"
             );
             assert!(
                 UNREAD_OBSERVER_SCRIPT.contains("var nodes = root.querySelectorAll(selectors[si]);"),
