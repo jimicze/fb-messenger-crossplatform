@@ -541,10 +541,13 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
                 && reconciledValue >= 0
                 && reconciledValue < titleCount) {
             if (domUnread >= 0 && domUnread > reconciledValue) {
+                var oldReconciledValue = reconciledValue;
                 clearReconcileLatch();
                 jlog('[ReadInPlace] latch invalidated by DOM rise title=' + titleCount
-                    + ' domUnread=' + domUnread + ' reconciled=' + reconciledValue);
-                return Math.max(titleCount, domUnread);
+                    + ' domUnread=' + domUnread + ' reconciled=' + oldReconciledValue);
+                // The title was already proven stale by the latch; when DOM rises,
+                // trust the DOM count instead of re-trusting the stale title.
+                return domUnread;
             }
             return reconciledValue;
         }
@@ -673,13 +676,35 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     function getConversationListRoot() {
         var anyThreadLink = 'a[href*="/t/"], a[href*="/e2ee/"], a[href*="thread_fbid"], [role="link"][tabindex]';
         var hrefThreadLink = 'a[href*="/t/"], a[href*="/e2ee/"], a[href*="thread_fbid"]';
+        function distinctHrefCount(scope) {
+            var seenHref = {};
+            var links = scope.querySelectorAll(hrefThreadLink);
+            for (var hi = 0; hi < links.length; hi++) {
+                var href = links[hi].getAttribute('href') || '';
+                if (href.length > 0) seenHref[href] = true;
+            }
+            var n = 0;
+            for (var k in seenHref) {
+                if (Object.prototype.hasOwnProperty.call(seenHref, k)) n++;
+            }
+            return n;
+        }
         try {
-            var roots = document.querySelectorAll(
-                '[role="navigation"], [role="complementary"], nav, '
-                + '[aria-label*="Chats"], [aria-label*="Chaty"], [aria-label*="Konverzace"]'
+            var chatRoots = document.querySelectorAll(
+                '[aria-label*="Chats"], [aria-label*="Chaty"], [aria-label*="Konverzace"]'
             );
+            for (var ci = 0; ci < chatRoots.length; ci++) {
+                if (chatRoots[ci] && chatRoots[ci].querySelector(anyThreadLink)) {
+                    return chatRoots[ci];
+                }
+            }
+
+            var roots = document.querySelectorAll('[role="navigation"], [role="complementary"], nav');
             for (var ri = 0; ri < roots.length; ri++) {
-                if (roots[ri] && roots[ri].querySelector(anyThreadLink)) {
+                // Require real thread hrefs for generic semantic roots.  Broad
+                // role links inside navigation/complementary can be unrelated
+                // controls; allowing them here reintroduces false unread counts.
+                if (roots[ri] && distinctHrefCount(roots[ri]) > 0) {
                     return roots[ri];
                 }
             }
@@ -689,11 +714,12 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             // up until an ancestor contains the visible thread-link cluster.  Never
             // return document.body; body-scope is exactly what causes false counts.
             var hrefLinks = document.querySelectorAll(hrefThreadLink);
+            var totalDistinctHrefs = distinctHrefCount(document);
             for (var li = 0; li < hrefLinks.length; li++) {
                 var node = hrefLinks[li].parentElement;
                 for (var depth = 0; depth < 10 && node && node !== document.body; depth++) {
-                    var count = node.querySelectorAll(hrefThreadLink).length;
-                    if (count >= Math.min(2, hrefLinks.length)) {
+                    var count = distinctHrefCount(node);
+                    if (count >= Math.min(2, totalDistinctHrefs)) {
                         return node;
                     }
                     node = node.parentElement;
@@ -7011,6 +7037,10 @@ mod tests {
                 UNREAD_OBSERVER_SCRIPT.contains("domUnread >= 0 && domUnread > reconciledValue"),
                 "latch must be invalidated when DOM unread count rises above the reconciled value"
             );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("return domUnread;"),
+                "latch invalidation must trust DOM count instead of stale title count"
+            );
         }
 
         /// `resetActivityState()` must NOT clear the latch while the title still
@@ -7069,6 +7099,14 @@ mod tests {
             assert!(
                 UNREAD_OBSERVER_SCRIPT.contains("var root = getConversationListRoot();"),
                 "getAllThreadLinks must query inside the resolved root"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function distinctHrefCount"),
+                "conversation-list root inference must count distinct thread href identities"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("distinctHrefCount(roots[ri]) > 0"),
+                "generic semantic roots must require real thread hrefs, not broad role links"
             );
             assert!(
                 UNREAD_OBSERVER_SCRIPT.contains("var nodes = root.querySelectorAll(selectors[si]);"),
