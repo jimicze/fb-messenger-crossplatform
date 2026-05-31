@@ -502,6 +502,25 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
 
     function effectiveUnreadCount() {
         var titleCount = getUnreadCountFromTitle();
+        // Always consult the sidebar DOM.  The window title's "(N)" is the unread
+        // count of the *currently-open* conversation, NOT the total number of
+        // unread conversations — so a message from a second sender (while a first
+        // is still unread) never raises the title past "(1)".  Counting unread
+        // sidebar threads is the only reliable signal for that case.  Returns
+        // -1 when the conversation list is absent (cannot be trusted).
+        var domUnread = countUnreadThreadsFromDom();
+
+        // DOM shows MORE unread threads than the title → a second/third sender.
+        // Drive the effective count up so Rust sees count_increased and fires,
+        // regardless of focus (an unfocused new message must still notify; a
+        // focused one updates the badge).  The latch is irrelevant when rising.
+        if (domUnread > titleCount) {
+            clearReconcileLatch();
+            jlog('[MultiSender] title=' + titleCount + ' domUnread=' + domUnread
+                + ' — using DOM count (second sender not reflected in title)');
+            return domUnread;
+        }
+
         if (titleCount <= 0) {
             clearReconcileLatch();
             return titleCount;
@@ -520,7 +539,6 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             // (DOM may not have rendered its unread marker yet) still notifies.
             return titleCount;
         }
-        var domUnread = countUnreadThreadsFromDom();
         if (domUnread < 0) {
             return titleCount; // conversation list absent — cannot trust DOM
         }
@@ -1093,7 +1111,11 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     }
 
     function refreshActivitySnapshot() {
-        var currentCount = getUnreadCountFromTitle();
+        // Use the EFFECTIVE count (title OR sidebar DOM), not the raw title.
+        // The title's "(N)" only reflects the open conversation, so a second
+        // unread sender leaves it at "(1)"/absent and the snapshot would never
+        // refresh — leaving activity_sig empty and the new sender undetected.
+        var currentCount = effectiveUnreadCount();
         if (currentCount === 0) return;
         var snap = getActivitySnapshot(currentCount);
         if (snap.length === 0) return;
@@ -6912,6 +6934,36 @@ mod tests {
                 UNREAD_OBSERVER_SCRIPT
                     .contains("if (getUnreadCountFromTitle() <= 0) {\n            clearReconcileLatch();"),
                 "resetActivityState must guard clearReconcileLatch behind a title<=0 check"
+            );
+        }
+
+        /// A second sender does not raise the window title past "(1)" (the title
+        /// reflects the OPEN conversation only).  effectiveUnreadCount must use
+        /// the higher DOM unread-thread count when the DOM shows more unread
+        /// threads than the title, so Rust sees count_increased and fires.
+        #[test]
+        fn second_sender_uses_higher_dom_count() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("if (domUnread > titleCount) {"),
+                "effectiveUnreadCount must raise the count when the DOM shows more unread threads than the title"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("[MultiSender]"),
+                "the multi-sender DOM-over-title path must be diagnostically logged"
+            );
+        }
+
+        /// The activity snapshot (which feeds activity_sig) must be refreshed
+        /// against the EFFECTIVE count, not the raw title — otherwise a second
+        /// sender (title still "(1)"/absent) never builds a signature and the
+        /// sig-change notification path stays permanently inactive.
+        #[test]
+        fn snapshot_refresh_uses_effective_count() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains(
+                    "function refreshActivitySnapshot() {\n        // Use the EFFECTIVE count"
+                ),
+                "refreshActivitySnapshot must derive its count from effectiveUnreadCount"
             );
         }
     }
