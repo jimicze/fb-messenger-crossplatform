@@ -488,16 +488,22 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     //
     // The latch remembers the title value at which we last reconciled down, so the
     // lowered value survives the window losing focus (otherwise an unfocus would
-    // re-raise the badge from the still-stale title).  A genuinely new message
-    // bumps the title beyond the latched value, which invalidates the latch and
-    // restores title-trust — so new-message notifications are never suppressed.
+    // re-raise the badge from the still-stale title).  A genuinely new message may
+    // NOT bump the title (Messenger's title count is per-open conversation), so a
+    // DOM unread count that rises above the reconciled value also invalidates the
+    // latch and restores notification delivery.
     // ---------------------------------------------------------------------------
     var reconciledTitleCount = -1; // title value when we last reconciled down
     var reconciledValue = -1;      // the lower (DOM-derived) value we pushed
 
-    function clearReconcileLatch() {
+    function clearLatchOnly() {
         reconciledTitleCount = -1;
         reconciledValue = -1;
+    }
+
+    function clearReconcileLatch() {
+        clearLatchOnly();
+        _lastMultiSenderDom = -1;
     }
 
     function effectiveUnreadCount() {
@@ -515,9 +521,14 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
         // regardless of focus (an unfocused new message must still notify; a
         // focused one updates the badge).  The latch is irrelevant when rising.
         if (domUnread > titleCount) {
-            clearReconcileLatch();
-            jlog('[MultiSender] title=' + titleCount + ' domUnread=' + domUnread
-                + ' — using DOM count (second sender not reflected in title)');
+            // Clear only the read-in-place latch; keep _lastMultiSenderDom so
+            // repeated 2 s polls do not spam identical [MultiSender] lines.
+            clearLatchOnly();
+            if (domUnread !== _lastMultiSenderDom) {
+                _lastMultiSenderDom = domUnread;
+                jlog('[MultiSender] title=' + titleCount + ' domUnread=' + domUnread
+                    + ' — using DOM count (second sender not reflected in title)');
+            }
             return domUnread;
         }
 
@@ -525,11 +536,24 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             clearReconcileLatch();
             return titleCount;
         }
-        // Honour an active latch while the title has not grown past it (no new
-        // message): keep showing the reconciled-down value even when unfocused.
+        // Honour an active latch only while the DOM has NOT risen above the
+        // reconciled-down value.  This covers the real-world edge case:
+        // title stays stale at "(1)", user reads active chat in-place → latch=0,
+        // then Bob sends a new unread thread and DOM rises back to 1 while title
+        // still equals the latched title.  Returning the latched 0 there would
+        // suppress Bob forever; DOM rise must invalidate the latch.
         if (reconciledTitleCount === titleCount
                 && reconciledValue >= 0
                 && reconciledValue < titleCount) {
+            if (domUnread >= 0 && domUnread > reconciledValue) {
+                var oldReconciledValue = reconciledValue;
+                clearReconcileLatch();
+                jlog('[ReadInPlace] latch invalidated by DOM rise title=' + titleCount
+                    + ' domUnread=' + domUnread + ' reconciled=' + oldReconciledValue);
+                // The title was already proven stale by the latch; when DOM rises,
+                // trust the DOM count instead of re-trusting the stale title.
+                return domUnread;
+            }
             return reconciledValue;
         }
         var focused = false;
@@ -648,6 +672,100 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     }
 
     // ---------------------------------------------------------------------------
+    // Resolve the conversation-list root.  The unread counter must scan the
+    // sidebar/list, not the whole document: broad `[role="link"][tabindex]`
+    // matches unrelated controls in the active thread and can create false
+    // unread counts.  Prefer semantic Messenger roots, then infer a shared
+    // ancestor from thread href links.  Return null when no trusted list root
+    // exists; callers then treat the DOM count as unknown (-1).
+    function getConversationListRoot() {
+        var anyThreadLink = 'a[href*="/t/"], a[href*="/e2ee/"], a[href*="thread_fbid"], [role="link"][tabindex]';
+        var hrefThreadLink = 'a[href*="/t/"], a[href*="/e2ee/"], a[href*="thread_fbid"]';
+        function distinctHrefCount(scope) {
+            var seenHref = {};
+            var links = scope.querySelectorAll(hrefThreadLink);
+            for (var hi = 0; hi < links.length; hi++) {
+                var href = links[hi].getAttribute('href') || '';
+                if (href.length > 0) seenHref[href] = true;
+            }
+            var n = 0;
+            for (var k in seenHref) {
+                if (Object.prototype.hasOwnProperty.call(seenHref, k)) n++;
+            }
+            return n;
+        }
+
+        // Locale-aware but still conservative: explicitly chat-labeled roots may
+        // use broad role-link rows because some Messenger builds omit hrefs.  The
+        // generic navigation/complementary fallback below still requires real
+        // thread hrefs to avoid counting unrelated controls.
+        function isChatListLabel(label) {
+            var l = (label || '').toLowerCase();
+            var keys = [
+                // English, Czech/Slovak, German, French, Spanish, Italian,
+                // Portuguese, Polish, Dutch, Romanian, Hungarian, Russian,
+                // Ukrainian, Croatian/Serbian/Bosnian, Slovenian, Turkish.
+                'chat','konverz','zpr\u00e1v','spr\u00e1v','unterhaltung','nachricht',
+                'discussion','message','mensaje','conversaci','chatta','messagg',
+                'conversa','czat','wiadomo','gesprek','bericht','conversa\u021b',
+                'mesaj','\u00fczenet','besz\u00e9lget','\u0447\u0430\u0442','\u0441\u043e\u043e\u0431\u0449',
+                '\u043f\u043e\u0432\u0456\u0434','razgovor','poruk','sporo\u010d','sohbet'
+            ];
+            for (var ki = 0; ki < keys.length; ki++) {
+                if (l.indexOf(keys[ki]) !== -1) return true;
+            }
+            return false;
+        }
+
+        try {
+            var chatRoots = document.querySelectorAll('[aria-label], [aria-labelledby]');
+            for (var ci = 0; ci < chatRoots.length; ci++) {
+                var label = chatRoots[ci].getAttribute('aria-label') || '';
+                var labelledBy = chatRoots[ci].getAttribute('aria-labelledby') || '';
+                if (labelledBy) {
+                    try {
+                        var labelEl = document.getElementById(labelledBy);
+                        if (labelEl) label += ' ' + (labelEl.textContent || '');
+                    } catch(_) {}
+                }
+                if (chatRoots[ci] && isChatListLabel(label) && chatRoots[ci].querySelector(anyThreadLink)) {
+                    return chatRoots[ci];
+                }
+            }
+
+            var roots = document.querySelectorAll('[role="navigation"], [role="complementary"], nav');
+            for (var ri = 0; ri < roots.length; ri++) {
+                // Require real thread hrefs for generic semantic roots.  Broad
+                // role links inside navigation/complementary can be unrelated
+                // controls; allowing them here reintroduces false unread counts.
+                if (roots[ri] && distinctHrefCount(roots[ri]) > 0) {
+                    return roots[ri];
+                }
+            }
+
+            // Some Messenger builds expose no semantic navigation root.  Infer a
+            // scoped root from real thread hrefs (not broad role links) by walking
+            // up until an ancestor contains the visible thread-link cluster.  Never
+            // return document.body; body-scope is exactly what causes false counts.
+            var hrefLinks = document.querySelectorAll(hrefThreadLink);
+            var totalDistinctHrefs = distinctHrefCount(document);
+            for (var li = 0; li < hrefLinks.length; li++) {
+                var node = hrefLinks[li].parentElement;
+                for (var depth = 0; depth < 10 && node && node !== document.body; depth++) {
+                    var count = distinctHrefCount(node);
+                    if (count >= Math.min(2, totalDistinctHrefs)) {
+                        return node;
+                    }
+                    node = node.parentElement;
+                }
+            }
+            if (hrefLinks.length === 1) {
+                return hrefLinks[0].parentElement || hrefLinks[0];
+            }
+        } catch(_) {}
+        return null;
+    }
+
     // getAllThreadLinks() — expanded link selector that covers all thread URL patterns.
     // De-duplicated by href to avoid processing the same link multiple times.
     // Used in getActivitySnapshot() and getFirstUnreadSenderName().
@@ -655,6 +773,8 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     function getAllThreadLinks() {
         var seen = {};
         var result = [];
+        var root = getConversationListRoot();
+        if (!root) return result;
         var selectors = [
             'a[href*="/t/"]',
             'a[href*="/e2ee/"]',
@@ -663,10 +783,22 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
         ];
         for (var si = 0; si < selectors.length; si++) {
             try {
-                var nodes = document.querySelectorAll(selectors[si]);
+                var nodes = root.querySelectorAll(selectors[si]);
                 for (var ni = 0; ni < nodes.length; ni++) {
                     var node = nodes[ni];
-                    var key = (node.getAttribute('href') || '') + '||' + (node.getAttribute('data-key') || ni);
+                    var href = node.getAttribute('href') || '';
+                    var dataKey = node.getAttribute('data-key') || '';
+                    var aria = node.getAttribute('aria-label') || '';
+                    var text = (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+                    // Prefer stable conversation identifiers.  Do NOT append the
+                    // loop index to href: the same anchor can match multiple
+                    // selectors (`/t/` + `[role="link"][tabindex]`) and would be
+                    // counted twice, inflating domUnread and causing false badges.
+                    var key = href ? ('href:' + href)
+                        : dataKey ? ('data:' + dataKey)
+                        : aria ? ('aria:' + aria)
+                        : text ? ('text:' + text)
+                        : ('idx:' + si + ':' + ni);
                     if (!seen[key]) {
                         seen[key] = true;
                         result.push(node);
@@ -691,6 +823,15 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     // Returns -1 ("unknown") when the conversation list is not present in the DOM
     // (e.g. a narrow/thread-only view) so callers never clear a badge based on an
     // absent list.  Otherwise returns the number of unread thread links.
+    //
+    // PERFORMANCE NOTE: this walks every sidebar thread link and calls
+    // getComputedStyle per span — it forces layout.  Called every 2 s via the
+    // poll when effectiveUnreadCount is invoked.  The early return below
+    // (links.length === 0) keeps the idle cost near-zero when the list is not in
+    // the DOM; when the list is present the cost is proportional to the number
+    // of visible conversations (~20–30 on a typical screen).  If jank is observed
+    // on low-end hardware, consider reducing the poll frequency or adding an
+    // RAF-gated debounce before the scan.
     // ---------------------------------------------------------------------------
     function countUnreadThreadsFromDom() {
         try {
@@ -1027,6 +1168,7 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     var zeroTimer = null;
     var lastRisingEdgeBucket = 0;   // set on 0→positive transition — logged only, not in sig
     var prevTitleCount = 0;         // track previous count for rising-edge logging
+    var _lastMultiSenderDom = -1;   // throttle [MultiSender] log to only fire when domUnread changes
 
     function coarseBucket() {
         return Math.floor(Date.now() / 2000);
@@ -1182,7 +1324,7 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             _threadMutDebounceTimer = null;
             var batch = _pendingThreadMutations;
             _pendingThreadMutations = [];
-            var currentCount = getUnreadCountFromTitle();
+            var currentCount = effectiveUnreadCount();
             jlog('[ThreadMut] batch size=' + batch.length + ' source=' + fromSource + ' count=' + currentCount);
             var bumped = tryBumpThreadMutSeq(batch, currentCount);
             if (bumped) {
@@ -6894,9 +7036,11 @@ mod tests {
             );
         }
 
-        /// The DOM count must only be trusted when the window is focused and the
+        /// A LOWER DOM count is only trusted when the window is focused and the
         /// conversation list is present (returns -1 / unknown when absent), so a
         /// brand-new message while unfocused still notifies via the title count.
+        /// A HIGHER DOM count is trusted regardless of focus for the multi-sender
+        /// case covered below.
         #[test]
         fn dom_reconciliation_is_focus_gated_and_list_guarded() {
             assert!(
@@ -6911,7 +7055,8 @@ mod tests {
 
         /// The reconciliation latch must survive the window losing focus (so the
         /// badge does not re-raise from the still-stale title) yet yield to a
-        /// genuinely new message that bumps the title past the latched value.
+        /// genuinely new message detected by DOM unread-count rise even when the
+        /// stale title does NOT change.
         #[test]
         fn latch_survives_unfocus_but_yields_to_new_message() {
             assert!(
@@ -6921,6 +7066,14 @@ mod tests {
             assert!(
                 UNREAD_OBSERVER_SCRIPT.contains("function clearReconcileLatch"),
                 "script must define clearReconcileLatch to invalidate the latch"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("domUnread >= 0 && domUnread > reconciledValue"),
+                "latch must be invalidated when DOM unread count rises above the reconciled value"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("return domUnread;"),
+                "latch invalidation must trust DOM count instead of stale title count"
             );
         }
 
@@ -6950,6 +7103,85 @@ mod tests {
             assert!(
                 UNREAD_OBSERVER_SCRIPT.contains("[MultiSender]"),
                 "the multi-sender DOM-over-title path must be diagnostically logged"
+            );
+        }
+
+        /// The [MultiSender] diagnostic must be throttled so the 2 s poll does
+        /// not log the same domUnread value repeatedly — otherwise the log file
+        /// grows with identical lines every poll cycle.
+        #[test]
+        fn multisender_log_is_throttled() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("if (domUnread !== _lastMultiSenderDom)"),
+                "MultiSender diagnostic must only fire when domUnread changes"
+            );
+            assert!(
+                !UNREAD_OBSERVER_SCRIPT.contains("if (domUnread > titleCount) {\n            clearReconcileLatch();"),
+                "MultiSender branch must not reset the throttle before checking it"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function clearLatchOnly"),
+                "latch-only reset helper must keep throttle-safe reset logic in one place"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("clearLatchOnly();\n            if (domUnread !== _lastMultiSenderDom)"),
+                "MultiSender branch must clear only the latch before throttle check"
+            );
+        }
+
+        /// DOM unread scans must be scoped to a conversation-list root, not the
+        /// entire document/body.  Otherwise broad role-link selectors can count
+        /// unrelated controls in the active thread as unread conversations.
+        #[test]
+        fn thread_link_scan_is_scoped_to_conversation_list_root() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function getConversationListRoot"),
+                "script must resolve a trusted conversation-list root"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("var root = getConversationListRoot();"),
+                "getAllThreadLinks must query inside the resolved root"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function distinctHrefCount"),
+                "conversation-list root inference must count distinct thread href identities"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("distinctHrefCount(roots[ri]) > 0"),
+                "generic semantic roots must require real thread hrefs, not broad role links"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function isChatListLabel"),
+                "chat-list root detection must be locale-aware instead of hard-coding only English/Czech selectors"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("discussion")
+                    && UNREAD_OBSERVER_SCRIPT.contains("conversa")
+                    && UNREAD_OBSERVER_SCRIPT.contains("czat"),
+                "chat-list root detection should cover common Messenger locales"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("var nodes = root.querySelectorAll(selectors[si]);"),
+                "thread-link selectors must be scoped to the root, not document"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("var key = href ? ('href:' + href)"),
+                "thread links must de-duplicate by stable href/data/aria/text identity"
+            );
+            assert!(
+                !UNREAD_OBSERVER_SCRIPT.contains("(node.getAttribute('data-key') || ni)"),
+                "thread links must not append loop index to href/data-key because duplicate selector matches inflate domUnread"
+            );
+        }
+
+        /// Thread/body mutation batches must use the same effective count as the
+        /// polling path; otherwise title=0/stale cases still fail to bump the
+        /// mutation sequence and activity_sig remains unchanged.
+        #[test]
+        fn thread_mutation_path_uses_effective_count() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("var currentCount = effectiveUnreadCount();\n            jlog('[ThreadMut]"),
+                "thread mutation batching must use effectiveUnreadCount before tryBumpThreadMutSeq"
             );
         }
 
