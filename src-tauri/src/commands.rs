@@ -1407,6 +1407,41 @@ pub fn write_file_bytes(
     Ok(())
 }
 
+/// Saves a DOM snapshot to a file in the app's data directory for debugging.
+/// Called from JS via `invoke('save_dom_snapshot', { html: '...' })`.
+#[tauri::command]
+pub fn save_dom_snapshot(
+    html: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let file_name = format!("dom_snapshot_{}.html", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {e}"))?
+        .join(&file_name);
+
+    std::fs::write(&path, html).map_err(|e| format!("Failed to write snapshot: {e}"))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Opens the WebView developer tools for the given window.
+/// Called from JS via keyboard shortcut (F12) or debug menu.
+#[tauri::command]
+pub fn open_devtools(window: tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    {
+        window.open_devtools();
+        Ok(())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = window;
+        Err("Devtools only available in debug builds".to_string())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {

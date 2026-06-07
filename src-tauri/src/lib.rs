@@ -432,6 +432,24 @@ pub(crate) const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
 const UNREAD_OBSERVER_SCRIPT: &str = r#"
 (function() {
     var MX_SENDER_TITLE_PREFIX = '__MX_SENDER_V1__?';
+    
+    // Global: last known sender name from any source (DOM, title, etc.)
+    var _lastKnownSender = '';
+    function updateLastKnownSender(name) {
+        if (name && name.length >= 1 && name.length <= 80 && name.toLowerCase() !== 'messenger') {
+            _lastKnownSender = name;
+        }
+    }
+
+    // F12 — open WebView DevTools for manual DOM inspection
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'F12') {
+            e.preventDefault();
+            try {
+                window.__TAURI__.core.invoke('open_devtools');
+            } catch(_) {}
+        }
+    });
 
     function isMxSenderBridgeTitle(title) {
         return typeof title === 'string' && title.indexOf(MX_SENDER_TITLE_PREFIX) === 0;
@@ -440,11 +458,16 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     function emitSenderHintViaTitle(count, sender) {
         try {
             sender = String(sender || '').trim();
+            // Use last known sender as fallback when DOM extraction fails
+            if (sender.length < 1 && _lastKnownSender) {
+                sender = _lastKnownSender;
+                jlog('[SenderHint] using last-known sender: "' + sender + '"');
+            }
             if (count <= 0 || sender.length < 1 || sender.length > 120) return;
 
             // JS->Rust invoke is unavailable from remote messenger.com on some
             // desktop WebViews.  document.title still reaches Rust via Wry's
-            // native on_document_title_changed hook, so we use a very short-lived
+            // native on_document_title_changed hook, so we use a short-lived
             // sentinel title as a sender-hint side channel.  The Rust title
             // handler recognizes this prefix, stores the hint, and returns early
             // without treating it as a Messenger title/count event.
@@ -452,13 +475,15 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
             var payload = 'count=' + encodeURIComponent(String(count))
                 + '&sender=' + encodeURIComponent(sender);
             document.title = MX_SENDER_TITLE_PREFIX + payload;
+            jlog('[SenderHint] emitted sentinel title with count=' + count + ' sender="' + sender + '"');
             setTimeout(function() {
                 try {
                     if (isMxSenderBridgeTitle(document.title)) {
                         document.title = previousTitle;
+                        jlog('[SenderHint] restored previous title');
                     }
                 } catch(_) {}
-            }, 80);
+            }, 300); // 300ms for reliable WebKit capture
         } catch(_) {}
     }
 
@@ -582,9 +607,36 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     // Composite unread-signal detection for a single link element.
     // Returns an object: { isUnread: bool, hasBadge: bool, hasBold: bool, hasDot: bool }
     // ---------------------------------------------------------------------------
+    // Locale-aware unread keywords extracted from conversation text.
+    // Messenger appends preview text like "Nepřečtená zpráva: ..." (CS),
+    // "Unread message: ..." (EN), etc. to the conversation row.
+    var UNREAD_KEYWORDS = [
+        'nepřečtená zpráva', 'nepřečtená',      // Czech
+        'unread message', 'unread',                // English
+        'ungelesene nachricht', 'ungelesen',      // German
+        'message non lu', 'non lu',              // French
+        'mensaje no leído', 'no leído',          // Spanish
+        'messaggio non letto', 'non letto',      // Italian
+        'nieprzeczytana wiadomość', 'nieprzeczytana', // Polish
+        'olvasatlan üzenet', 'olvasatlan'        // Hungarian
+    ];
+    function textContainsUnreadIndicator(text) {
+        var t = (text || '').toLowerCase();
+        for (var ki = 0; ki < UNREAD_KEYWORDS.length; ki++) {
+            if (t.indexOf(UNREAD_KEYWORDS[ki]) !== -1) return true;
+        }
+        return false;
+    }
+
     function detectUnreadSignals(link) {
         var ariaLabel = (link.getAttribute('aria-label') || '').trim();
         var isUnreadViaAria = ariaLabel.toLowerCase().indexOf('unread') !== -1;
+        
+        // Signal 0: conversation text contains unread preview (most reliable).
+        // Messenger appends "Nepřečtená zpráva: ..." or "Unread message: ..."
+        // to the conversation row text when there are unread messages.
+        var linkText = (link.textContent || '').trim();
+        var hasUnreadText = textContainsUnreadIndicator(linkText);
 
         // Signal 2: small numeric badge in parent container.
         var hasNumericBadge = false;
@@ -600,48 +652,56 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
 
         // Signal 3: font-weight >= 600 on a span[dir="auto"] inside the link.
         var hasBold = false;
+        var fwMax = 0;
         var autoSpans = link.querySelectorAll('span[dir="auto"]');
         for (var b = 0; b < autoSpans.length; b++) {
             var spanText = autoSpans[b].textContent.trim();
             if (spanText.length < 1 || /^\d+$/.test(spanText)) continue;
             try {
-                var fw = parseInt(window.getComputedStyle(autoSpans[b]).fontWeight, 10);
+                var fwStr = window.getComputedStyle(autoSpans[b]).fontWeight;
+                var fw = (fwStr === 'bold' || fwStr === 'bolder') ? 700
+                       : fwStr === 'normal' || fwStr === 'lighter' ? 400
+                       : parseInt(fwStr, 10);
+                if (!isNaN(fw) && fw > fwMax) fwMax = fw;
                 if (!isNaN(fw) && fw >= 600) { hasBold = true; break; }
             } catch(_) {}
         }
 
-        // Signal 4: small colored dot — look for a sibling/descendant element
-        // that is roughly square (≤16 px), has no text, and has a non-transparent
-        // background color that is not white/black/grey (i.e. accent color dot).
+        // Signal 4: small colored dot inside or adjacent to the link.
         var hasDot = false;
         try {
-            var dotCandidates = container.querySelectorAll('*');
-            for (var d = 0; d < Math.min(dotCandidates.length, 60); d++) {
+            // Check inside the link and its parent (dot may be a sibling).
+            var dotScope = link.parentElement || link;
+            var dotCandidates = dotScope.querySelectorAll('*');
+            for (var d = 0; d < Math.min(dotCandidates.length, 40); d++) {
                 var el = dotCandidates[d];
                 if (el.textContent.trim().length > 0) continue;
                 var rect = el.getBoundingClientRect();
-                if (rect.width < 4 || rect.width > 18 || rect.height < 4 || rect.height > 18) continue;
-                if (Math.abs(rect.width - rect.height) > 6) continue;
+                if (rect.width < 4 || rect.width > 14 || rect.height < 4 || rect.height > 14) continue;
+                if (Math.abs(rect.width - rect.height) > 4) continue;
                 try {
                     var bg = window.getComputedStyle(el).backgroundColor;
-                    // Match rgb(r,g,b) or rgba(r,g,b,a) with non-trivial saturation.
                     var m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
                     if (m) {
                         var r = parseInt(m[1],10), g = parseInt(m[2],10), bv = parseInt(m[3],10);
                         var mn = Math.min(r,g,bv), mx = Math.max(r,g,bv);
-                        // Saturation proxy: max-min > 40 and not near-white (mx>50).
-                        if (mx > 50 && (mx - mn) > 40) { hasDot = true; break; }
+                        if (mx > 80 && (mx - mn) > 50) { hasDot = true; break; }
                     }
                 } catch(_) {}
             }
         } catch(_) {}
 
+        // Primary: unread text indicator. Fallback: dot, badge+aria, or badge+bold.
+        var isUnread = hasUnreadText || hasDot || isUnreadViaAria || (hasNumericBadge && hasBold);
+        
         return {
-            isUnread: isUnreadViaAria || hasNumericBadge || hasBold || hasDot,
+            isUnread: isUnread,
+            hasUnreadText: hasUnreadText,
             hasAria: isUnreadViaAria,
             hasBadge: hasNumericBadge,
             hasBold: hasBold,
             hasDot: hasDot,
+            fwMax: fwMax,
             ariaLabel: ariaLabel
         };
     }
@@ -743,15 +803,30 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
                 }
             }
 
+            // Some Messenger builds use [role="list"] or [role="listbox"] for the
+            // conversation list (neither navigation nor complementary role).
+            // Require at least 2 distinct thread hrefs to avoid picking up small
+            // lists of unrelated items.
+            var listRoots = document.querySelectorAll('[role="list"], [role="listbox"]');
+            for (var lri = 0; lri < listRoots.length; lri++) {
+                if (listRoots[lri] && distinctHrefCount(listRoots[lri]) >= 2) {
+                    return listRoots[lri];
+                }
+            }
+
             // Some Messenger builds expose no semantic navigation root.  Infer a
             // scoped root from real thread hrefs (not broad role links) by walking
             // up until an ancestor contains the visible thread-link cluster.  Never
             // return document.body; body-scope is exactly what causes false counts.
-            var hrefLinks = document.querySelectorAll(hrefThreadLink);
+            // Also include the /messages/ URL pattern (used by some Messenger builds).
+            var extHrefThreadLink = hrefThreadLink + ', a[href*="/messages/"]';
+            var hrefLinks = document.querySelectorAll(extHrefThreadLink);
             var totalDistinctHrefs = distinctHrefCount(document);
             for (var li = 0; li < hrefLinks.length; li++) {
                 var node = hrefLinks[li].parentElement;
-                for (var depth = 0; depth < 10 && node && node !== document.body; depth++) {
+                // Increased depth from 10 → 15 to handle deeper nesting in
+                // newer Messenger React renders.
+                for (var depth = 0; depth < 15 && node && node !== document.body; depth++) {
                     var count = distinctHrefCount(node);
                     if (count >= Math.min(2, totalDistinctHrefs)) {
                         return node;
@@ -766,39 +841,186 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
         return null;
     }
 
-    // getAllThreadLinks() — expanded link selector that covers all thread URL patterns.
-    // De-duplicated by href to avoid processing the same link multiple times.
-    // Used in getActivitySnapshot() and getFirstUnreadSenderName().
+    // ---------------------------------------------------------------------------
+    // DOM Diagnostic — logs what elements exist in the conversation area.
+    // Called once per session to understand Messenger's current DOM structure.
+    // ---------------------------------------------------------------------------
+    var _mxDomDiagLogged = false;
+    function logDomDiagnostic() {
+        if (_mxDomDiagLogged) return;
+        _mxDomDiagLogged = true;
+        try {
+            jlog('[Diag] === DOM Diagnostic Start ===');
+            jlog('[Diag] URL: ' + window.location.href);
+            jlog('[Diag] Viewport: ' + window.innerWidth + 'x' + window.innerHeight);
+            
+            // Strategy 1: Total clickable elements
+            var allClickables = document.querySelectorAll('[role="button"], [role="link"], a, button');
+            jlog('[Diag] Total clickable elements: ' + allClickables.length);
+            
+            // Strategy 2: Find scroll containers (virtual lists hide items outside viewport)
+            var scrollContainers = document.querySelectorAll('*');
+            var scrollCount = 0;
+            for (var sci = 0; sci < scrollContainers.length; sci++) {
+                var el = scrollContainers[sci];
+                var style = window.getComputedStyle(el);
+                if (style.overflowY === 'auto' || style.overflowY === 'scroll' || 
+                    style.overflow === 'auto' || style.overflow === 'scroll') {
+                    scrollCount++;
+                    if (scrollCount <= 3) {
+                        jlog('[Diag] Scroll container #' + scrollCount + ': ' + el.tagName + 
+                             ' class=' + (el.className || '').split(' ')[0] + 
+                             ' children=' + el.children.length);
+                    }
+                }
+            }
+            jlog('[Diag] Total scroll containers: ' + scrollCount);
+            
+            // Strategy 3: Check for sidebar navigation tabs
+            var chatTab = document.querySelector('[aria-label="Chaty"], [aria-label="Chats"]');
+            if (chatTab) {
+                jlog('[Diag] Found Chaty/Chats tab');
+                // Check if clicking it reveals a sidebar drawer
+                try {
+                    chatTab.click();
+                    jlog('[Diag] Clicked Chaty/Chats tab to reveal sidebar');
+                } catch(e) {
+                    jlog('[Diag] Could not click Chaty/Chats tab: ' + e.message);
+                }
+            }
+            
+            // Strategy 4: Check for Messenger drawer / sidebar
+            var drawer = document.querySelector('[role="dialog"]') || 
+                        document.querySelector('[role="drawer"]');
+            if (drawer) {
+                jlog('[Diag] Found drawer/dialog element');
+            }
+            
+            // Strategy 5: Find all <a> tags with /t/ hrefs
+            var threadLinks = document.querySelectorAll('a[href*="/t/"]');
+            jlog('[Diag] Found ' + threadLinks.length + ' <a> tags with /t/ href');
+            if (threadLinks.length > 0) {
+                for (var tli = 0; tli < Math.min(threadLinks.length, 5); tli++) {
+                    var href = threadLinks[tli].getAttribute('href') || '';
+                    var rect = threadLinks[tli].getBoundingClientRect();
+                    jlog('[Diag] Link #' + tli + ': href=' + href.slice(0, 50) + 
+                         ' visible=' + (rect.width > 0 && rect.height > 0));
+                }
+            }
+            
+            // Strategy 6: Save full DOM snapshot
+            try {
+                var html = document.documentElement.outerHTML;
+                window.__TAURI__.core.invoke('save_dom_snapshot', { html: html })
+                    .then(function(path) {
+                        jlog('[Diag] Snapshot saved: ' + path);
+                    })
+                    .catch(function(e) {
+                        jlog('[Diag] Snapshot save failed: ' + e);
+                    });
+            } catch(e) {
+                jlog('[Diag] Snapshot error: ' + e.message);
+            }
+            
+            jlog('[Diag] === DOM Diagnostic End ===');
+            
+        } catch(e) {
+            jlog('[Diag] Error: ' + e.message);
+        }
+    }
+
+    // getAllThreadLinks() — finds conversation thread elements.
+    // Searches the ENTIRE document (not just a scoped root) because Messenger
+    // changes DOM structure frequently and root detection often fails.
+    // Navigation tabs are excluded by content-based filters.
     // ---------------------------------------------------------------------------
     function getAllThreadLinks() {
+        // Run DOM diagnostic on first call
+        logDomDiagnostic();
         var seen = {};
         var result = [];
-        var root = getConversationListRoot();
-        if (!root) return result;
-        var selectors = [
+        // Always search entire document — root detection is unreliable with
+        // Messenger's dynamic React renders and virtual scrolling.
+        var searchRoot = document;
+
+        // Try several generic selector families.  Facebook changes element types
+        // (<a>, <div>, <button>), roles and attributes frequently; covering
+        // multiple families makes the scan resilient.
+        var selectorFamilies = [
+            // Family 1: elements with href pointing to a thread path.
+            // Navigation tabs also match these, so we filter them below.
             'a[href*="/t/"]',
             'a[href*="/e2ee/"]',
-            'a[href*="thread_fbid"]',
-            '[role="link"][tabindex]'
+            // Family 2: generic interactive elements.
+            '[role="link"]',
+            '[role="button"]',
+            // Family 3: elements with Messenger-specific data attributes.
+            '[data-testid="conversation"]',
+            '[data-testid="thread"]'
         ];
-        for (var si = 0; si < selectors.length; si++) {
+
+        // Returns true for navigation tabs that should be ignored.
+        function isNavigationTab(node) {
+            var href = (node.getAttribute('href') || '');
+            var aria = (node.getAttribute('aria-label') || '').toLowerCase().trim();
+
+            // Tabs carry focus_target or known section paths.
+            if (href.indexOf('focus_target') !== -1) return true;
+            if (href.indexOf('/marketplace/') !== -1) return true;
+            if (href.indexOf('/requests/')    !== -1) return true;
+            if (href.indexOf('/archived/')     !== -1) return true;
+
+            // Known tab labels (English + Czech + a few others).
+            var tabNames = ['chats','chaty','marketplace','requests','žádosti',
+                            'archived','archivovat'];
+            if (tabNames.indexOf(aria) !== -1) return true;
+
+            // Total-unread summary label, e.g. "Chaty · 1 nepřečtených"
+            if (aria.indexOf('nepřečtených') !== -1) return true;
+            if (aria.indexOf('unread') !== -1) return true;
+
+            return false;
+        }
+
+        // Returns true for non-<a> elements that look like conversation rows.
+        // <a> tags with thread hrefs are accepted even with empty direct
+        // textContent because the sender name / preview lives in descendants.
+        function looksLikeConversation(node) {
+            var text = (node.textContent || '').trim();
+
+            // Too short → not a conversation (name + preview is always longer).
+            if (text.length < 5) return false;
+
+            // Must contain some non-numeric, non-symbol text.
+            if (!/[a-zA-Z\u00C0-\u017F]/.test(text)) return false;
+
+            return true;
+        }
+
+        for (var si = 0; si < selectorFamilies.length; si++) {
             try {
-                var nodes = root.querySelectorAll(selectors[si]);
+                var nodes = searchRoot.querySelectorAll(selectorFamilies[si]);
                 for (var ni = 0; ni < nodes.length; ni++) {
                     var node = nodes[ni];
+
+                    if (isNavigationTab(node)) continue;
+
+                    var tag = node.tagName.toLowerCase();
                     var href = node.getAttribute('href') || '';
-                    var dataKey = node.getAttribute('data-key') || '';
-                    var aria = node.getAttribute('aria-label') || '';
-                    var text = (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-                    // Prefer stable conversation identifiers.  Do NOT append the
-                    // loop index to href: the same anchor can match multiple
-                    // selectors (`/t/` + `[role="link"][tabindex]`) and would be
-                    // counted twice, inflating domUnread and causing false badges.
-                    var key = href ? ('href:' + href)
-                        : dataKey ? ('data:' + dataKey)
-                        : aria ? ('aria:' + aria)
-                        : text ? ('text:' + text)
-                        : ('idx:' + si + ':' + ni);
+
+                    // Accept <a> tags with role="link" inside conversation root
+                    // (Messenger uses various href patterns, not just /t/).
+                    var role = node.getAttribute('role') || '';
+                    var isThreadAnchor = (tag === 'a') && (role === 'link');
+
+                    if (!isThreadAnchor && !looksLikeConversation(node)) continue;
+
+                    // Stable de-duplication key — normalize href by stripping
+                    // query params so the same conversation isn't counted twice.
+                    var key = isThreadAnchor
+                        ? ('href:' + href.replace(/\?.*$/, ''))
+                        : (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+                          || ('idx:' + si + ':' + ni);
                     if (!seen[key]) {
                         seen[key] = true;
                         result.push(node);
@@ -806,6 +1028,66 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
                 }
             } catch(_) {}
         }
+
+        // Fallback: if no conversations found via selectors, try finding them
+        // by looking for parent elements of span[dir="auto"] (sender name spans).
+        // Conversation rows always contain at least one such span.
+        if (result.length === 0) {
+            try {
+                var spans = searchRoot.querySelectorAll('span[dir="auto"]');
+                var convParents = {};
+                for (var spi = 0; spi < Math.min(spans.length, 30); spi++) {
+                    var sp = spans[spi];
+                    var parent = sp.parentElement;
+                    // Walk up a few levels to find the conversation container
+                    for (var up = 0; up < 4 && parent && parent !== searchRoot; up++) {
+                        var pt = (parent.textContent || '').trim();
+                        // Must have substantial text (name + preview) and contain letters
+                        if (pt.length >= 10 && /[a-zA-Z\u00C0-\u017F]/.test(pt)) {
+                            var pKey = pt.slice(0, 60);
+                            if (!convParents[pKey]) {
+                                convParents[pKey] = true;
+                                result.push(parent);
+                                break;
+                            }
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+            } catch(_) {}
+        }
+
+        // Throttled diagnostic logging — only log when result count changes
+        // or at most once every 30 seconds to avoid log spam.
+        var _gatlLastLog = window._gatlLastLog || { count: -1, time: 0 };
+        var now = Date.now();
+        if (result.length !== _gatlLastLog.count || (now - _gatlLastLog.time) > 30000) {
+            _gatlLastLog.count = result.length;
+            _gatlLastLog.time = now;
+            window._gatlLastLog = _gatlLastLog;
+            if (result.length === 0) {
+                var rejectedSample = [];
+                var allLinks = searchRoot.querySelectorAll('a[href*="/t/"], a[href*="/e2ee/"]');
+                for (var ri = 0; ri < Math.min(allLinks.length, 5); ri++) {
+                    var rLink = allLinks[ri];
+                    var rHref = rLink.getAttribute('href') || '';
+                    var rAria = rLink.getAttribute('aria-label') || '';
+                    var rRole = rLink.getAttribute('role') || '';
+                    var rTag = rLink.tagName.toLowerCase();
+                    rejectedSample.push(rTag + ' role=' + rRole + ' href=' + rHref.slice(0, 30) + ' aria="' + rAria.slice(0, 20) + '"');
+                }
+                jlog('[Unread] getAllThreadLinks() returned 0. Sample rejected links: ' + rejectedSample.join(' | '));
+            } else {
+                var diag = [];
+                for (var di = 0; di < Math.min(result.length, 3); di++) {
+                    var t = (result[di].textContent || '').trim().slice(0, 40);
+                    diag.push('"' + t + '"');
+                }
+                jlog('[Unread] getAllThreadLinks() returned ' + result.length +
+                     ' conversation(s): ' + diag.join(' | '));
+            }
+        }
+
         return result;
     }
 
@@ -820,9 +1102,13 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     // Counting unread thread links therefore reflects the real unread state sooner
     // than the title does, letting the badge clear without a conversation switch.
     //
-    // Returns -1 ("unknown") when the conversation list is not present in the DOM
-    // (e.g. a narrow/thread-only view) so callers never clear a badge based on an
-    // absent list.  Otherwise returns the number of unread thread links.
+    // Returns -1 ("unknown") when no thread links are found in the DOM at all
+    // (e.g. the Messenger SPA has not rendered the list yet).  When
+    // getAllThreadLinks() returns links — even via its document-level fallback —
+    // we return the number of those links that currently show an unread signal.
+    // A return of 0 means "list found, nothing unread" and allows callers to
+    // reconcile the badge down; -1 means "cannot determine" and preserves the
+    // current badge to avoid false-positive clears.
     //
     // PERFORMANCE NOTE: this walks every sidebar thread link and calls
     // getComputedStyle per span — it forces layout.  Called every 2 s via the
@@ -836,12 +1122,34 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     function countUnreadThreadsFromDom() {
         try {
             var links = getAllThreadLinks();
-            if (links.length === 0) return -1; // list not in DOM — cannot determine
+            if (links.length === 0) return -1; // no thread links found at all
             var n = 0;
+            var unreadNames = [];
             for (var i = 0; i < links.length; i++) {
                 try {
-                    if (detectUnreadSignals(links[i]).isUnread) n++;
+                    var sig = detectUnreadSignals(links[i]);
+                    if (sig.isUnread) {
+                        n++;
+                        // Log first few unread conversation names for debugging
+                        if (unreadNames.length < 3) {
+                            var name = extractNameFromLink(links[i], sig);
+                            if (name) unreadNames.push(name);
+                        }
+                    }
                 } catch(_) {}
+            }
+            // Throttled logging — only log when unread count changes or >0.
+            var _cutdLastLog = window._cutdLastLog || { count: -1, time: 0 };
+            var now2 = Date.now();
+            if (n !== _cutdLastLog.count || (now2 - _cutdLastLog.time) > 30000) {
+                _cutdLastLog.count = n;
+                _cutdLastLog.time = now2;
+                window._cutdLastLog = _cutdLastLog;
+                if (n > 0) {
+                    jlog('[Unread] countUnreadThreadsFromDom: ' + n + ' unread out of ' + links.length + ' links. Unread: ' + unreadNames.join(', '));
+                } else if (n === 0) {
+                    jlog('[Unread] countUnreadThreadsFromDom: 0 unread (all read)');
+                }
             }
             return n;
         } catch(_) {
@@ -853,42 +1161,35 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
     // Uses expanded link selectors via getAllThreadLinks().
     // ---------------------------------------------------------------------------
     function getFirstUnreadSenderName() {
-        // Phase A1 telemetry: log full extraction trace per IPC call so we can
-        // diagnose macOS sender-name regression (H1). Each call summarises
-        // link count, candidates considered, and final result.
-        var diag = { totalLinks: 0, scanned: 0, unreadHits: 0, rejected: [], picked: '' };
+        var diag = { totalLinks: 0, scanned: 0, unreadHits: 0, picked: '' };
         try {
             var links = getAllThreadLinks();
             diag.totalLinks = links.length;
-            for (var i = 0; i < Math.min(links.length, 10); i++) {
+            for (var i = 0; i < links.length; i++) {
                 diag.scanned++;
                 var link = links[i];
                 var sig = detectUnreadSignals(link);
-                if (!sig.isUnread) {
-                    if (diag.rejected.length < 5) {
-                        diag.rejected.push('i=' + i + ' notUnread aria=' + (sig.hasAria ? 'y' : 'n')
-                            + ' badge=' + (sig.hasBadge ? 'y' : 'n') + ' bold=' + (sig.hasBold ? 'y' : 'n')
-                            + ' dot=' + (sig.hasDot ? 'y' : 'n'));
-                    }
-                    continue;
-                }
+                if (!sig.isUnread) continue;
+                
                 diag.unreadHits++;
                 var name = extractNameFromLink(link, sig);
                 if (name.length >= 1) {
                     diag.picked = name;
-                    jlog('[Sender] ' + JSON.stringify(diag) + ' result="' + name + '"');
+                    updateLastKnownSender(name);
+                    // Only log when we find a sender (not on every poll).
+                    jlog('[Sender] found="' + name + '" in ' + diag.scanned + ' scanned');
                     return name;
-                } else {
-                    if (diag.rejected.length < 5) {
-                        diag.rejected.push('i=' + i + ' unread but extractName returned ""'
-                            + ' aria=' + JSON.stringify((link.getAttribute('aria-label') || '').slice(0, 60)));
-                    }
                 }
             }
         } catch(e) {
             jlog('[Sender] EXCEPTION: ' + (e && e.message ? e.message : String(e)));
         }
-        jlog('[Sender] ' + JSON.stringify(diag) + ' result=""');
+        
+        // Fallback: use last known sender from previous successful DOM extraction.
+        if (_lastKnownSender) {
+            return _lastKnownSender;
+        }
+        
         return '';
     }
 
@@ -1660,6 +1961,55 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
                 resetActivityState();
             }
         });
+
+        // Attribute-change observer for rapid badge clearing.
+        //
+        // The 2 s poll already handles in-place reads, but with up to 2 s
+        // latency.  This observer fires immediately when the sidebar DOM
+        // updates an aria-label or class attribute (e.g. Messenger removes the
+        // bold/unread indicator from a conversation after the user reads it),
+        // then re-evaluates and sends the updated count within 300 ms.
+        //
+        // Scoped to the sidebar root so we don't pay the cost of observing
+        // all attribute mutations on the full document in a React app.
+        // Falls back gracefully: if no sidebar root is found the 2 s poll still
+        // provides coverage via the improved getAllThreadLinks() fallback.
+        (function installUnreadClearObserver() {
+            try {
+                var sidebarRoot = document.querySelector('[role="navigation"]')
+                    || document.querySelector('[role="complementary"]')
+                    || document.querySelector('nav');
+                if (!sidebarRoot) {
+                    try { sidebarRoot = getConversationListRoot(); } catch(_) {}
+                }
+                if (!sidebarRoot) {
+                    jlog('[Unread] no sidebar root for attr observer; 2s poll provides coverage');
+                    return;
+                }
+                if (sidebarRoot._mxUnreadClearAttrObserver) return;
+                sidebarRoot._mxUnreadClearAttrObserver = true;
+                var attrClearTimer = null;
+                var attrObs = new MutationObserver(function() {
+                    if (attrClearTimer !== null) clearTimeout(attrClearTimer);
+                    attrClearTimer = setTimeout(function() {
+                        attrClearTimer = null;
+                        var newCount = effectiveUnreadCount();
+                        if (newCount !== lastCount) {
+                            jlog('[Unread] attr-observer: count ' + lastCount + ' → ' + newCount);
+                            markRisingEdge(newCount);
+                            lastCount = newCount;
+                            sendUnreadCount(newCount);
+                        }
+                    }, 300);
+                });
+                attrObs.observe(sidebarRoot, {
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['aria-label', 'class']
+                });
+                jlog('[Unread] attr-change observer installed for rapid badge clearing');
+            } catch(_) {}
+        })();
     }
 
     if (document.readyState === 'loading') {
@@ -3372,8 +3722,11 @@ pub fn dispatch_notification_from_bundle(
 ///    via the EdgeUpdate registry key. Used for H3/H4.
 ///  - **macOS**: kernel version via `uname -r`.
 fn log_platform_environment() {
-    let pkg_version = env!("CARGO_PKG_VERSION");
-    log::info!("[MessengerX][Env] starting v{pkg_version}");
+    // MESSENGERX_BUILD_VERSION is set by build.rs via `git describe --tags
+    // --long --dirty` (e.g. "v1.5.7-3-gafc7ffe-dirty").  Falls back to
+    // CARGO_PKG_VERSION when git is unavailable.
+    let build_version = env!("MESSENGERX_BUILD_VERSION");
+    log::info!("[MessengerX][Env] starting {build_version}");
 
     #[cfg(target_os = "linux")]
     {
@@ -3930,6 +4283,8 @@ pub fn run() {
             commands::get_window_focused,
             commands::pick_save_path,
             commands::write_file_bytes,
+            commands::save_dom_snapshot,
+            commands::open_devtools,
             commands::open_popup,
         ])
         .build(tauri::generate_context!())
@@ -4401,14 +4756,21 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some((hint_count, sender, stored_at)) = hint.live.take()
                                     {
                                         let age = stored_at.elapsed();
-                                        if hint_count == count
-                                            && age <= std::time::Duration::from_secs(3)
+                                        // Use hint if it's very fresh (< 500ms) regardless of count,
+                                        // OR if count matches and hint is < 3s old.
+                                        // DOM count may differ from title count (e.g. DOM sees 3
+                                        // unread threads but title only shows (1)), but the sender
+                                        // name is still valid.
+                                        if age <= std::time::Duration::from_millis(500)
+                                            || (hint_count == count
+                                                && age <= std::time::Duration::from_secs(3))
                                         {
                                             log::info!(
-                                                "[MessengerX][SenderHint] using DOM sender hint count={} sender={:?} age={}ms",
+                                                "[MessengerX][SenderHint] using DOM sender hint count={} sender={:?} age={}ms (hint_count={})",
                                                 count,
                                                 sender,
                                                 age.as_millis(),
+                                                hint_count,
                                             );
                                             // Promote to retained so a typing-
                                             // indicator-rearm fire (same conv,
@@ -4456,6 +4818,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     break sender;
                                 }
+                                log::info!(
+                                    "[MessengerX][SenderHint] deadline reached with no hint for count={}",
+                                    count,
+                                );
                                 break String::new();
                             }
                             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -6110,6 +6476,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         let logout_item = MenuItemBuilder::with_id("logout", &tr.settings_logout).build(app)?;
 
+        // Debug menu item — opens WebView DevTools (F12).
+        #[cfg(debug_assertions)]
+        let inspect_item = MenuItemBuilder::with_id("inspect", "Inspect")
+            .accelerator("F12")
+            .build(app)?;
+
         // Non-interactive version label shown at the top of the app submenu.
         let version_str = format!("v{}", app.package_info().version);
         let version_item = MenuItemBuilder::with_id("app_version_macos", &version_str)
@@ -6125,27 +6497,37 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         let sep6 = PredefinedMenuItem::separator(app)?;
 
         // --- Assemble app submenu ---
-        let app_submenu = SubmenuBuilder::new(app, "Messenger X")
+        #[allow(unused_mut)]
+        let mut app_submenu_builder = SubmenuBuilder::new(app, "Messenger X")
             .item(&version_item)
             .item(&sep1)
             .item(&show_item)
             .item(&sep2)
             .item(&stay_logged_in_item)
+            .item(&sep3)
             .item(&notifications_item)
             .item(&notification_sound_item)
-            .item(&appearance_submenu)
-            .item(&sep3)
-            .item(&zoom_submenu)
             .item(&sep4)
+            .item(&appearance_submenu)
+            .item(&zoom_submenu)
+            .item(&sep5)
             .item(&autostart_item)
             .item(&start_minimized_item)
             .item(&auto_update_item)
-            .item(&sep5)
             .item(&check_update_item)
+            .item(&sep6)
             .item(&view_logs_item)
             .item(&clear_logs_item)
-            .item(&sep6)
-            .item(&logout_item)
+            .item(&logout_item);
+
+        #[cfg(debug_assertions)]
+        {
+            app_submenu_builder = app_submenu_builder
+                .separator()
+                .item(&inspect_item);
+        }
+
+        let app_submenu = app_submenu_builder
             .separator()
             .quit()
             .build()?;
@@ -6483,6 +6865,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let _ = wv.show();
                         let _ = wv.set_focus();
+                    }
+                }
+
+                // ---- Open DevTools (debug builds only) ----
+                #[cfg(debug_assertions)]
+                "inspect" => {
+                    if let Some(wv) = h.get_webview_window("main") {
+                        wv.open_devtools();
                     }
                 }
 
@@ -7139,8 +7529,8 @@ mod tests {
                 "script must resolve a trusted conversation-list root"
             );
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("var root = getConversationListRoot();"),
-                "getAllThreadLinks must query inside the resolved root"
+                UNREAD_OBSERVER_SCRIPT.contains("var searchRoot = document;"),
+                "getAllThreadLinks must search entire document when root detection is unreliable"
             );
             assert!(
                 UNREAD_OBSERVER_SCRIPT.contains("function distinctHrefCount"),
@@ -7160,17 +7550,91 @@ mod tests {
                     && UNREAD_OBSERVER_SCRIPT.contains("czat"),
                 "chat-list root detection should cover common Messenger locales"
             );
+            // Generic multi-family selector approach: the code queries inside
+            // searchRoot (root when available, document as fallback) and uses
+            // several selector families so it survives Facebook DOM changes.
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("var nodes = root.querySelectorAll(selectors[si]);"),
-                "thread-link selectors must be scoped to the root, not document"
+                UNREAD_OBSERVER_SCRIPT.contains("var searchRoot = document;"),
+                "getAllThreadLinks must always use document for reliable conversation discovery"
             );
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("var key = href ? ('href:' + href)"),
-                "thread links must de-duplicate by stable href/data/aria/text identity"
+                UNREAD_OBSERVER_SCRIPT.contains("var selectorFamilies = ["),
+                "getAllThreadLinks must use a multi-family selector array for resilience"
             );
             assert!(
-                !UNREAD_OBSERVER_SCRIPT.contains("(node.getAttribute('data-key') || ni)"),
-                "thread links must not append loop index to href/data-key because duplicate selector matches inflate domUnread"
+                UNREAD_OBSERVER_SCRIPT.contains("searchRoot.querySelectorAll(selectorFamilies[si])"),
+                "thread-link selectors must be issued against searchRoot"
+            );
+            // Navigation tabs must be filtered out by content heuristics, not
+            // by hard-coding only English selectors.
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function isNavigationTab"),
+                "getAllThreadLinks must filter navigation tabs via isNavigationTab"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("'chats'") && UNREAD_OBSERVER_SCRIPT.contains("'chaty'"),
+                "navigation-tab filter must cover common Messenger locales"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("'marketplace'") && UNREAD_OBSERVER_SCRIPT.contains("'žádosti'"),
+                "navigation-tab filter must cover Czech locale tab names"
+            );
+            // De-duplicate by href for anchors, by text for everything else.
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("var key = isThreadAnchor") &&
+                UNREAD_OBSERVER_SCRIPT.contains("'href:' + href") &&
+                UNREAD_OBSERVER_SCRIPT.contains("|| ('idx:' + si + ':' + ni)"),
+                "thread links must de-duplicate by href when anchor, by text otherwise"
+            );
+            assert!(
+                !UNREAD_OBSERVER_SCRIPT.contains("titleFallback"),
+                "title fallback must be removed — it shows open conversation name, not the actual sender"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("_lastKnownSender"),
+                "getFirstUnreadSenderName must cache the last known sender for fallback"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("updateLastKnownSender"),
+                "sender name extraction must update the last-known cache"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("var isThreadAnchor = (tag === 'a') && (role === 'link')"),
+                "<a> tags with role=link must be accepted as conversation anchors"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("'href:' + href"),
+                "thread anchors must de-duplicate by href, not by empty textContent"
+            );
+        }
+
+        /// getAllThreadLinks must include a DOM diagnostic function that logs
+        /// the document structure on first call, so we can debug DOM changes.
+        #[test]
+        fn thread_links_include_dom_diagnostic() {
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("function logDomDiagnostic"),
+                "getAllThreadLinks must include a DOM diagnostic helper"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("_mxDomDiagLogged"),
+                "DOM diagnostic must use a guard to run only once per session"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("[Diag] === DOM Diagnostic Start ==="),
+                "DOM diagnostic must have start marker"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("[Diag] Viewport:"),
+                "DOM diagnostic must log viewport size"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("[Diag] Total scroll containers:"),
+                "DOM diagnostic must log scroll container count"
+            );
+            assert!(
+                UNREAD_OBSERVER_SCRIPT.contains("[Diag] === DOM Diagnostic End ==="),
+                "DOM diagnostic must have end marker"
             );
         }
 
