@@ -1,6 +1,6 @@
 {
   "name": "messengerx",
-  "version": "1.5.2",
+  "version": "1.5.8-alpha",
   "description": "Cross-platform Messenger desktop client (Tauri)",
   "private": true,
   "type": "module",
