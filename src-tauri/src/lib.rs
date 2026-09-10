@@ -3012,6 +3012,97 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     } catch(_) {}
 
     // -----------------------------------------------------------------------
+    // 0c. Global JS error & unhandled-rejection capture.
+    //     Logs every uncaught exception and unhandled Promise rejection so
+    //     we can diagnose Messenger SPA failures (e.g. file upload picker
+    //     opens but the upload itself silently dies because of a JS crash).
+    // -----------------------------------------------------------------------
+    try {
+        window.addEventListener('error', function(e) {
+            try {
+                var msg = (e && e.message) ? String(e.message) : 'unknown';
+                var file = (e && e.filename) ? String(e.filename) : '';
+                var line = (e && e.lineno) ? e.lineno : 0;
+                var col = (e && e.colno) ? e.colno : 0;
+                var errObj = (e && e.error) ? String(e.error) : '';
+                var summary = '[JSERR] ' + msg + ' @ ' + file + ':' + line + ':' + col;
+                if (errObj && errObj !== msg) summary += ' | ' + errObj.slice(0, 200);
+                dlog(summary.slice(0, 500));
+            } catch(_) {}
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+            try {
+                var reason = (e && e.reason) ? String(e.reason) : 'unknown';
+                dlog('[JSERR] unhandledrejection: ' + reason.slice(0, 400));
+            } catch(_) {}
+        });
+        dlog('[ErrorTrap] global error listeners installed');
+    } catch(_) {}
+
+    // -----------------------------------------------------------------------
+    // 0d. File input / paste / drag-drop telemetry.
+    //     When Messenger's attachment flow silently fails we need to know
+    //     whether the browser event fired at all (picker opened) and whether
+    //     the files actually reached the page.
+    // -----------------------------------------------------------------------
+    try {
+        var _fileTrapLogged = {};
+        function _fileTrapLog(key, msg) {
+            if (_fileTrapLogged[key]) return;
+            _fileTrapLogged[key] = true;
+            dlog(msg);
+        }
+        document.addEventListener('paste', function(e) {
+            try {
+                var items = (e.clipboardData && e.clipboardData.items) ? e.clipboardData.items.length : 0;
+                var files = (e.clipboardData && e.clipboardData.files) ? e.clipboardData.files.length : 0;
+                var types = (e.clipboardData && e.clipboardData.types) ? e.clipboardData.types.join(',') : '';
+                _fileTrapLog('paste', '[FileTrap] paste items=' + items + ' files=' + files + ' types=' + types.slice(0, 120));
+            } catch(_) {}
+        });
+        document.addEventListener('dragover', function(e) {
+            _fileTrapLog('dragover', '[FileTrap] dragover');
+        });
+        document.addEventListener('drop', function(e) {
+            try {
+                var files = (e.dataTransfer && e.dataTransfer.files) ? e.dataTransfer.files.length : 0;
+                _fileTrapLog('drop', '[FileTrap] drop files=' + files);
+            } catch(_) {}
+        });
+        // Intercept <input type="file"> changes via delegation and mutation.
+        document.addEventListener('change', function(e) {
+            try {
+                var t = e.target;
+                if (t && t.tagName === 'INPUT' && t.type === 'file') {
+                    var fcount = (t.files && t.files.length) ? t.files.length : 0;
+                    var fname = (fcount > 0 && t.files[0].name) ? t.files[0].name : '';
+                    dlog('[FileTrap] input[type=file] change files=' + fcount + ' first=' + fname.slice(0, 60));
+                }
+            } catch(_) {}
+        });
+        // Also watch for dynamically created file inputs.
+        var _fileObs = new MutationObserver(function(muts) {
+            for (var mi = 0; mi < muts.length; mi++) {
+                var added = muts[mi].addedNodes;
+                for (var ai = 0; ai < added.length; ai++) {
+                    var n = added[ai];
+                    if (n.tagName === 'INPUT' && n.type === 'file') {
+                        dlog('[FileTrap] <input type=file> dynamically added');
+                    }
+                }
+            }
+        });
+        if (document.body) {
+            _fileObs.observe(document.body, { childList: true, subtree: true });
+        } else {
+            document.addEventListener('DOMContentLoaded', function() {
+                if (document.body) _fileObs.observe(document.body, { childList: true, subtree: true });
+            });
+        }
+        dlog('[FileTrap] file/paste/drag listeners installed');
+    } catch(_) {}
+
+    // -----------------------------------------------------------------------
     // 1. Page-loaded ping (A5)
     // -----------------------------------------------------------------------
     var pingedDomReady = false;
