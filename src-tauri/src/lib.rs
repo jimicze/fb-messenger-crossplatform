@@ -5893,6 +5893,33 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // navigate inside the WebView so the login flow can complete.
                 }
 
+                // Facebook profile pages (e.g. /username or /profile.php) must
+                // open in the system browser, not inside the WebView.  The only
+                // facebook.com URLs that should stay in-app are e2ee group calls
+                // (/groupcall/...) and login/oauth flows.
+                if host == "facebook.com" || host.ends_with(".facebook.com") {
+                    let path = url.path();
+                    let is_call = path.starts_with("/groupcall/");
+                    let is_login = path.starts_with("/login")
+                        || path.starts_with("/oauth")
+                        || path.starts_with("/dialog/")
+                        || path.starts_with("/connect/");
+                    if !is_call && !is_login {
+                        let url_str = url.to_string();
+                        log::info!(
+                            "[MessengerX][Navigation] Blocking Facebook profile page — opening externally: {url_str}"
+                        );
+                        let handle = nav_app_handle.clone();
+                        std::thread::spawn(move || {
+                            use tauri_plugin_opener::OpenerExt;
+                            if let Err(e) = handle.opener().open_url(&url_str, None::<&str>) {
+                                log::warn!("[MessengerX] Failed to open Facebook profile URL {url_str}: {e}");
+                            }
+                        });
+                        return false;
+                    }
+                }
+
                 // Google domains are required for the Facebook login reCAPTCHA flow:
                 // Facebook redirects to accounts.google.com / recaptcha.google.com
                 // during login verification.  These pages must render inside the
