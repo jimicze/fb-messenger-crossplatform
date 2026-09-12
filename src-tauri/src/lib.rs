@@ -3398,15 +3398,49 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
     // that retry loops don't flood the log file.  Keyed on the full raw URL
     // so that long URLs differing only in their query string are not collapsed.
     var _seen = new Set();
+    // Track load-start times for media elements to compute load duration on error.
+    var _loadStartTimes = new Map();
+
+    function isMediaElement(t) {
+        return (t instanceof HTMLImageElement  ||
+                t instanceof HTMLVideoElement  ||
+                t instanceof HTMLAudioElement  ||
+                t instanceof HTMLSourceElement);
+    }
+
+    function getMediaInfo(t) {
+        var tag = t.tagName ? t.tagName.toLowerCase() : 'unknown';
+        var isGif = false;
+        try {
+            if (t.src) isGif = t.src.toLowerCase().endsWith('.gif');
+            if (!isGif && t.currentSrc) isGif = t.currentSrc.toLowerCase().endsWith('.gif');
+        } catch(_) {}
+        var naturalSize = '';
+        try {
+            if (t.naturalWidth !== undefined && t.naturalHeight !== undefined) {
+                naturalSize = t.naturalWidth + 'x' + t.naturalHeight;
+            }
+        } catch(_) {}
+        return { tag: tag, isGif: isGif, naturalSize: naturalSize };
+    }
+
+    // Listen for loadstart on media elements to measure load duration.
+    try {
+        document.addEventListener('loadstart', function(e) {
+            try {
+                var t = e.target;
+                if (!isMediaElement(t)) return;
+                var src = t.src || t.currentSrc || '';
+                if (src) _loadStartTimes.set(src, performance.now());
+            } catch(_) {}
+        }, true);
+    } catch(e) { mlog('loadstart listener FAILED: ' + (e && e.message ? e.message : String(e))); }
 
     try {
         window.addEventListener('error', function(e) {
             try {
                 var t = e.target;
-                if (!(t instanceof HTMLImageElement  ||
-                      t instanceof HTMLVideoElement  ||
-                      t instanceof HTMLAudioElement  ||
-                      t instanceof HTMLSourceElement)) {
+                if (!isMediaElement(t)) {
                     return;
                 }
                 // t.src / t.currentSrc covers <img>, <video>, <audio>, and
@@ -3429,14 +3463,276 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
                      display = src.replace(/[?#].*$/, '');
                  }
                 if (display.length > 200) { display = display.slice(0, 197) + '...'; }
-                mlog('failed <' + t.tagName.toLowerCase() + '> src=' +
-                     JSON.stringify(display) + ' v=' + APP_VERSION);
+                var info = getMediaInfo(t);
+                var loadMs = '';
+                if (_loadStartTimes.has(src)) {
+                    loadMs = ' loadMs=' + Math.round(performance.now() - _loadStartTimes.get(src));
+                }
+                mlog('failed <' + info.tag + '> src=' + JSON.stringify(display) +
+                     ' isGif=' + info.isGif +
+                     (info.naturalSize ? ' size=' + info.naturalSize : '') +
+                     loadMs +
+                     ' v=' + APP_VERSION);
             } catch(_) {}
         }, true /* capture phase — catches errors from same-origin frames; cross-origin iframes excluded by browser SOP */);
         mlog('listener registered v=' + APP_VERSION);
     } catch(e) {
         mlog('register FAILED: ' + (e && e.message ? e.message : String(e)));
     }
+})();
+"#
+);
+
+/// Verbose media load logger — logs successful loads of images, videos, and GIFs
+/// so we can diagnose intermittent attachment failures (e.g. GIFs that load only
+/// after restart, videos that show the "sorry you're having trouble" banner).
+const MEDIA_LOAD_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function mlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[MediaLoadJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _loadLogged = new Set();
+
+    function logMediaLoad(t) {
+        try {
+            var tag = t.tagName ? t.tagName.toLowerCase() : 'unknown';
+            var src = t.src || t.currentSrc || '';
+            if (!src) return;
+            // Dedup per page-load
+            var key = tag + '|' + src;
+            if (_loadLogged.has(key)) return;
+            _loadLogged.add(key);
+            var isGif = src.toLowerCase().endsWith('.gif');
+            var size = '';
+            try {
+                if (t.naturalWidth !== undefined && t.naturalHeight !== undefined) {
+                    size = t.naturalWidth + 'x' + t.naturalHeight;
+                }
+            } catch(_) {}
+            var display = src;
+            try { var u = new URL(src); display = u.origin + u.pathname; } catch(_) {
+                display = src.replace(/[?#].*$/, '');
+            }
+            if (display.length > 200) display = display.slice(0, 197) + '...';
+            mlog('loaded <' + tag + '> src=' + JSON.stringify(display) +
+                 ' isGif=' + isGif + (size ? ' size=' + size : '') +
+                 ' v=' + APP_VERSION);
+        } catch(_) {}
+    }
+
+    // Log successful image loads
+    try {
+        document.addEventListener('load', function(e) {
+            try {
+                var t = e.target;
+                if (t instanceof HTMLImageElement || t instanceof HTMLVideoElement || t instanceof HTMLAudioElement) {
+                    logMediaLoad(t);
+                }
+            } catch(_) {}
+        }, true);
+        mlog('load listener registered v=' + APP_VERSION);
+    } catch(e) {
+        mlog('load listener FAILED: ' + (e && e.message ? e.message : String(e)));
+    }
+
+    // Also observe dynamically inserted media via MutationObserver
+    try {
+        var mo = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+                mutation.addedNodes.forEach(function(node) {
+                    if (node instanceof HTMLImageElement) {
+                        if (node.complete && node.naturalWidth > 0) logMediaLoad(node);
+                    } else if (node instanceof HTMLVideoElement) {
+                        if (node.readyState >= 1) logMediaLoad(node);
+                    } else if (node.nodeType === 1) {
+                        // Element node — check children
+                        var imgs = node.querySelectorAll ? node.querySelectorAll('img, video, audio') : [];
+                        imgs.forEach(function(img) {
+                            if (img instanceof HTMLImageElement && img.complete && img.naturalWidth > 0) logMediaLoad(img);
+                            else if (img instanceof HTMLVideoElement && img.readyState >= 1) logMediaLoad(img);
+                        });
+                    }
+                });
+            });
+        });
+        mo.observe(document, { childList: true, subtree: true });
+        mlog('MutationObserver registered v=' + APP_VERSION);
+    } catch(e) {
+        mlog('MutationObserver FAILED: ' + (e && e.message ? e.message : String(e)));
+    }
+})();
+"#
+);
+
+/// Drag & drop event logger — helps diagnose attachment upload issues.
+/// Logs dragenter/dragover/drop events including file count and types.
+const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function dlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[DragDropJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _lastDragEnter = 0;
+
+    document.addEventListener('dragenter', function(e) {
+        try {
+            var files = e.dataTransfer ? e.dataTransfer.files.length : 0;
+            var types = e.dataTransfer ? (e.dataTransfer.types || []).join(',') : 'n/a';
+            _lastDragEnter = Date.now();
+            dlog('dragenter files=' + files + ' types=' + types + ' target=' + (e.target && e.target.tagName ? e.target.tagName : 'none'));
+        } catch(_) {}
+    }, true);
+
+    document.addEventListener('dragover', function(e) {
+        try {
+            // Throttle: log at most once per second
+            if (Date.now() - _lastDragEnter < 1000) return;
+            _lastDragEnter = Date.now();
+            var files = e.dataTransfer ? e.dataTransfer.files.length : 0;
+            var items = e.dataTransfer ? (e.dataTransfer.items ? e.dataTransfer.items.length : 0) : 0;
+            dlog('dragover files=' + files + ' items=' + items);
+        } catch(_) {}
+    }, true);
+
+    document.addEventListener('drop', function(e) {
+        try {
+            var files = [];
+            if (e.dataTransfer && e.dataTransfer.files) {
+                for (var i = 0; i < e.dataTransfer.files.length; i++) {
+                    var f = e.dataTransfer.files[i];
+                    files.push(f.name + '(' + f.type + ',' + f.size + ')');
+                }
+            }
+            dlog('drop files=[' + files.join('; ') + '] target=' + (e.target && e.target.tagName ? e.target.tagName : 'none'));
+        } catch(err) {
+            dlog('drop ERROR: ' + (err && err.message ? err.message : String(err)));
+        }
+    }, true);
+
+    // Log paste events (alternative way to attach images on some platforms)
+    document.addEventListener('paste', function(e) {
+        try {
+            var items = [];
+            if (e.clipboardData && e.clipboardData.items) {
+                for (var i = 0; i < e.clipboardData.items.length; i++) {
+                    var item = e.clipboardData.items[i];
+                    items.push(item.type + (item.kind ? '/' + item.kind : ''));
+                }
+            }
+            dlog('paste items=[' + items.join('; ') + ']');
+        } catch(err) {
+            dlog('paste ERROR: ' + (err && err.message ? err.message : String(err)));
+        }
+    }, true);
+
+    dlog('listeners registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// GIF-specific debug logger — watches for GIF elements that fail to animate or
+/// show the "sorry you're having trouble playing this video" fallback banner.
+const GIF_DEBUG_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function glog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[GifDebugJS] ' + msg });
+        } catch(_) {}
+    }
+
+    function isGifElement(el) {
+        try {
+            if (el instanceof HTMLImageElement) {
+                var src = el.src || el.currentSrc || '';
+                if (src.toLowerCase().endsWith('.gif')) return true;
+                // Facebook sometimes serves GIFs as webp with gif content
+                if (src.indexOf('.gif?') >= 0) return true;
+            }
+            if (el instanceof HTMLVideoElement) {
+                var src = el.src || el.currentSrc || '';
+                if (src.toLowerCase().endsWith('.gif')) return true;
+                // Check poster
+                if (el.poster && el.poster.toLowerCase().indexOf('.gif') >= 0) return true;
+            }
+        } catch(_) {}
+        return false;
+    }
+
+    function checkGifState() {
+        try {
+            var gifs = document.querySelectorAll('img, video');
+            var gifCount = 0;
+            var brokenCount = 0;
+            gifs.forEach(function(el) {
+                if (!isGifElement(el)) return;
+                gifCount++;
+                var broken = false;
+                try {
+                    if (el instanceof HTMLImageElement) {
+                        // Broken if complete but zero size
+                        if (el.complete && (el.naturalWidth === 0 || el.naturalHeight === 0)) {
+                            broken = true;
+                        }
+                        // Or if parent contains error text
+                        var parent = el.parentElement;
+                        if (parent && parent.textContent && parent.textContent.toLowerCase().indexOf('sorry') >= 0) {
+                            broken = true;
+                        }
+                    } else if (el instanceof HTMLVideoElement) {
+                        // Check for error state
+                        if (el.error && el.error.code !== 0) broken = true;
+                        // Check for the "sorry" banner
+                        var rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            // Video element visible but not playing
+                            if (el.paused && el.readyState < 2 && el.networkState === 3) {
+                                broken = true;
+                            }
+                        }
+                    }
+                } catch(_) {}
+                if (broken) {
+                    brokenCount++;
+                    var src = el.src || el.currentSrc || '(no-src)';
+                    try { var u = new URL(src); src = u.origin + u.pathname; } catch(_) { src = src.replace(/[?#].*$/, ''); }
+                    if (src.length > 200) src = src.slice(0, 197) + '...';
+                    glog('broken gif detected src=' + JSON.stringify(src) +
+                         ' tag=' + (el.tagName ? el.tagName.toLowerCase() : 'unknown') +
+                         ' complete=' + el.complete +
+                         ' naturalWidth=' + (el.naturalWidth || 0));
+                }
+            });
+            if (gifCount > 0) {
+                glog('gif scan complete total=' + gifCount + ' broken=' + brokenCount);
+            }
+        } catch(e) {
+            glog('scan ERROR: ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+
+    // Run scan periodically
+    setInterval(checkGifState, 5000);
+    glog('GIF scanner registered v=' + APP_VERSION);
 })();
 "#
 );
@@ -3819,6 +4115,13 @@ fn log_platform_environment() {
     let build_version = env!("MESSENGERX_BUILD_VERSION");
     log::info!("[MessengerX][Env] starting {build_version}");
 
+    // Log build-time info: target arch and build profile.
+    log::info!(
+        "[MessengerX][Env] arch={} profile={}",
+        std::env::consts::ARCH,
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
+
     #[cfg(target_os = "linux")]
     {
         let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".into());
@@ -3859,6 +4162,29 @@ fn log_platform_environment() {
             }
             Err(e) => {
                 log::warn!("[MessengerX][Env][Linux] notify-send probe spawn failed: {e}");
+            }
+        }
+
+        // Probe for GStreamer codecs — these are needed for GIF/video playback
+        // in WebKitGTK.  Missing plugins produce silent failures.
+        let gst_probe = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("gst-inspect-1.0 --version 2>/dev/null; echo '---'; \
+                  gst-inspect-1.0 libav 2>/dev/null | head -n1; \
+                  gst-inspect-1.0 vp8dec 2>/dev/null | head -n1; \
+                  gst-inspect-1.0 vp9dec 2>/dev/null | head -n1; \
+                  gst-inspect-1.0 h264parse 2>/dev/null | head -n1")
+            .output();
+        match gst_probe {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                log::info!(
+                    "[MessengerX][Env][Linux] gstreamer_probe stdout={stdout:?} stderr={stderr:?}"
+                );
+            }
+            Err(e) => {
+                log::debug!("[MessengerX][Env][Linux] gstreamer_probe spawn failed (non-fatal): {e}");
             }
         }
     }
@@ -4673,6 +4999,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(DIAGNOSTIC_TELEMETRY_SCRIPT)
         .initialization_script(AUDIO_HOOK_SCRIPT)
         .initialization_script(MEDIA_ERROR_LOGGER_SCRIPT)
+        .initialization_script(MEDIA_LOAD_LOGGER_SCRIPT)
+        .initialization_script(DRAG_DROP_LOGGER_SCRIPT)
+        .initialization_script(GIF_DEBUG_SCRIPT)
         .initialization_script(OFFLINE_DIALOG_HIDER_SCRIPT)
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
@@ -7124,8 +7453,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!(
-        "[MessengerX][Boot] setup_app complete (t={}ms)",
-        setup_started.elapsed().as_millis()
+        "[MessengerX][Boot] setup_app complete (t={}ms) scripts=\"{}\" zoom={} appearance={:?} online={}",
+        setup_started.elapsed().as_millis(),
+        "notif,unread,diag,audio,mediaErr,mediaLoad,dragDrop,gifDebug,offline,zoom,scroll,appearance,call,callUnlock,windowOpen",
+        zoom_level,
+        settings.appearance,
+        is_online
     );
     Ok(())
 }
