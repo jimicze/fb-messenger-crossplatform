@@ -3737,6 +3737,325 @@ const GIF_DEBUG_SCRIPT: &str = concat!(
 "#
 );
 
+/// Console error logger — captures window.onerror, unhandledrejection, and
+/// console.error calls. Many Messenger JS errors don't surface as media errors
+/// but still break attachment rendering or cause silent failures.
+const CONSOLE_ERROR_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function clog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[ConsoleJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _errorDedup = new Set();
+    function dedupKey(msg, url, line) {
+        return (msg || '') + '|' + (url || '') + '|' + (line || 0);
+    }
+
+    // window.onerror — catches uncaught JS exceptions
+    var _origOnError = window.onerror;
+    window.onerror = function(msg, url, line, col, err) {
+        try {
+            var key = dedupKey(String(msg), url, line);
+            if (_errorDedup.has(key)) return;
+            _errorDedup.add(key);
+            if (_errorDedup.size > 100) { _errorDedup.clear(); } // prevent unbounded growth
+            var stack = '';
+            try { stack = err && err.stack ? err.stack.split('\n').slice(0,3).join(' || ') : ''; } catch(_) {}
+            clog('onerror msg=' + JSON.stringify(String(msg).slice(0,200)) +
+                 ' url=' + JSON.stringify(String(url||'').slice(0,200)) +
+                 ' line=' + line + ' col=' + col +
+                 (stack ? ' stack=' + JSON.stringify(stack.slice(0,300)) : ''));
+        } catch(_) {}
+        if (typeof _origOnError === 'function') return _origOnError.apply(this, arguments);
+        return false;
+    };
+
+    // unhandledrejection — catches Promise rejections
+    window.addEventListener('unhandledrejection', function(e) {
+        try {
+            var reason = e.reason;
+            var msg = '';
+            try {
+                msg = reason instanceof Error ? reason.message : String(reason);
+            } catch(_) { msg = String(reason); }
+            var stack = '';
+            try { stack = reason && reason.stack ? reason.stack.split('\n').slice(0,3).join(' || ') : ''; } catch(_) {}
+            clog('unhandledrejection reason=' + JSON.stringify(msg.slice(0,300)) +
+                 (stack ? ' stack=' + JSON.stringify(stack.slice(0,300)) : ''));
+        } catch(_) {}
+    });
+
+    // Intercept console.error — Messenger logs many internal errors here
+    var _origConsoleError = console.error;
+    console.error = function() {
+        try {
+            var args = Array.prototype.slice.call(arguments);
+            var msg = args.map(function(a) {
+                try { return String(a); } catch(_) { return '[unstringable]'; }
+            }).join(' ');
+            // Throttle: only log if different from last 50ms
+            if (!console._lastErr || Date.now() - console._lastErr.t > 50 || console._lastErr.msg !== msg) {
+                console._lastErr = { t: Date.now(), msg: msg };
+                clog('console.error: ' + msg.slice(0,400));
+            }
+        } catch(_) {}
+        return _origConsoleError.apply(this, arguments);
+    };
+
+    clog('Console error logger registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// Network logger — intercepts fetch() and XMLHttpRequest to log all network
+/// requests including media fetches. This catches failures that don't produce
+/// DOM errors (e.g. 403/404 on CDN, CORS issues, timeouts).
+const NETWORK_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function nlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[NetworkJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _requestId = 0;
+    var _pending = new Map();
+
+    function shouldLogUrl(url) {
+        // Log media URLs and Messenger API calls; skip analytics/beacons
+        var s = String(url || '');
+        return s.indexOf('.gif') >= 0 || s.indexOf('.png') >= 0 || s.indexOf('.jpg') >= 0 ||
+               s.indexOf('.jpeg') >= 0 || s.indexOf('.mp4') >= 0 || s.indexOf('.webm') >= 0 ||
+               s.indexOf('fbcdn.net') >= 0 || s.indexOf('messenger.com') >= 0 ||
+               s.indexOf('facebook.com') >= 0;
+    }
+
+    function sanitizeUrl(url) {
+        try { var u = new URL(url); return u.origin + u.pathname; } catch(_) {
+            return String(url).replace(/[?#].*$/, '').slice(0, 200);
+        }
+    }
+
+    // Intercept fetch()
+    var _origFetch = window.fetch;
+    window.fetch = function(url, options) {
+        var id = ++_requestId;
+        var start = performance.now();
+        var urlStr = String(url || '');
+        var method = (options && options.method) || 'GET';
+        var logThis = shouldLogUrl(urlStr);
+
+        if (logThis) {
+            nlog('fetch start id=' + id + ' method=' + method + ' url=' + JSON.stringify(sanitizeUrl(urlStr)));
+        }
+
+        return _origFetch.apply(this, arguments).then(function(response) {
+            if (logThis) {
+                var ms = Math.round(performance.now() - start);
+                nlog('fetch end id=' + id + ' status=' + response.status + ' ms=' + ms +
+                     ' type=' + (response.headers.get('content-type') || 'unknown').split(';')[0]);
+            }
+            return response;
+        }).catch(function(err) {
+            if (logThis) {
+                var ms = Math.round(performance.now() - start);
+                nlog('fetch ERROR id=' + id + ' ms=' + ms + ' err=' + String(err).slice(0,200));
+            }
+            throw err;
+        });
+    };
+
+    // Intercept XMLHttpRequest
+    var _origXHROpen = XMLHttpRequest.prototype.open;
+    var _origXHRSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._netLogId = ++_requestId;
+        this._netLogUrl = String(url || '');
+        this._netLogMethod = method;
+        this._netLogStart = 0;
+        this._netLogShould = shouldLogUrl(this._netLogUrl);
+        return _origXHROpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function() {
+        var self = this;
+        if (self._netLogShould) {
+            self._netLogStart = performance.now();
+            nlog('xhr start id=' + self._netLogId + ' method=' + self._netLogMethod +
+                 ' url=' + JSON.stringify(sanitizeUrl(self._netLogUrl)));
+        }
+
+        self.addEventListener('loadend', function() {
+            if (!self._netLogShould) return;
+            var ms = Math.round(performance.now() - self._netLogStart);
+            var ct = '';
+            try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
+            nlog('xhr end id=' + self._netLogId + ' status=' + self.status + ' ms=' + ms +
+                 ' type=' + ct);
+        });
+
+        return _origXHRSend.apply(this, arguments);
+    };
+
+    nlog('Network logger registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// WebSocket logger — logs connect/disconnect and message counts. Messenger
+/// uses WebSocket for real-time messaging; disconnections can cause attachment
+/// sync issues (uploaded files not appearing, stuck "sending" state).
+const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function wlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[WebSocketJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _origWebSocket = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+        var ws = protocols ? new _origWebSocket(url, protocols) : new _origWebSocket(url);
+        var wsUrl = String(url || '');
+        var id = Math.random().toString(36).slice(2, 8);
+        var openTime = 0;
+
+        wlog('WS created id=' + id + ' url=' + JSON.stringify(wsUrl.slice(0, 200)));
+
+        ws.addEventListener('open', function() {
+            openTime = Date.now();
+            wlog('WS open id=' + id);
+        });
+
+        ws.addEventListener('close', function(e) {
+            var duration = openTime ? (Date.now() - openTime) + 'ms' : 'N/A';
+            wlog('WS close id=' + id + ' code=' + e.code + ' reason=' + JSON.stringify(e.reason||'').slice(0,100) + ' duration=' + duration);
+        });
+
+        ws.addEventListener('error', function(e) {
+            wlog('WS error id=' + id);
+        });
+
+        // Count messages (but don't log content for privacy)
+        var msgCount = 0;
+        var _origSend = ws.send;
+        ws.send = function(data) {
+            msgCount++;
+            if (msgCount <= 3 || msgCount % 50 === 0) {
+                var size = typeof data === 'string' ? data.length : (data && data.byteLength ? data.byteLength : 0);
+                wlog('WS send id=' + id + ' msg#' + msgCount + ' size=' + size);
+            }
+            return _origSend.apply(this, arguments);
+        };
+
+        var _origAddEventListener = ws.addEventListener;
+        ws.addEventListener = function(type, handler, options) {
+            if (type === 'message') {
+                var wrapped = function(e) {
+                    msgCount++;
+                    if (msgCount <= 3 || msgCount % 50 === 0) {
+                        var size = typeof e.data === 'string' ? e.data.length : (e.data && e.data.byteLength ? e.data.byteLength : 0);
+                        wlog('WS recv id=' + id + ' msg#' + msgCount + ' size=' + size);
+                    }
+                    return handler.apply(this, arguments);
+                };
+                return _origAddEventListener.call(this, type, wrapped, options);
+            }
+            return _origAddEventListener.apply(this, arguments);
+        };
+
+        return ws;
+    };
+    window.WebSocket.prototype = _origWebSocket.prototype;
+
+    wlog('WebSocket logger registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// Performance and memory logger — periodically logs JS heap size, DOM node
+/// count, and event listener count. Helps diagnose memory leaks that cause
+/// attachment failures after long sessions ("restart fixes it" pattern).
+const PERFORMANCE_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function plog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[PerfJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _lastMemory = 0;
+
+    function logPerformanceSnapshot() {
+        try {
+            var mem = performance.memory;
+            var heapUsed = mem ? Math.round(mem.usedJSHeapSize / 1048576) : 0;
+            var heapTotal = mem ? Math.round(mem.totalJSHeapSize / 1048576) : 0;
+            var heapLimit = mem ? Math.round(mem.jsHeapSizeLimit / 1048576) : 0;
+
+            // DOM node count
+            var nodes = document.querySelectorAll('*').length;
+
+            // Count img/video elements
+            var imgs = document.querySelectorAll('img').length;
+            var videos = document.querySelectorAll('video').length;
+            var canvases = document.querySelectorAll('canvas').length;
+
+            // Memory delta (MB)
+            var delta = heapUsed - _lastMemory;
+            _lastMemory = heapUsed;
+
+            plog('heap=' + heapUsed + 'MB/' + heapTotal + 'MB limit=' + heapLimit +
+                 'MB nodes=' + nodes + ' imgs=' + imgs + ' videos=' + videos +
+                 ' canvases=' + canvases + ' delta=' + delta + 'MB');
+        } catch(e) {
+            plog('snapshot ERROR: ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+
+    // Log immediately, then every 30 seconds
+    setTimeout(logPerformanceSnapshot, 5000);
+    setInterval(logPerformanceSnapshot, 30000);
+
+    // Also log when memory pressure might be happening
+    if (window.performance && window.performance.memory) {
+        setInterval(function() {
+            var used = performance.memory.usedJSHeapSize;
+            var limit = performance.memory.jsHeapSizeLimit;
+            if (used > limit * 0.85) {
+                plog('WARNING heap usage=' + Math.round(used/1048576) + 'MB exceeds 85% of limit');
+            }
+        }, 10000);
+    }
+
+    plog('Performance logger registered v=' + APP_VERSION);
+})();
+"#
+);
+
 /// JavaScript snippet that triggers snapshot capture and forwards the HTML to
 /// Rust via `invoke('save_snapshot', …)`.  Called from the Rust snapshot timer.
 ///
@@ -5002,6 +5321,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .initialization_script(MEDIA_LOAD_LOGGER_SCRIPT)
         .initialization_script(DRAG_DROP_LOGGER_SCRIPT)
         .initialization_script(GIF_DEBUG_SCRIPT)
+        .initialization_script(CONSOLE_ERROR_LOGGER_SCRIPT)
+        .initialization_script(NETWORK_LOGGER_SCRIPT)
+        .initialization_script(WEBSOCKET_LOGGER_SCRIPT)
+        .initialization_script(PERFORMANCE_LOGGER_SCRIPT)
         .initialization_script(OFFLINE_DIALOG_HIDER_SCRIPT)
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
@@ -7455,7 +7778,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     log::info!(
         "[MessengerX][Boot] setup_app complete (t={}ms) scripts=\"{}\" zoom={} appearance={:?} online={}",
         setup_started.elapsed().as_millis(),
-        "notif,unread,diag,audio,mediaErr,mediaLoad,dragDrop,gifDebug,offline,zoom,scroll,appearance,call,callUnlock,windowOpen",
+        "notif,unread,diag,audio,mediaErr,mediaLoad,dragDrop,gifDebug,consoleErr,network,websocket,perf,offline,zoom,scroll,appearance,call,callUnlock,windowOpen",
         zoom_level,
         settings.appearance,
         is_online
