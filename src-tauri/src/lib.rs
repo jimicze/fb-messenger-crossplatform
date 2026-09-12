@@ -3591,6 +3591,10 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
 
     document.addEventListener('dragenter', function(e) {
         try {
+            // CRITICAL: preventDefault + dropEffect required for drop to fire.
+            // Without this the browser suppresses the drop event entirely.
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
             var files = e.dataTransfer ? e.dataTransfer.files.length : 0;
             var types = e.dataTransfer ? (e.dataTransfer.types || []).join(',') : 'n/a';
             _lastDragEnter = Date.now();
@@ -3600,6 +3604,10 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
 
     document.addEventListener('dragover', function(e) {
         try {
+            // CRITICAL: preventDefault must be called on every dragover
+            // so the drop event fires.  This is a WebKit/macOS requirement.
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
             // Throttle: log at most once per second
             if (Date.now() - _lastDragEnter < 1000) return;
             _lastDragEnter = Date.now();
@@ -3611,6 +3619,8 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
 
     document.addEventListener('drop', function(e) {
         try {
+            e.preventDefault();
+            e.stopPropagation();
             var files = [];
             if (e.dataTransfer && e.dataTransfer.files) {
                 for (var i = 0; i < e.dataTransfer.files.length; i++) {
@@ -5312,6 +5322,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .min_inner_size(400.0, 300.0)
         .resizable(true)
         .visible(!settings.start_minimized)
+        // Disable Tauri's native drag-drop handler so that standard HTML5
+        // drag-and-drop events (dragenter/dragover/drop) reach Messenger's
+        // JavaScript handlers.  Without this, Tauri intercepts file drops and
+        // emits tauri://drag-drop events that Messenger does not listen for.
+        .disable_drag_drop_handler()
         // Inject all JS at document-start.
         .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
         .initialization_script(UNREAD_OBSERVER_SCRIPT)
