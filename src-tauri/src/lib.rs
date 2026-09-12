@@ -3619,8 +3619,10 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
 
     document.addEventListener('drop', function(e) {
         try {
+            // preventDefault is REQUIRED for the browser to treat this as a drop
+            // target (otherwise it opens the file in the window).  We do NOT call
+            // stopPropagation() — Messenger's own drop listener needs the event.
             e.preventDefault();
-            e.stopPropagation();
             var files = [];
             if (e.dataTransfer && e.dataTransfer.files) {
                 for (var i = 0; i < e.dataTransfer.files.length; i++) {
@@ -3649,6 +3651,65 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
             dlog('paste ERROR: ' + (err && err.message ? err.message : String(err)));
         }
     }, true);
+
+    // Handler called from Rust when Tauri native drag-drop events fire.
+    // WKWebView on macOS doesn't deliver HTML5 DnD to JS, so Rust forwards
+    // the file paths and we create synthetic drop events with real File objects.
+    window.__messengerx_handleDroppedFiles = async function(paths) {
+        try {
+            dlog('handleDroppedFiles paths=' + JSON.stringify(paths));
+            const { convertFileSrc } = await import('@tauri-apps/api/core');
+            const files = [];
+            for (const path of paths) {
+                try {
+                    const url = convertFileSrc(path);
+                    dlog('fetching ' + url);
+                    const response = await fetch(url);
+                    if (!response.ok) {
+                        dlog('fetch FAILED status=' + response.status + ' url=' + url);
+                        continue;
+                    }
+                    const blob = await response.blob();
+                    // Extract filename from path
+                    const filename = path.replace(/\\/g, '/').split('/').pop() || 'file';
+                    // Guess mime type from extension
+                    const ext = filename.split('.').pop().toLowerCase();
+                    const mimeMap = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', mp4:'video/mp4', mov:'video/quicktime', avi:'video/x-msvideo', webm:'video/webm', pdf:'application/pdf' };
+                    const type = mimeMap[ext] || blob.type || 'application/octet-stream';
+                    const file = new File([blob], filename, { type: type });
+                    files.push(file);
+                    dlog('created File name=' + filename + ' size=' + file.size + ' type=' + type);
+                } catch(err) {
+                    dlog('handleDroppedFiles path ERROR: ' + (err && err.message ? err.message : String(err)));
+                }
+            }
+            if (files.length === 0) {
+                dlog('handleDroppedFiles: no files created');
+                return;
+            }
+            // Create synthetic drop event with File objects
+            const dt = new DataTransfer();
+            for (const f of files) {
+                dt.items.add(f);
+            }
+            const dropEvent = new DragEvent('drop', {
+                bubbles: true,
+                cancelable: true,
+                dataTransfer: dt
+            });
+            // Find the best target — Messenger's drop zone (usually the composer area)
+            var target = document.querySelector('[contenteditable="true"]') ||
+                         document.querySelector('[role="textbox"]') ||
+                         document.activeElement ||
+                         document.body;
+            dlog('dispatching drop on ' + target.tagName + ' files=' + files.length);
+            target.dispatchEvent(dropEvent);
+            // Also dispatch on document for global listeners
+            document.dispatchEvent(dropEvent);
+        } catch(err) {
+            dlog('handleDroppedFiles ERROR: ' + (err && err.message ? err.message : String(err)));
+        }
+    };
 
     dlog('listeners registered v=' + APP_VERSION);
 })();
@@ -5322,11 +5383,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .min_inner_size(400.0, 300.0)
         .resizable(true)
         .visible(!settings.start_minimized)
-        // Disable Tauri's native drag-drop handler so that standard HTML5
-        // drag-and-drop events (dragenter/dragover/drop) reach Messenger's
-        // JavaScript handlers.  Without this, Tauri intercepts file drops and
-        // emits tauri://drag-drop events that Messenger does not listen for.
-        .disable_drag_drop_handler()
+        // NOTE: disable_drag_drop_handler() is only needed on Windows.
+        // On macOS WKWebView delegates to the OS default behaviour when the
+        // Tauri handler is not explicitly set, so we leave it enabled.
         // Inject all JS at document-start.
         .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
         .initialization_script(UNREAD_OBSERVER_SCRIPT)
@@ -6401,6 +6460,55 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 log::info!(
                     "[MessengerX][Notification] Window gained focus (count=0) — notification state reset to Idle"
                 );
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // macOS drag-and-drop bridge.
+    //
+    // WKWebView (macOS) does not reliably deliver HTML5 drag-and-drop events
+    // to Messenger's JavaScript handlers when files are dropped from Finder.
+    // We intercept Tauri's native DragDrop events, add the dropped files to
+    // the asset protocol scope so the webview can read them, and forward
+    // the paths to a JS helper that creates synthetic HTML5 drop events.
+    // ------------------------------------------------------------------
+    {
+        let app_handle = app.handle().clone();
+        let dnd_webview = webview.clone();
+        webview.on_window_event(move |event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
+                log::info!(
+                    "[MessengerX][DnD] Drop received paths={:?} position={:?}",
+                    paths, position
+                );
+                let scope = app_handle.asset_protocol_scope();
+                let path_strs: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| {
+                        let path_str = p.to_string_lossy().into_owned();
+                        if let Err(e) = scope.allow_file(&path_str) {
+                            log::warn!("[MessengerX][DnD] allow_file failed for {path_str}: {e}");
+                            return None;
+                        }
+                        log::info!("[MessengerX][DnD] allowed file: {path_str}");
+                        Some(path_str)
+                    })
+                    .collect();
+
+                if path_strs.is_empty() {
+                    log::warn!("[MessengerX][DnD] No files could be allowed");
+                    return;
+                }
+
+                let json = serde_json::to_string(&path_strs).unwrap_or_default();
+                let js = format!(
+                    "(function(){{ if(window.__messengerx_handleDroppedFiles){{ window.__messengerx_handleDroppedFiles({}); }} }})();",
+                    json
+                );
+                if let Err(e) = dnd_webview.eval(&js) {
+                    log::warn!("[MessengerX][DnD] Failed to eval drop handler: {e}");
+                }
             }
         });
     }
