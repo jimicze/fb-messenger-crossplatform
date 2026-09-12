@@ -10,6 +10,9 @@ mod services;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSWindow;
+
 /// Monotonically increasing counter used to generate unique window labels for
 /// popup windows spawned via `window.open()` (e.g. Messenger video/audio call
 /// UI).  Wraps at `u32::MAX` but that is effectively unreachable in practice.
@@ -6467,50 +6470,25 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     // macOS drag-and-drop bridge.
     //
-    // WKWebView (macOS) does not reliably deliver HTML5 drag-and-drop events
-    // to Messenger's JavaScript handlers when files are dropped from Finder.
-    // We intercept Tauri's native DragDrop events, add the dropped files to
-    // the asset protocol scope so the webview can read them, and forward
-    // the paths to a JS helper that creates synthetic HTML5 drop events.
+    // Tao (Tauri's windowing lib) registers an NSWindow-level drag-drop
+    // handler that emits tao::WindowEvent::DroppedFile.  Tauri v2 removed
+    // DroppedFile from its public WindowEvent enum, so those drops are
+    // silently swallowed and never reach the webview.  We therefore:
+    //   1. Unregister the NSWindow drag types so Tao does NOT intercept.
+    //   2. Disable Wry's native drag_drop_handler so the standard HTML5
+    //      DnD events reach Messenger's JS handlers directly.
     // ------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
     {
-        let app_handle = app.handle().clone();
-        let dnd_webview = webview.clone();
-        webview.on_window_event(move |event| {
-            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
-                log::info!(
-                    "[MessengerX][DnD] Drop received paths={:?} position={:?}",
-                    paths, position
-                );
-                let scope = app_handle.asset_protocol_scope();
-                let path_strs: Vec<String> = paths
-                    .iter()
-                    .filter_map(|p| {
-                        let path_str = p.to_string_lossy().into_owned();
-                        if let Err(e) = scope.allow_file(&path_str) {
-                            log::warn!("[MessengerX][DnD] allow_file failed for {path_str}: {e}");
-                            return None;
-                        }
-                        log::info!("[MessengerX][DnD] allowed file: {path_str}");
-                        Some(path_str)
-                    })
-                    .collect();
-
-                if path_strs.is_empty() {
-                    log::warn!("[MessengerX][DnD] No files could be allowed");
-                    return;
-                }
-
-                let json = serde_json::to_string(&path_strs).unwrap_or_default();
-                let js = format!(
-                    "(function(){{ if(window.__messengerx_handleDroppedFiles){{ window.__messengerx_handleDroppedFiles({}); }} }})();",
-                    json
-                );
-                if let Err(e) = dnd_webview.eval(&js) {
-                    log::warn!("[MessengerX][DnD] Failed to eval drop handler: {e}");
-                }
+        if let Ok(ns_window_ptr) = webview.ns_window() {
+            unsafe {
+                let ns_window = &*(ns_window_ptr as *mut NSWindow);
+                ns_window.unregisterDraggedTypes();
             }
-        });
+            log::info!("[MessengerX][DnD] Unregistered NSWindow dragged types — HTML5 DnD enabled");
+        } else {
+            log::warn!("[MessengerX][DnD] Failed to get ns_window pointer");
+        }
     }
 
     // ------------------------------------------------------------------
