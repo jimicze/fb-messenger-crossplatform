@@ -3332,8 +3332,8 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     // -----------------------------------------------------------------------
     try {
         var _fbUserCheckCount = 0;
-        var _fbUserMaxChecks = 15;   // 15 * 2s = 30s window
-        var _fbUserInterval = 2000;  // check every 2 seconds
+        var _fbUserMaxChecks = 40;   // 40 * 500ms = 20s window
+        var _fbUserInterval = 500;   // check every 500ms
         function _checkFacebookUser() {
             try {
                 _fbUserCheckCount++;
@@ -3349,40 +3349,56 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                 // version).
                 var text = document.body ? document.body.innerText || document.body.textContent || '' : '';
                 if (text.indexOf('Facebook user') >= 0) {
-                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — clearing persisted URL and reloading');
-                    // Mark session so we don't reload again.
+                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — hiding glitch, waiting for hydration');
+                    // Mark session so we don't act again.
                     try { sessionStorage.setItem('_mx_fbuser_redirect', '1'); } catch(_) {}
                     // Clear the persisted last_messenger_url in Rust so the
                     // next startup does not restore this broken thread.
                     try {
                         window.__TAURI__.core.invoke('clear_last_messenger_url');
                     } catch(_) {}
-                    // Show a loading overlay so the user never sees the
-                    // broken "Facebook user" placeholder.
+                    // Hide the broken header element(s) so the user never sees
+                    // "Facebook user".  Messenger hydrates the real data in
+                    // the background; when it arrives the hidden elements are
+                    // replaced automatically.
                     try {
-                        var _mxOverlay = document.createElement('div');
-                        _mxOverlay.id = '_mx_fbuser_overlay';
-                        _mxOverlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:#f0f2f5;z-index:999999;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:16px;color:#65676b;';
-                        _mxOverlay.textContent = 'Loading conversation…';
-                        if (document.body) document.body.appendChild(_mxOverlay);
+                        var _fbUserStyle = document.createElement('style');
+                        _fbUserStyle.id = '_mx_fbuser_hide';
+                        _fbUserStyle.textContent = '[data-pagelet="MWThreadList"] h2, [data-pagelet="MWThreadList"] span, div[role="main"] h2 { visibility:hidden !important; }';
+                        document.head.appendChild(_fbUserStyle);
                     } catch(_) {}
-                    // Force a full page reload. Messenger's SPA sometimes
-                    // fails to hydrate conversation data on the first load;
-                    // a reload re-initialises everything from cache.
-                    location.reload();
+                    // Poll until the real conversation title appears, then
+                    // remove the hide rule.
+                    var _fbUserHidePoll = 0;
+                    function _unhideWhenReady() {
+                        _fbUserHidePoll++;
+                        if (_fbUserHidePoll > 30) { // 15s max
+                            try { var s = document.getElementById('_mx_fbuser_hide'); if (s) s.remove(); } catch(_) {}
+                            return;
+                        }
+                        var t2 = document.body ? document.body.innerText || '' : '';
+                        if (t2.indexOf('Facebook user') < 0) {
+                            // Real data loaded — unhide.
+                            try { var s = document.getElementById('_mx_fbuser_hide'); if (s) s.remove(); } catch(_) {}
+                            dlog('[FBUserDetect] Real conversation data loaded — unhiding');
+                            return;
+                        }
+                        setTimeout(_unhideWhenReady, 500);
+                    }
+                    setTimeout(_unhideWhenReady, 500);
                     return;
                 }
                 setTimeout(_checkFacebookUser, _fbUserInterval);
             } catch(_) {}
         }
-        // Start checking 3 seconds after DOM ready (give Messenger time to
-        // hydrate the conversation normally).
+        // Start checking 500ms after DOM ready — if Messenger fails to
+        // hydrate, the "Facebook user" text usually appears very quickly.
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', function() {
-                setTimeout(_checkFacebookUser, 3000);
+                setTimeout(_checkFacebookUser, 500);
             });
         } else {
-            setTimeout(_checkFacebookUser, 3000);
+            setTimeout(_checkFacebookUser, 500);
         }
     } catch(_) {}
 
