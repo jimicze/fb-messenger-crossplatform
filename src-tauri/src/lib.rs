@@ -3313,6 +3313,92 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
         dlog('[HTTP] install FAILED: ' + (e && e.message ? e.message : String(e)));
     }
 
+    // -----------------------------------------------------------------------
+    // 5. "Facebook user" broken conversation detection & auto-redirect.
+    //
+    //    On startup Messenger sometimes loads the last conversation URL but
+    //    renders a broken "Facebook user" placeholder instead of the actual
+    //    chat.  This appears to be a Messenger SPA fallback when conversation
+    //    data fails to hydrate.
+    //
+    //    We redirect ONCE per session (tracked via sessionStorage) to avoid
+    //    an infinite loop: Messenger's client-side router restores the last
+    //    conversation after navigating to messenger.com, which would trigger
+    //    the detector again.  We also clear the persisted last_messenger_url
+    //    via Rust so the next startup does not restore the broken thread.
+    // -----------------------------------------------------------------------
+    try {
+        var _fbUserCheckCount = 0;
+        var _fbUserMaxChecks = 40;   // 40 * 500ms = 20s window
+        var _fbUserInterval = 500;   // check every 500ms
+        function _checkFacebookUser() {
+            try {
+                _fbUserCheckCount++;
+                if (_fbUserCheckCount > _fbUserMaxChecks) return;
+                // Prevent redirect loop: only redirect once per session.
+                if (sessionStorage && sessionStorage.getItem('_mx_fbuser_redirect')) return;
+                var path = (location && location.pathname) || '';
+                if (!path.startsWith('/t/')) return;
+                // Look for "Facebook user" text in the document.
+                // Messenger renders this as the conversation header when the
+                // thread fails to load.  We scan the whole document because
+                // the exact element varies (h2, span, div depending on DOM
+                // version).
+                var text = document.body ? document.body.innerText || document.body.textContent || '' : '';
+                if (text.indexOf('Facebook user') >= 0) {
+                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — hiding glitch, waiting for hydration');
+                    // Mark session so we don't act again.
+                    try { sessionStorage.setItem('_mx_fbuser_redirect', '1'); } catch(_) {}
+                    // Clear the persisted last_messenger_url in Rust so the
+                    // next startup does not restore this broken thread.
+                    try {
+                        window.__TAURI__.core.invoke('clear_last_messenger_url');
+                    } catch(_) {}
+                    // Hide the broken header element(s) so the user never sees
+                    // "Facebook user".  Messenger hydrates the real data in
+                    // the background; when it arrives the hidden elements are
+                    // replaced automatically.
+                    try {
+                        var _fbUserStyle = document.createElement('style');
+                        _fbUserStyle.id = '_mx_fbuser_hide';
+                        _fbUserStyle.textContent = '[data-pagelet="MWThreadList"] h2, [data-pagelet="MWThreadList"] span, div[role="main"] h2 { visibility:hidden !important; }';
+                        document.head.appendChild(_fbUserStyle);
+                    } catch(_) {}
+                    // Poll until the real conversation title appears, then
+                    // remove the hide rule.
+                    var _fbUserHidePoll = 0;
+                    function _unhideWhenReady() {
+                        _fbUserHidePoll++;
+                        if (_fbUserHidePoll > 30) { // 15s max
+                            try { var s = document.getElementById('_mx_fbuser_hide'); if (s) s.remove(); } catch(_) {}
+                            return;
+                        }
+                        var t2 = document.body ? document.body.innerText || '' : '';
+                        if (t2.indexOf('Facebook user') < 0) {
+                            // Real data loaded — unhide.
+                            try { var s = document.getElementById('_mx_fbuser_hide'); if (s) s.remove(); } catch(_) {}
+                            dlog('[FBUserDetect] Real conversation data loaded — unhiding');
+                            return;
+                        }
+                        setTimeout(_unhideWhenReady, 500);
+                    }
+                    setTimeout(_unhideWhenReady, 500);
+                    return;
+                }
+                setTimeout(_checkFacebookUser, _fbUserInterval);
+            } catch(_) {}
+        }
+        // Start checking 500ms after DOM ready — if Messenger fails to
+        // hydrate, the "Facebook user" text usually appears very quickly.
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function() {
+                setTimeout(_checkFacebookUser, 500);
+            });
+        } else {
+            setTimeout(_checkFacebookUser, 500);
+        }
+    } catch(_) {}
+
     dlog('[Init] diagnostic telemetry v=' + APP_VERSION + ' ready');
 })();
 "#
@@ -3398,15 +3484,49 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
     // that retry loops don't flood the log file.  Keyed on the full raw URL
     // so that long URLs differing only in their query string are not collapsed.
     var _seen = new Set();
+    // Track load-start times for media elements to compute load duration on error.
+    var _loadStartTimes = new Map();
+
+    function isMediaElement(t) {
+        return (t instanceof HTMLImageElement  ||
+                t instanceof HTMLVideoElement  ||
+                t instanceof HTMLAudioElement  ||
+                t instanceof HTMLSourceElement);
+    }
+
+    function getMediaInfo(t) {
+        var tag = t.tagName ? t.tagName.toLowerCase() : 'unknown';
+        var isGif = false;
+        try {
+            if (t.src) isGif = t.src.toLowerCase().endsWith('.gif');
+            if (!isGif && t.currentSrc) isGif = t.currentSrc.toLowerCase().endsWith('.gif');
+        } catch(_) {}
+        var naturalSize = '';
+        try {
+            if (t.naturalWidth !== undefined && t.naturalHeight !== undefined) {
+                naturalSize = t.naturalWidth + 'x' + t.naturalHeight;
+            }
+        } catch(_) {}
+        return { tag: tag, isGif: isGif, naturalSize: naturalSize };
+    }
+
+    // Listen for loadstart on media elements to measure load duration.
+    try {
+        document.addEventListener('loadstart', function(e) {
+            try {
+                var t = e.target;
+                if (!isMediaElement(t)) return;
+                var src = t.src || t.currentSrc || '';
+                if (src) _loadStartTimes.set(src, performance.now());
+            } catch(_) {}
+        }, true);
+    } catch(e) { mlog('loadstart listener FAILED: ' + (e && e.message ? e.message : String(e))); }
 
     try {
         window.addEventListener('error', function(e) {
             try {
                 var t = e.target;
-                if (!(t instanceof HTMLImageElement  ||
-                      t instanceof HTMLVideoElement  ||
-                      t instanceof HTMLAudioElement  ||
-                      t instanceof HTMLSourceElement)) {
+                if (!isMediaElement(t)) {
                     return;
                 }
                 // t.src / t.currentSrc covers <img>, <video>, <audio>, and
@@ -3429,14 +3549,666 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
                      display = src.replace(/[?#].*$/, '');
                  }
                 if (display.length > 200) { display = display.slice(0, 197) + '...'; }
-                mlog('failed <' + t.tagName.toLowerCase() + '> src=' +
-                     JSON.stringify(display) + ' v=' + APP_VERSION);
+                var info = getMediaInfo(t);
+                var loadMs = '';
+                if (_loadStartTimes.has(src)) {
+                    loadMs = ' loadMs=' + Math.round(performance.now() - _loadStartTimes.get(src));
+                }
+                mlog('failed <' + info.tag + '> src=' + JSON.stringify(display) +
+                     ' isGif=' + info.isGif +
+                     (info.naturalSize ? ' size=' + info.naturalSize : '') +
+                     loadMs +
+                     ' v=' + APP_VERSION);
             } catch(_) {}
         }, true /* capture phase — catches errors from same-origin frames; cross-origin iframes excluded by browser SOP */);
         mlog('listener registered v=' + APP_VERSION);
     } catch(e) {
         mlog('register FAILED: ' + (e && e.message ? e.message : String(e)));
     }
+})();
+"#
+);
+
+/// Verbose media load logger — logs successful loads of images, videos, and GIFs
+/// so we can diagnose intermittent attachment failures (e.g. GIFs that load only
+/// after restart, videos that show the "sorry you're having trouble" banner).
+const MEDIA_LOAD_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function mlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[MediaLoadJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _loadLogged = new Set();
+
+    function logMediaLoad(t) {
+        try {
+            var tag = t.tagName ? t.tagName.toLowerCase() : 'unknown';
+            var src = t.src || t.currentSrc || '';
+            if (!src) return;
+            // Dedup per page-load
+            var key = tag + '|' + src;
+            if (_loadLogged.has(key)) return;
+            _loadLogged.add(key);
+            var isGif = src.toLowerCase().endsWith('.gif');
+            var size = '';
+            try {
+                if (t.naturalWidth !== undefined && t.naturalHeight !== undefined) {
+                    size = t.naturalWidth + 'x' + t.naturalHeight;
+                }
+            } catch(_) {}
+            var display = src;
+            try { var u = new URL(src); display = u.origin + u.pathname; } catch(_) {
+                display = src.replace(/[?#].*$/, '');
+            }
+            if (display.length > 200) display = display.slice(0, 197) + '...';
+            mlog('loaded <' + tag + '> src=' + JSON.stringify(display) +
+                 ' isGif=' + isGif + (size ? ' size=' + size : '') +
+                 ' v=' + APP_VERSION);
+        } catch(_) {}
+    }
+
+    // Log successful image loads
+    try {
+        document.addEventListener('load', function(e) {
+            try {
+                var t = e.target;
+                if (t instanceof HTMLImageElement || t instanceof HTMLVideoElement || t instanceof HTMLAudioElement) {
+                    logMediaLoad(t);
+                }
+            } catch(_) {}
+        }, true);
+        mlog('load listener registered v=' + APP_VERSION);
+    } catch(e) {
+        mlog('load listener FAILED: ' + (e && e.message ? e.message : String(e)));
+    }
+
+    // Also observe dynamically inserted media via MutationObserver
+    try {
+        var mo = new MutationObserver(function(mutations) {
+            mutations.forEach(function(mutation) {
+                mutation.addedNodes.forEach(function(node) {
+                    if (node instanceof HTMLImageElement) {
+                        if (node.complete && node.naturalWidth > 0) logMediaLoad(node);
+                    } else if (node instanceof HTMLVideoElement) {
+                        if (node.readyState >= 1) logMediaLoad(node);
+                    } else if (node.nodeType === 1) {
+                        // Element node — check children
+                        var imgs = node.querySelectorAll ? node.querySelectorAll('img, video, audio') : [];
+                        imgs.forEach(function(img) {
+                            if (img instanceof HTMLImageElement && img.complete && img.naturalWidth > 0) logMediaLoad(img);
+                            else if (img instanceof HTMLVideoElement && img.readyState >= 1) logMediaLoad(img);
+                        });
+                    }
+                });
+            });
+        });
+        mo.observe(document, { childList: true, subtree: true });
+        mlog('MutationObserver registered v=' + APP_VERSION);
+    } catch(e) {
+        mlog('MutationObserver FAILED: ' + (e && e.message ? e.message : String(e)));
+    }
+})();
+"#
+);
+
+/// Drag & drop event logger — helps diagnose attachment upload issues.
+/// Logs dragenter/dragover/drop events including file count and types.
+const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function dlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[DragDropJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _lastDragEnter = 0;
+
+    document.addEventListener('dragenter', function(e) {
+        try {
+            // CRITICAL: preventDefault + dropEffect required for drop to fire.
+            // Without this the browser suppresses the drop event entirely.
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+            var files = e.dataTransfer ? e.dataTransfer.files.length : 0;
+            var types = e.dataTransfer ? (e.dataTransfer.types || []).join(',') : 'n/a';
+            _lastDragEnter = Date.now();
+            dlog('dragenter files=' + files + ' types=' + types + ' target=' + (e.target && e.target.tagName ? e.target.tagName : 'none'));
+        } catch(_) {}
+    }, true);
+
+    document.addEventListener('dragover', function(e) {
+        try {
+            // CRITICAL: preventDefault must be called on every dragover
+            // so the drop event fires.  This is a WebKit/macOS requirement.
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+            // Throttle: log at most once per second
+            if (Date.now() - _lastDragEnter < 1000) return;
+            _lastDragEnter = Date.now();
+            var files = e.dataTransfer ? e.dataTransfer.files.length : 0;
+            var items = e.dataTransfer ? (e.dataTransfer.items ? e.dataTransfer.items.length : 0) : 0;
+            dlog('dragover files=' + files + ' items=' + items);
+        } catch(_) {}
+    }, true);
+
+    document.addEventListener('drop', function(e) {
+        try {
+            // preventDefault is REQUIRED for the browser to treat this as a drop
+            // target (otherwise it opens the file in the window).  We do NOT call
+            // stopPropagation() — Messenger's own drop listener needs the event.
+            e.preventDefault();
+            var files = [];
+            if (e.dataTransfer && e.dataTransfer.files) {
+                for (var i = 0; i < e.dataTransfer.files.length; i++) {
+                    var f = e.dataTransfer.files[i];
+                    files.push(f.name + '(' + f.type + ',' + f.size + ')');
+                }
+            }
+            dlog('drop files=[' + files.join('; ') + '] target=' + (e.target && e.target.tagName ? e.target.tagName : 'none'));
+        } catch(err) {
+            dlog('drop ERROR: ' + (err && err.message ? err.message : String(err)));
+        }
+    }, true);
+
+    // Log paste events (alternative way to attach images on some platforms)
+    document.addEventListener('paste', function(e) {
+        try {
+            var items = [];
+            if (e.clipboardData && e.clipboardData.items) {
+                for (var i = 0; i < e.clipboardData.items.length; i++) {
+                    var item = e.clipboardData.items[i];
+                    items.push(item.type + (item.kind ? '/' + item.kind : ''));
+                }
+            }
+            dlog('paste items=[' + items.join('; ') + ']');
+        } catch(err) {
+            dlog('paste ERROR: ' + (err && err.message ? err.message : String(err)));
+        }
+    }, true);
+
+    // Handler called from Rust when Tauri native drag-drop events fire.
+    // WKWebView on macOS doesn't deliver HTML5 DnD to JS, so Rust forwards
+    // the file paths and we create synthetic drop events with real File objects.
+    window.__messengerx_handleDroppedFiles = async function(paths) {
+        try {
+            dlog('handleDroppedFiles paths=' + JSON.stringify(paths));
+            const { convertFileSrc } = await import('@tauri-apps/api/core');
+            const files = [];
+            for (const path of paths) {
+                try {
+                    const url = convertFileSrc(path);
+                    dlog('fetching ' + url);
+                    const response = await fetch(url);
+                    if (!response.ok) {
+                        dlog('fetch FAILED status=' + response.status + ' url=' + url);
+                        continue;
+                    }
+                    const blob = await response.blob();
+                    // Extract filename from path
+                    const filename = path.replace(/\\/g, '/').split('/').pop() || 'file';
+                    // Guess mime type from extension
+                    const ext = filename.split('.').pop().toLowerCase();
+                    const mimeMap = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', mp4:'video/mp4', mov:'video/quicktime', avi:'video/x-msvideo', webm:'video/webm', pdf:'application/pdf' };
+                    const type = mimeMap[ext] || blob.type || 'application/octet-stream';
+                    const file = new File([blob], filename, { type: type });
+                    files.push(file);
+                    dlog('created File name=' + filename + ' size=' + file.size + ' type=' + type);
+                } catch(err) {
+                    dlog('handleDroppedFiles path ERROR: ' + (err && err.message ? err.message : String(err)));
+                }
+            }
+            if (files.length === 0) {
+                dlog('handleDroppedFiles: no files created');
+                return;
+            }
+            // Create synthetic drop event with File objects
+            const dt = new DataTransfer();
+            for (const f of files) {
+                dt.items.add(f);
+            }
+            const dropEvent = new DragEvent('drop', {
+                bubbles: true,
+                cancelable: true,
+                dataTransfer: dt
+            });
+            // Find the best target — Messenger's drop zone (usually the composer area)
+            var target = document.querySelector('[contenteditable="true"]') ||
+                         document.querySelector('[role="textbox"]') ||
+                         document.activeElement ||
+                         document.body;
+            dlog('dispatching drop on ' + target.tagName + ' files=' + files.length);
+            target.dispatchEvent(dropEvent);
+            // Also dispatch on document for global listeners
+            document.dispatchEvent(dropEvent);
+        } catch(err) {
+            dlog('handleDroppedFiles ERROR: ' + (err && err.message ? err.message : String(err)));
+        }
+    };
+
+    dlog('listeners registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// GIF-specific debug logger — watches for GIF elements that fail to animate or
+/// show the "sorry you're having trouble playing this video" fallback banner.
+const GIF_DEBUG_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function glog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[GifDebugJS] ' + msg });
+        } catch(_) {}
+    }
+
+    function isGifElement(el) {
+        try {
+            if (el instanceof HTMLImageElement) {
+                var src = el.src || el.currentSrc || '';
+                if (src.toLowerCase().endsWith('.gif')) return true;
+                // Facebook sometimes serves GIFs as webp with gif content
+                if (src.indexOf('.gif?') >= 0) return true;
+            }
+            if (el instanceof HTMLVideoElement) {
+                var src = el.src || el.currentSrc || '';
+                if (src.toLowerCase().endsWith('.gif')) return true;
+                // Check poster
+                if (el.poster && el.poster.toLowerCase().indexOf('.gif') >= 0) return true;
+            }
+        } catch(_) {}
+        return false;
+    }
+
+    function checkGifState() {
+        try {
+            var gifs = document.querySelectorAll('img, video');
+            var gifCount = 0;
+            var brokenCount = 0;
+            gifs.forEach(function(el) {
+                if (!isGifElement(el)) return;
+                gifCount++;
+                var broken = false;
+                try {
+                    if (el instanceof HTMLImageElement) {
+                        // Broken if complete but zero size
+                        if (el.complete && (el.naturalWidth === 0 || el.naturalHeight === 0)) {
+                            broken = true;
+                        }
+                        // Or if parent contains error text
+                        var parent = el.parentElement;
+                        if (parent && parent.textContent && parent.textContent.toLowerCase().indexOf('sorry') >= 0) {
+                            broken = true;
+                        }
+                    } else if (el instanceof HTMLVideoElement) {
+                        // Check for error state
+                        if (el.error && el.error.code !== 0) broken = true;
+                        // Check for the "sorry" banner
+                        var rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            // Video element visible but not playing
+                            if (el.paused && el.readyState < 2 && el.networkState === 3) {
+                                broken = true;
+                            }
+                        }
+                    }
+                } catch(_) {}
+                if (broken) {
+                    brokenCount++;
+                    var src = el.src || el.currentSrc || '(no-src)';
+                    try { var u = new URL(src); src = u.origin + u.pathname; } catch(_) { src = src.replace(/[?#].*$/, ''); }
+                    if (src.length > 200) src = src.slice(0, 197) + '...';
+                    glog('broken gif detected src=' + JSON.stringify(src) +
+                         ' tag=' + (el.tagName ? el.tagName.toLowerCase() : 'unknown') +
+                         ' complete=' + el.complete +
+                         ' naturalWidth=' + (el.naturalWidth || 0));
+                }
+            });
+            if (gifCount > 0) {
+                glog('gif scan complete total=' + gifCount + ' broken=' + brokenCount);
+            }
+        } catch(e) {
+            glog('scan ERROR: ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+
+    // Run scan periodically
+    setInterval(checkGifState, 5000);
+    glog('GIF scanner registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// Console error logger — captures window.onerror, unhandledrejection, and
+/// console.error calls. Many Messenger JS errors don't surface as media errors
+/// but still break attachment rendering or cause silent failures.
+const CONSOLE_ERROR_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function clog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[ConsoleJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _errorDedup = new Set();
+    function dedupKey(msg, url, line) {
+        return (msg || '') + '|' + (url || '') + '|' + (line || 0);
+    }
+
+    // window.onerror — catches uncaught JS exceptions
+    var _origOnError = window.onerror;
+    window.onerror = function(msg, url, line, col, err) {
+        try {
+            var key = dedupKey(String(msg), url, line);
+            if (_errorDedup.has(key)) return;
+            _errorDedup.add(key);
+            if (_errorDedup.size > 100) { _errorDedup.clear(); } // prevent unbounded growth
+            var stack = '';
+            try { stack = err && err.stack ? err.stack.split('\n').slice(0,3).join(' || ') : ''; } catch(_) {}
+            clog('onerror msg=' + JSON.stringify(String(msg).slice(0,200)) +
+                 ' url=' + JSON.stringify(String(url||'').slice(0,200)) +
+                 ' line=' + line + ' col=' + col +
+                 (stack ? ' stack=' + JSON.stringify(stack.slice(0,300)) : ''));
+        } catch(_) {}
+        if (typeof _origOnError === 'function') return _origOnError.apply(this, arguments);
+        return false;
+    };
+
+    // unhandledrejection — catches Promise rejections
+    window.addEventListener('unhandledrejection', function(e) {
+        try {
+            var reason = e.reason;
+            var msg = '';
+            try {
+                msg = reason instanceof Error ? reason.message : String(reason);
+            } catch(_) { msg = String(reason); }
+            var stack = '';
+            try { stack = reason && reason.stack ? reason.stack.split('\n').slice(0,3).join(' || ') : ''; } catch(_) {}
+            clog('unhandledrejection reason=' + JSON.stringify(msg.slice(0,300)) +
+                 (stack ? ' stack=' + JSON.stringify(stack.slice(0,300)) : ''));
+        } catch(_) {}
+    });
+
+    // Intercept console.error — Messenger logs many internal errors here
+    var _origConsoleError = console.error;
+    console.error = function() {
+        try {
+            var args = Array.prototype.slice.call(arguments);
+            var msg = args.map(function(a) {
+                try { return String(a); } catch(_) { return '[unstringable]'; }
+            }).join(' ');
+            // Throttle: only log if different from last 50ms
+            if (!console._lastErr || Date.now() - console._lastErr.t > 50 || console._lastErr.msg !== msg) {
+                console._lastErr = { t: Date.now(), msg: msg };
+                clog('console.error: ' + msg.slice(0,400));
+            }
+        } catch(_) {}
+        return _origConsoleError.apply(this, arguments);
+    };
+
+    clog('Console error logger registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// Network logger — intercepts fetch() and XMLHttpRequest to log all network
+/// requests including media fetches. This catches failures that don't produce
+/// DOM errors (e.g. 403/404 on CDN, CORS issues, timeouts).
+const NETWORK_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function nlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[NetworkJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _requestId = 0;
+    var _pending = new Map();
+
+    function shouldLogUrl(url) {
+        // Log media URLs and Messenger API calls; skip analytics/beacons
+        var s = String(url || '');
+        return s.indexOf('.gif') >= 0 || s.indexOf('.png') >= 0 || s.indexOf('.jpg') >= 0 ||
+               s.indexOf('.jpeg') >= 0 || s.indexOf('.mp4') >= 0 || s.indexOf('.webm') >= 0 ||
+               s.indexOf('fbcdn.net') >= 0 || s.indexOf('messenger.com') >= 0 ||
+               s.indexOf('facebook.com') >= 0;
+    }
+
+    function sanitizeUrl(url) {
+        try { var u = new URL(url); return u.origin + u.pathname; } catch(_) {
+            return String(url).replace(/[?#].*$/, '').slice(0, 200);
+        }
+    }
+
+    // Intercept fetch()
+    var _origFetch = window.fetch;
+    window.fetch = function(url, options) {
+        var id = ++_requestId;
+        var start = performance.now();
+        var urlStr = String(url || '');
+        var method = (options && options.method) || 'GET';
+        var logThis = shouldLogUrl(urlStr);
+
+        if (logThis) {
+            nlog('fetch start id=' + id + ' method=' + method + ' url=' + JSON.stringify(sanitizeUrl(urlStr)));
+        }
+
+        return _origFetch.apply(this, arguments).then(function(response) {
+            if (logThis) {
+                var ms = Math.round(performance.now() - start);
+                nlog('fetch end id=' + id + ' status=' + response.status + ' ms=' + ms +
+                     ' type=' + (response.headers.get('content-type') || 'unknown').split(';')[0]);
+            }
+            return response;
+        }).catch(function(err) {
+            if (logThis) {
+                var ms = Math.round(performance.now() - start);
+                nlog('fetch ERROR id=' + id + ' ms=' + ms + ' err=' + String(err).slice(0,200));
+            }
+            throw err;
+        });
+    };
+
+    // Intercept XMLHttpRequest
+    var _origXHROpen = XMLHttpRequest.prototype.open;
+    var _origXHRSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this._netLogId = ++_requestId;
+        this._netLogUrl = String(url || '');
+        this._netLogMethod = method;
+        this._netLogStart = 0;
+        this._netLogShould = shouldLogUrl(this._netLogUrl);
+        return _origXHROpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function() {
+        var self = this;
+        if (self._netLogShould) {
+            self._netLogStart = performance.now();
+            nlog('xhr start id=' + self._netLogId + ' method=' + self._netLogMethod +
+                 ' url=' + JSON.stringify(sanitizeUrl(self._netLogUrl)));
+        }
+
+        self.addEventListener('loadend', function() {
+            if (!self._netLogShould) return;
+            var ms = Math.round(performance.now() - self._netLogStart);
+            var ct = '';
+            try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
+            nlog('xhr end id=' + self._netLogId + ' status=' + self.status + ' ms=' + ms +
+                 ' type=' + ct);
+        });
+
+        return _origXHRSend.apply(this, arguments);
+    };
+
+    nlog('Network logger registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// WebSocket logger — logs connect/disconnect and message counts. Messenger
+/// uses WebSocket for real-time messaging; disconnections can cause attachment
+/// sync issues (uploaded files not appearing, stuck "sending" state).
+const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function wlog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[WebSocketJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _origWebSocket = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+        var ws = protocols ? new _origWebSocket(url, protocols) : new _origWebSocket(url);
+        var wsUrl = String(url || '');
+        var id = Math.random().toString(36).slice(2, 8);
+        var openTime = 0;
+
+        wlog('WS created id=' + id + ' url=' + JSON.stringify(wsUrl.slice(0, 200)));
+
+        ws.addEventListener('open', function() {
+            openTime = Date.now();
+            wlog('WS open id=' + id);
+        });
+
+        ws.addEventListener('close', function(e) {
+            var duration = openTime ? (Date.now() - openTime) + 'ms' : 'N/A';
+            wlog('WS close id=' + id + ' code=' + e.code + ' reason=' + JSON.stringify(e.reason||'').slice(0,100) + ' duration=' + duration);
+        });
+
+        ws.addEventListener('error', function(e) {
+            wlog('WS error id=' + id);
+        });
+
+        // Count messages (but don't log content for privacy)
+        var msgCount = 0;
+        var _origSend = ws.send;
+        ws.send = function(data) {
+            msgCount++;
+            if (msgCount <= 3 || msgCount % 50 === 0) {
+                var size = typeof data === 'string' ? data.length : (data && data.byteLength ? data.byteLength : 0);
+                wlog('WS send id=' + id + ' msg#' + msgCount + ' size=' + size);
+            }
+            return _origSend.apply(this, arguments);
+        };
+
+        var _origAddEventListener = ws.addEventListener;
+        ws.addEventListener = function(type, handler, options) {
+            if (type === 'message') {
+                var wrapped = function(e) {
+                    msgCount++;
+                    if (msgCount <= 3 || msgCount % 50 === 0) {
+                        var size = typeof e.data === 'string' ? e.data.length : (e.data && e.data.byteLength ? e.data.byteLength : 0);
+                        wlog('WS recv id=' + id + ' msg#' + msgCount + ' size=' + size);
+                    }
+                    return handler.apply(this, arguments);
+                };
+                return _origAddEventListener.call(this, type, wrapped, options);
+            }
+            return _origAddEventListener.apply(this, arguments);
+        };
+
+        return ws;
+    };
+    window.WebSocket.prototype = _origWebSocket.prototype;
+
+    wlog('WebSocket logger registered v=' + APP_VERSION);
+})();
+"#
+);
+
+/// Performance and memory logger — periodically logs JS heap size, DOM node
+/// count, and event listener count. Helps diagnose memory leaks that cause
+/// attachment failures after long sessions ("restart fixes it" pattern).
+const PERFORMANCE_LOGGER_SCRIPT: &str = concat!(
+    r#"
+(function() {
+    var APP_VERSION = ""#,
+    env!("CARGO_PKG_VERSION"),
+    r#"";
+
+    function plog(msg) {
+        try {
+            window.__TAURI__.core.invoke('js_log', { message: '[PerfJS] ' + msg });
+        } catch(_) {}
+    }
+
+    var _lastMemory = 0;
+
+    function logPerformanceSnapshot() {
+        try {
+            var mem = performance.memory;
+            var heapUsed = mem ? Math.round(mem.usedJSHeapSize / 1048576) : 0;
+            var heapTotal = mem ? Math.round(mem.totalJSHeapSize / 1048576) : 0;
+            var heapLimit = mem ? Math.round(mem.jsHeapSizeLimit / 1048576) : 0;
+
+            // DOM node count
+            var nodes = document.querySelectorAll('*').length;
+
+            // Count img/video elements
+            var imgs = document.querySelectorAll('img').length;
+            var videos = document.querySelectorAll('video').length;
+            var canvases = document.querySelectorAll('canvas').length;
+
+            // Memory delta (MB)
+            var delta = heapUsed - _lastMemory;
+            _lastMemory = heapUsed;
+
+            plog('heap=' + heapUsed + 'MB/' + heapTotal + 'MB limit=' + heapLimit +
+                 'MB nodes=' + nodes + ' imgs=' + imgs + ' videos=' + videos +
+                 ' canvases=' + canvases + ' delta=' + delta + 'MB');
+        } catch(e) {
+            plog('snapshot ERROR: ' + (e && e.message ? e.message : String(e)));
+        }
+    }
+
+    // Log immediately, then every 30 seconds
+    setTimeout(logPerformanceSnapshot, 5000);
+    setInterval(logPerformanceSnapshot, 30000);
+
+    // Also log when memory pressure might be happening
+    if (window.performance && window.performance.memory) {
+        setInterval(function() {
+            var used = performance.memory.usedJSHeapSize;
+            var limit = performance.memory.jsHeapSizeLimit;
+            if (used > limit * 0.85) {
+                plog('WARNING heap usage=' + Math.round(used/1048576) + 'MB exceeds 85% of limit');
+            }
+        }, 10000);
+    }
+
+    plog('Performance logger registered v=' + APP_VERSION);
 })();
 "#
 );
@@ -3819,6 +4591,13 @@ fn log_platform_environment() {
     let build_version = env!("MESSENGERX_BUILD_VERSION");
     log::info!("[MessengerX][Env] starting {build_version}");
 
+    // Log build-time info: target arch and build profile.
+    log::info!(
+        "[MessengerX][Env] arch={} profile={}",
+        std::env::consts::ARCH,
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
+
     #[cfg(target_os = "linux")]
     {
         let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "<unset>".into());
@@ -3859,6 +4638,29 @@ fn log_platform_environment() {
             }
             Err(e) => {
                 log::warn!("[MessengerX][Env][Linux] notify-send probe spawn failed: {e}");
+            }
+        }
+
+        // Probe for GStreamer codecs — these are needed for GIF/video playback
+        // in WebKitGTK.  Missing plugins produce silent failures.
+        let gst_probe = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("gst-inspect-1.0 --version 2>/dev/null; echo '---'; \
+                  gst-inspect-1.0 libav 2>/dev/null | head -n1; \
+                  gst-inspect-1.0 vp8dec 2>/dev/null | head -n1; \
+                  gst-inspect-1.0 vp9dec 2>/dev/null | head -n1; \
+                  gst-inspect-1.0 h264parse 2>/dev/null | head -n1")
+            .output();
+        match gst_probe {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                log::info!(
+                    "[MessengerX][Env][Linux] gstreamer_probe stdout={stdout:?} stderr={stderr:?}"
+                );
+            }
+            Err(e) => {
+                log::debug!("[MessengerX][Env][Linux] gstreamer_probe spawn failed (non-fatal): {e}");
             }
         }
     }
@@ -4372,6 +5174,7 @@ pub fn run() {
             commands::is_autostart_enabled,
             commands::js_log,
             commands::get_window_focused,
+            commands::clear_last_messenger_url,
             commands::pick_save_path,
             commands::write_file_bytes,
             commands::save_dom_snapshot,
@@ -4667,12 +5470,24 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .min_inner_size(400.0, 300.0)
         .resizable(true)
         .visible(!settings.start_minimized)
+        // Disable Tauri's internal drag-drop handler on macOS so that the
+        // WKWebView receives native HTML5 drag-and-drop events instead.
+        // Without this, Tao's NSDraggingDestination intercepts all drops
+        // and they never reach Messenger's JS handlers.
+        .disable_drag_drop_handler()
         // Inject all JS at document-start.
         .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
         .initialization_script(UNREAD_OBSERVER_SCRIPT)
         .initialization_script(DIAGNOSTIC_TELEMETRY_SCRIPT)
         .initialization_script(AUDIO_HOOK_SCRIPT)
         .initialization_script(MEDIA_ERROR_LOGGER_SCRIPT)
+        .initialization_script(MEDIA_LOAD_LOGGER_SCRIPT)
+        .initialization_script(DRAG_DROP_LOGGER_SCRIPT)
+        .initialization_script(GIF_DEBUG_SCRIPT)
+        .initialization_script(CONSOLE_ERROR_LOGGER_SCRIPT)
+        .initialization_script(NETWORK_LOGGER_SCRIPT)
+        .initialization_script(WEBSOCKET_LOGGER_SCRIPT)
+        .initialization_script(PERFORMANCE_LOGGER_SCRIPT)
         .initialization_script(OFFLINE_DIALOG_HIDER_SCRIPT)
         .initialization_script(&offline_banner_script)
         .initialization_script(&zoom_init_script)
@@ -5224,6 +6039,33 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // No `u` param — this is likely a Messenger OAuth / login
                     // cookie redirect (NOT an external link shim).  Let it
                     // navigate inside the WebView so the login flow can complete.
+                }
+
+                // Facebook profile pages (e.g. /username or /profile.php) must
+                // open in the system browser, not inside the WebView.  The only
+                // facebook.com URLs that should stay in-app are e2ee group calls
+                // (/groupcall/...) and login/oauth flows.
+                if host == "facebook.com" || host.ends_with(".facebook.com") {
+                    let path = url.path();
+                    let is_call = path.starts_with("/groupcall/");
+                    let is_login = path.starts_with("/login")
+                        || path.starts_with("/oauth")
+                        || path.starts_with("/dialog/")
+                        || path.starts_with("/connect/");
+                    if !is_call && !is_login {
+                        let url_str = url.to_string();
+                        log::info!(
+                            "[MessengerX][Navigation] Blocking Facebook profile page — opening externally: {url_str}"
+                        );
+                        let handle = nav_app_handle.clone();
+                        std::thread::spawn(move || {
+                            use tauri_plugin_opener::OpenerExt;
+                            if let Err(e) = handle.opener().open_url(&url_str, None::<&str>) {
+                                log::warn!("[MessengerX] Failed to open Facebook profile URL {url_str}: {e}");
+                            }
+                        });
+                        return false;
+                    }
                 }
 
                 // Google domains are required for the Facebook login reCAPTCHA flow:
@@ -7124,8 +7966,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!(
-        "[MessengerX][Boot] setup_app complete (t={}ms)",
-        setup_started.elapsed().as_millis()
+        "[MessengerX][Boot] setup_app complete (t={}ms) scripts=\"{}\" zoom={} appearance={:?} online={}",
+        setup_started.elapsed().as_millis(),
+        "notif,unread,diag,audio,mediaErr,mediaLoad,dragDrop,gifDebug,consoleErr,network,websocket,perf,offline,zoom,scroll,appearance,call,callUnlock,windowOpen",
+        zoom_level,
+        settings.appearance,
+        is_online
     );
     Ok(())
 }

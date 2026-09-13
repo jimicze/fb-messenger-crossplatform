@@ -1087,6 +1087,7 @@ pub fn open_popup(url: String, app: AppHandle) -> Result<(), String> {
         .title("Messenger X — Call")
         .inner_size(960.0, 640.0)
         .resizable(true)
+        .disable_drag_drop_handler()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
         .initialization_script(crate::NOTIFICATION_OVERRIDE_SCRIPT)
         .initialization_script(crate::CALL_COMPAT_SCRIPT)
@@ -1124,6 +1125,7 @@ pub fn open_popup(url: String, app: AppHandle) -> Result<(), String> {
                 .title("Messenger X — Call")
                 .inner_size(960.0, 640.0)
                 .resizable(true)
+                .disable_drag_drop_handler()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
                 .initialization_script(crate::NOTIFICATION_OVERRIDE_SCRIPT)
                 .initialization_script(crate::CALL_COMPAT_SCRIPT)
@@ -1288,6 +1290,23 @@ pub fn set_autostart(enabled: bool, app: AppHandle) -> Result<(), String> {
 pub fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// Clear the persisted `last_messenger_url` setting.
+///
+/// Called from JS when a broken "Facebook user" conversation is detected,
+/// so the next startup does not restore the same broken URL.
+#[tauri::command]
+pub fn clear_last_messenger_url(app: AppHandle) {
+    let mut settings = crate::services::auth::load_settings(&app).unwrap_or_default();
+    if settings.last_messenger_url.is_some() {
+        settings.last_messenger_url = None;
+        if let Err(e) = crate::services::auth::save_settings(&app, &settings) {
+            log::warn!("[MessengerX][FBUserDetect] Failed to clear last_messenger_url: {e}");
+        } else {
+            log::info!("[MessengerX][FBUserDetect] Cleared last_messenger_url");
+        }
+    }
 }
 
 // ── Download save-as commands ──────────────────────────────────────────
