@@ -3349,15 +3349,27 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                 // version).
                 var text = document.body ? document.body.innerText || document.body.textContent || '' : '';
                 if (text.indexOf('Facebook user') >= 0) {
-                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — clearing persisted URL and redirecting to messenger.com');
-                    // Mark session so we don't redirect again.
+                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — clearing persisted URL and reloading');
+                    // Mark session so we don't reload again.
                     try { sessionStorage.setItem('_mx_fbuser_redirect', '1'); } catch(_) {}
                     // Clear the persisted last_messenger_url in Rust so the
                     // next startup does not restore this broken thread.
                     try {
                         window.__TAURI__.core.invoke('clear_last_messenger_url');
                     } catch(_) {}
-                    location.href = 'https://www.messenger.com/';
+                    // Show a loading overlay so the user never sees the
+                    // broken "Facebook user" placeholder.
+                    try {
+                        var _mxOverlay = document.createElement('div');
+                        _mxOverlay.id = '_mx_fbuser_overlay';
+                        _mxOverlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:#f0f2f5;z-index:999999;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:16px;color:#65676b;';
+                        _mxOverlay.textContent = 'Loading conversation…';
+                        if (document.body) document.body.appendChild(_mxOverlay);
+                    } catch(_) {}
+                    // Force a full page reload. Messenger's SPA sometimes
+                    // fails to hydrate conversation data on the first load;
+                    // a reload re-initialises everything from cache.
+                    location.reload();
                     return;
                 }
                 setTimeout(_checkFacebookUser, _fbUserInterval);
