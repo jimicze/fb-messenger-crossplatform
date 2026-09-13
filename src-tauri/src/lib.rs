@@ -3322,8 +3322,13 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     //    On startup Messenger sometimes loads the last conversation URL but
     //    renders a broken "Facebook user" placeholder instead of the actual
     //    chat.  This appears to be a Messenger SPA fallback when conversation
-    //    data fails to hydrate.  Detect it and redirect to the main page so
-    //    the user sees their conversation list instead of a blank profile.
+    //    data fails to hydrate.
+    //
+    //    We redirect ONCE per session (tracked via sessionStorage) to avoid
+    //    an infinite loop: Messenger's client-side router restores the last
+    //    conversation after navigating to messenger.com, which would trigger
+    //    the detector again.  We also clear the persisted last_messenger_url
+    //    via Rust so the next startup does not restore the broken thread.
     // -----------------------------------------------------------------------
     try {
         var _fbUserCheckCount = 0;
@@ -3333,6 +3338,8 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
             try {
                 _fbUserCheckCount++;
                 if (_fbUserCheckCount > _fbUserMaxChecks) return;
+                // Prevent redirect loop: only redirect once per session.
+                if (sessionStorage && sessionStorage.getItem('_mx_fbuser_redirect')) return;
                 var path = (location && location.pathname) || '';
                 if (!path.startsWith('/t/')) return;
                 // Look for "Facebook user" text in the document.
@@ -3342,7 +3349,14 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                 // version).
                 var text = document.body ? document.body.innerText || document.body.textContent || '' : '';
                 if (text.indexOf('Facebook user') >= 0) {
-                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — redirecting to messenger.com');
+                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — clearing persisted URL and redirecting to messenger.com');
+                    // Mark session so we don't redirect again.
+                    try { sessionStorage.setItem('_mx_fbuser_redirect', '1'); } catch(_) {}
+                    // Clear the persisted last_messenger_url in Rust so the
+                    // next startup does not restore this broken thread.
+                    try {
+                        window.__TAURI__.core.invoke('clear_last_messenger_url');
+                    } catch(_) {}
                     location.href = 'https://www.messenger.com/';
                     return;
                 }
@@ -5135,6 +5149,7 @@ pub fn run() {
             commands::is_autostart_enabled,
             commands::js_log,
             commands::get_window_focused,
+            commands::clear_last_messenger_url,
             commands::pick_save_path,
             commands::write_file_bytes,
             commands::save_dom_snapshot,

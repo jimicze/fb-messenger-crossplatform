@@ -1290,6 +1290,23 @@ pub fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+/// Clear the persisted `last_messenger_url` setting.
+///
+/// Called from JS when a broken "Facebook user" conversation is detected,
+/// so the next startup does not restore the same broken URL.
+#[tauri::command]
+pub fn clear_last_messenger_url(app: AppHandle) {
+    let mut settings = crate::services::auth::load_settings(&app).unwrap_or_default();
+    if settings.last_messenger_url.is_some() {
+        settings.last_messenger_url = None;
+        if let Err(e) = crate::services::auth::save_settings(&app, &settings) {
+            log::warn!("[MessengerX][FBUserDetect] Failed to clear last_messenger_url: {e}");
+        } else {
+            log::info!("[MessengerX][FBUserDetect] Cleared last_messenger_url");
+        }
+    }
+}
+
 // ── Download save-as commands ──────────────────────────────────────────
 
 /// Opens a native "Save As" file dialog and returns the chosen path.
