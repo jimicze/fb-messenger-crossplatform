@@ -3316,6 +3316,50 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
         dlog('[HTTP] install FAILED: ' + (e && e.message ? e.message : String(e)));
     }
 
+    // -----------------------------------------------------------------------
+    // 5. "Facebook user" broken conversation detection & auto-redirect.
+    //
+    //    On startup Messenger sometimes loads the last conversation URL but
+    //    renders a broken "Facebook user" placeholder instead of the actual
+    //    chat.  This appears to be a Messenger SPA fallback when conversation
+    //    data fails to hydrate.  Detect it and redirect to the main page so
+    //    the user sees their conversation list instead of a blank profile.
+    // -----------------------------------------------------------------------
+    try {
+        var _fbUserCheckCount = 0;
+        var _fbUserMaxChecks = 15;   // 15 * 2s = 30s window
+        var _fbUserInterval = 2000;  // check every 2 seconds
+        function _checkFacebookUser() {
+            try {
+                _fbUserCheckCount++;
+                if (_fbUserCheckCount > _fbUserMaxChecks) return;
+                var path = (location && location.pathname) || '';
+                if (!path.startsWith('/t/')) return;
+                // Look for "Facebook user" text in the document.
+                // Messenger renders this as the conversation header when the
+                // thread fails to load.  We scan the whole document because
+                // the exact element varies (h2, span, div depending on DOM
+                // version).
+                var text = document.body ? document.body.innerText || document.body.textContent || '' : '';
+                if (text.indexOf('Facebook user') >= 0) {
+                    dlog('[FBUserDetect] Broken conversation detected on ' + path + ' — redirecting to messenger.com');
+                    location.href = 'https://www.messenger.com/';
+                    return;
+                }
+                setTimeout(_checkFacebookUser, _fbUserInterval);
+            } catch(_) {}
+        }
+        // Start checking 3 seconds after DOM ready (give Messenger time to
+        // hydrate the conversation normally).
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function() {
+                setTimeout(_checkFacebookUser, 3000);
+            });
+        } else {
+            setTimeout(_checkFacebookUser, 3000);
+        }
+    } catch(_) {}
+
     dlog('[Init] diagnostic telemetry v=' + APP_VERSION + ' ready');
 })();
 "#
