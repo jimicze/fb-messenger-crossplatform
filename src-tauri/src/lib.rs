@@ -10,9 +10,6 @@ mod services;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
-#[cfg(target_os = "macos")]
-use objc2_app_kit::NSWindow;
-
 /// Monotonically increasing counter used to generate unique window labels for
 /// popup windows spawned via `window.open()` (e.g. Messenger video/audio call
 /// UI).  Wraps at `u32::MAX` but that is effectively unreachable in practice.
@@ -5473,9 +5470,11 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .min_inner_size(400.0, 300.0)
         .resizable(true)
         .visible(!settings.start_minimized)
-        // NOTE: disable_drag_drop_handler() is only needed on Windows.
-        // On macOS WKWebView delegates to the OS default behaviour when the
-        // Tauri handler is not explicitly set, so we leave it enabled.
+        // Disable Tauri's internal drag-drop handler on macOS so that the
+        // WKWebView receives native HTML5 drag-and-drop events instead.
+        // Without this, Tao's NSDraggingDestination intercepts all drops
+        // and they never reach Messenger's JS handlers.
+        .disable_drag_drop_handler()
         // Inject all JS at document-start.
         .initialization_script(NOTIFICATION_OVERRIDE_SCRIPT)
         .initialization_script(UNREAD_OBSERVER_SCRIPT)
@@ -6552,71 +6551,6 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         });
-    }
-
-    // ------------------------------------------------------------------
-    // macOS drag-and-drop bridge.
-    //
-    // Tao (Tauri's windowing lib) creates an NSWindow delegate that
-    // implements NSDraggingDestination.  When a file is dropped onto the
-    // window, the delegate's performDragOperation: is called; Tao emits
-    // tao::WindowEvent::DroppedFile.  Tauri v2 removed DroppedFile from
-    // its public WindowEvent enum, so the drop is silently swallowed and
-    // never reaches the WKWebView HTML5 DnD handlers.
-    //
-    // We fix this by replacing Tao's dragging delegate methods with no-ops
-    // that return NO/NSDragOperationNone.  macOS then forwards the drop to
-    // the WKWebView, which natively handles HTML5 drag-and-drop.
-    // ------------------------------------------------------------------
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CStr;
-        use objc2::ffi::{class_replaceMethod, BOOL, NO, YES};
-        use objc2::runtime::{AnyClass, Sel};
-
-        unsafe extern "C" fn no_dragging_entered(_: &objc2::runtime::AnyObject, _: Sel, _: *mut objc2::runtime::AnyObject) -> BOOL {
-            NO
-        }
-        unsafe extern "C" fn no_perform_drag_operation(_: &objc2::runtime::AnyObject, _: Sel, _: *mut objc2::runtime::AnyObject) -> BOOL {
-            NO
-        }
-        unsafe extern "C" fn no_dragging_exited(_: &objc2::runtime::AnyObject, _: Sel, _: *mut objc2::runtime::AnyObject) {}
-
-        if let Some(tao_delegate_cls) = AnyClass::get(CStr::from_bytes_with_nul(b"TaoWindowDelegate\0").unwrap()) {
-            let dragging_entered_sel = Sel::register(CStr::from_bytes_with_nul(b"draggingEntered:\0").unwrap());
-            let perform_drag_sel = Sel::register(CStr::from_bytes_with_nul(b"performDragOperation:\0").unwrap());
-            let dragging_exited_sel = Sel::register(CStr::from_bytes_with_nul(b"draggingExited:\0").unwrap());
-
-            // Replace Tao's drag methods with no-ops that reject the drop.
-            // Type encodings: B=BOOL, v=void, @=id, :=SEL
-            let bool_types = CStr::from_bytes_with_nul(b"B@:@\0").unwrap();
-            let void_types = CStr::from_bytes_with_nul(b"v@:@\0").unwrap();
-
-            unsafe {
-                class_replaceMethod(
-                    tao_delegate_cls as *const AnyClass as *mut AnyClass,
-                    dragging_entered_sel,
-                    std::mem::transmute(no_dragging_entered as unsafe extern "C" fn(_, _, _) -> _),
-                    bool_types.as_ptr(),
-                );
-                class_replaceMethod(
-                    tao_delegate_cls as *const AnyClass as *mut AnyClass,
-                    perform_drag_sel,
-                    std::mem::transmute(no_perform_drag_operation as unsafe extern "C" fn(_, _, _) -> _),
-                    bool_types.as_ptr(),
-                );
-                class_replaceMethod(
-                    tao_delegate_cls as *const AnyClass as *mut AnyClass,
-                    dragging_exited_sel,
-                    std::mem::transmute(no_dragging_exited as unsafe extern "C" fn(_, _, _)),
-                    void_types.as_ptr(),
-                );
-            }
-
-            log::info!("[MessengerX][DnD] Replaced TaoWindowDelegate drag methods — HTML5 DnD enabled");
-        } else {
-            log::warn!("[MessengerX][DnD] Could not find TaoWindowDelegate class");
-        }
     }
 
     // ------------------------------------------------------------------
