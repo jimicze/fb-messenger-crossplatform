@@ -20,13 +20,16 @@ jobs:
       matrix:
         include:
           # ── Linux x64 ─────────────────────────────────────────────────────
-          - platform: 'ubuntu-22.04'
+          # Use ubuntu-24.04 to match the GLib version on target systems
+          # (AppImage bundles system libs; mismatch with 22.04 causes crashes
+          # on newer distros like Ubuntu 24.04 / Mint 22).
+          - platform: 'ubuntu-24.04'
             args: ''
             rust-targets: ''
             label: 'Linux-x64'
 
           # ── Linux arm64 ───────────────────────────────────────────────────
-          - platform: 'ubuntu-22.04-arm'
+          - platform: 'ubuntu-24.04-arm'
             args: ''
             rust-targets: ''
             label: 'Linux-arm64'

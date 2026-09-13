@@ -4584,6 +4584,66 @@ pub fn dispatch_notification_from_bundle(
 ///  - **Windows**: OS version via `cmd /c ver` and WebView2 runtime version
 ///    via the EdgeUpdate registry key. Used for H3/H4.
 ///  - **macOS**: kernel version via `uname -r`.
+/// Returns `true` when the GStreamer plugins required by WebKitGTK for
+/// video/GIF playback are available on the host system.
+///
+/// Uses the full path to `gst-inspect-1.0` because AppImage overrides PATH
+/// and may not see the host-installed binary.
+#[cfg(target_os = "linux")]
+fn has_gstreamer_codecs() -> bool {
+    // Try to locate gst-inspect-1.0 on the host system.
+    let gst_inspect = [
+        "/usr/bin/gst-inspect-1.0",
+        "/usr/local/bin/gst-inspect-1.0",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .map(|s| s.to_string())
+    .or_else(|| {
+        // Fallback: try via `which` using the host's shell (AppImage
+        // sometimes strips PATH, so expand it explicitly).
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("PATH=/usr/bin:/usr/local/bin:/bin:$PATH which gst-inspect-1.0 2>/dev/null")
+            .output()
+            .ok()
+            .and_then(|out| {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if path.is_empty() { None } else { Some(path) }
+            })
+    });
+
+    let Some(gst_inspect) = gst_inspect else {
+        log::debug!("[MessengerX][Env][Linux] has_gstreamer_codecs=false (gst-inspect-1.0 not found)");
+        return false;
+    };
+
+    let ok = std::process::Command::new(&gst_inspect)
+        .arg("libav")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && std::process::Command::new(&gst_inspect)
+            .arg("vp8dec")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        && std::process::Command::new(&gst_inspect)
+            .arg("vp9dec")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+    log::debug!("[MessengerX][Env][Linux] has_gstreamer_codecs={ok} (using {gst_inspect})");
+    ok
+}
+
 fn log_platform_environment() {
     // MESSENGERX_BUILD_VERSION is set by build.rs via `git describe --tags
     // --long --dirty` (e.g. "v1.5.7-3-gafc7ffe-dirty").  Falls back to
@@ -5420,11 +5480,29 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // re-running the binary in dev.  Empty `last_url_raw` means first-launch.
     let last_url_raw = settings.last_messenger_url.as_deref().unwrap_or("");
     let last_url_safe = !last_url_raw.is_empty() && is_safe_messenger_startup_url(last_url_raw);
-    let startup_url = settings
+    #[allow(unused_mut)]
+    let mut startup_url = settings
         .last_messenger_url
         .as_deref()
         .filter(|u| is_safe_messenger_startup_url(u))
         .unwrap_or("https://www.messenger.com/");
+
+    // Linux: if GStreamer codecs are missing, avoid thread URLs on startup
+    // because media-heavy pages (videos, GIFs) trigger WebKitWebProcess
+    // crashes via GStreamer NULL-pointer derefs.
+    #[cfg(target_os = "linux")]
+    {
+        if !has_gstreamer_codecs() && startup_url.contains("/t/") {
+            log::warn!(
+                "[MessengerX][Boot][Linux] GStreamer codecs missing and startup URL \
+                 is a thread ({startup_url}) — falling back to messenger.com root \
+                 to avoid WebKit crash on media load. Install: \
+                 sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-libav"
+            );
+            startup_url = "https://www.messenger.com/";
+        }
+    }
+
     log::info!(
         "[MessengerX][Boot][Trace] startup_url decision: last_raw={last_url_raw:?} \
          safe={last_url_safe} chosen={startup_url:?}"
@@ -5568,6 +5646,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let post_crash_proxy_block = post_crash_proxy_block.clone();
             let messenger_com_navigated = messenger_com_navigated.clone();
             let page_load_stable = page_load_stable.clone();
+            let crash_app_handle = nav_app_handle.clone();
             move |webview_window, title| {
                 const SENDER_HINT_PREFIX: &str = "__MX_SENDER_V1__?";
                 if let Some(query) = title.strip_prefix(SENDER_HINT_PREFIX) {
@@ -5835,6 +5914,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         // maw_proxy_page navigation (which triggers the GStreamer
                         // NULL-pointer deref) is suppressed on the reloaded page.
                         post_crash_proxy_block.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Clear the persisted last URL so Messenger does not
+                        // auto-redirect back to the problematic thread after reload.
+                        let app_handle_for_clear = crash_app_handle.clone();
+                        std::thread::spawn(move || {
+                            commands::clear_last_messenger_url(app_handle_for_clear);
+                        });
                         let wv = webview_window.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -5913,6 +5998,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
          .on_page_load({
              let page_load_stable_pl = page_load_stable.clone();
              let post_crash_proxy_block_pl = post_crash_proxy_block.clone();
+             let crash_reload_count_pl = crash_reload_count.clone();
              move |_webview_window, payload| {
                  use tauri::webview::PageLoadEvent;
                  let event_str = match payload.event() {
@@ -5945,6 +6031,21 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                   (page loaded successfully after crash)"
                              );
                          }
+                         // Reset crash-reload counter after 30 s of stability.
+                         // This prevents the counter from reaching MAX_CRASH_RELOADS
+                         // during a transient network hiccup and permanently disabling
+                         // CrashDetect for the rest of the session.
+                         let crc = crash_reload_count_pl.clone();
+                         std::thread::spawn(move || {
+                             std::thread::sleep(std::time::Duration::from_secs(30));
+                             let old = crc.swap(0, std::sync::atomic::Ordering::Relaxed);
+                             if old > 0 {
+                                 log::info!(
+                                     "[MessengerX][CrashDetect] crash_reload_count reset \
+                                      after 30s stability (was {old})"
+                                 );
+                             }
+                         });
                      }
                  }
              }
