@@ -3049,20 +3049,14 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     //     the files actually reached the page.
     // -----------------------------------------------------------------------
     try {
-        var _fileTrapLogged = {};
+        var         _fileTrapLogged = {};
         function _fileTrapLog(key, msg) {
             if (_fileTrapLogged[key]) return;
             _fileTrapLogged[key] = true;
             dlog(msg);
         }
-        document.addEventListener('paste', function(e) {
-            try {
-                var items = (e.clipboardData && e.clipboardData.items) ? e.clipboardData.items.length : 0;
-                var files = (e.clipboardData && e.clipboardData.files) ? e.clipboardData.files.length : 0;
-                var types = (e.clipboardData && e.clipboardData.types) ? e.clipboardData.types.join(',') : '';
-                _fileTrapLog('paste', '[FileTrap] paste items=' + items + ' files=' + files + ' types=' + types.slice(0, 120));
-            } catch(_) {}
-        });
+        // Paste events are logged per-event by DRAG_DROP_LOGGER_SCRIPT
+        // ([DragDropJS]); no duplicate listener here.
         document.addEventListener('dragover', function(e) {
             _fileTrapLog('dragover', '[FileTrap] dragover');
         });
@@ -3729,7 +3723,8 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
         }
     }, true);
 
-    // Log paste events (alternative way to attach images on some platforms)
+    // Log paste events (alternative way to attach images on some platforms).
+    // This is the single per-paste logging path; FileTrap no longer duplicates it.
     document.addEventListener('paste', function(e) {
         try {
             var items = [];
@@ -3739,70 +3734,18 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
                     items.push(item.type + (item.kind ? '/' + item.kind : ''));
                 }
             }
-            dlog('paste items=[' + items.join('; ') + ']');
+            dlog('paste items=[' + items.join('; ') + '] target=' + (e.target && e.target.tagName ? e.target.tagName : 'none'));
         } catch(err) {
             dlog('paste ERROR: ' + (err && err.message ? err.message : String(err)));
         }
     }, true);
 
-    // Handler called from Rust when Tauri native drag-drop events fire.
-    // WKWebView on macOS doesn't deliver HTML5 DnD to JS, so Rust forwards
-    // the file paths and we create synthetic drop events with real File objects.
-    window.__messengerx_handleDroppedFiles = async function(paths) {
-        try {
-            dlog('handleDroppedFiles paths=' + JSON.stringify(paths));
-            const { convertFileSrc } = await import('@tauri-apps/api/core');
-            const files = [];
-            for (const path of paths) {
-                try {
-                    const url = convertFileSrc(path);
-                    dlog('fetching ' + url);
-                    const response = await fetch(url);
-                    if (!response.ok) {
-                        dlog('fetch FAILED status=' + response.status + ' url=' + url);
-                        continue;
-                    }
-                    const blob = await response.blob();
-                    // Extract filename from path
-                    const filename = path.replace(/\\/g, '/').split('/').pop() || 'file';
-                    // Guess mime type from extension
-                    const ext = filename.split('.').pop().toLowerCase();
-                    const mimeMap = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', mp4:'video/mp4', mov:'video/quicktime', avi:'video/x-msvideo', webm:'video/webm', pdf:'application/pdf' };
-                    const type = mimeMap[ext] || blob.type || 'application/octet-stream';
-                    const file = new File([blob], filename, { type: type });
-                    files.push(file);
-                    dlog('created File name=' + filename + ' size=' + file.size + ' type=' + type);
-                } catch(err) {
-                    dlog('handleDroppedFiles path ERROR: ' + (err && err.message ? err.message : String(err)));
-                }
-            }
-            if (files.length === 0) {
-                dlog('handleDroppedFiles: no files created');
-                return;
-            }
-            // Create synthetic drop event with File objects
-            const dt = new DataTransfer();
-            for (const f of files) {
-                dt.items.add(f);
-            }
-            const dropEvent = new DragEvent('drop', {
-                bubbles: true,
-                cancelable: true,
-                dataTransfer: dt
-            });
-            // Find the best target — Messenger's drop zone (usually the composer area)
-            var target = document.querySelector('[contenteditable="true"]') ||
-                         document.querySelector('[role="textbox"]') ||
-                         document.activeElement ||
-                         document.body;
-            dlog('dispatching drop on ' + target.tagName + ' files=' + files.length);
-            target.dispatchEvent(dropEvent);
-            // Also dispatch on document for global listeners
-            document.dispatchEvent(dropEvent);
-        } catch(err) {
-            dlog('handleDroppedFiles ERROR: ' + (err && err.message ? err.message : String(err)));
-        }
-    };
+    // Note: a Rust-driven `__messengerx_handleDroppedFiles` bridge that fetched
+    // dropped files through the asset protocol was removed — no Rust code ever
+    // invoked it and `assetProtocol.scope` is empty (all asset fetches would
+    // have failed with 403 anyway). File drops now go straight to the WebView
+    // as native HTML5 drag-and-drop via `.disable_drag_drop_handler()`.
+    // Paste events are logged once per event here; FileTrap no longer duplicates them.
 
     dlog('listeners registered v=' + APP_VERSION);
 })();
@@ -4050,14 +3993,20 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
                  ' url=' + JSON.stringify(sanitizeUrl(self._netLogUrl)));
         }
 
-        self.addEventListener('loadend', function() {
-            if (!self._netLogShould) return;
-            var ms = Math.round(performance.now() - self._netLogStart);
-            var ct = '';
-            try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
-            nlog('xhr end id=' + self._netLogId + ' status=' + self.status + ' ms=' + ms +
-                 ' type=' + ct);
-        });
+        // One loadend listener per XHR instance (loadend fires after every
+        // send), never re-added — reused XHR objects would otherwise
+        // accumulate listeners.
+        if (!self._netLogLoadendAdded) {
+            self._netLogLoadendAdded = true;
+            self.addEventListener('loadend', function() {
+                if (!self._netLogShould) return;
+                var ms = Math.round(performance.now() - self._netLogStart);
+                var ct = '';
+                try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
+                nlog('xhr end id=' + self._netLogId + ' status=' + self.status + ' ms=' + ms +
+                     ' type=' + ct);
+            });
+        }
 
         return _origXHRSend.apply(this, arguments);
     };
@@ -4085,59 +4034,63 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
     }
 
     var _origWebSocket = window.WebSocket;
-    window.WebSocket = function(url, protocols) {
-        var ws = protocols ? new _origWebSocket(url, protocols) : new _origWebSocket(url);
-        var wsUrl = String(url || '');
-        var id = Math.random().toString(36).slice(2, 8);
-        var openTime = 0;
+    // A real class subclass (not a plain function) keeps `constructor.name`,
+    // super-chained initialization, and prototype identity intact so that
+    // Messenger's anti-bot heuristics cannot detect the logger override.
+    class LoggedWebSocket extends _origWebSocket {
+        constructor(url, protocols) {
+            super(url, protocols);
+            var ws = this;
+            var wsUrl = String(url || '');
+            var id = Math.random().toString(36).slice(2, 8);
+            var openTime = 0;
+            var msgCount = 0;
 
-        wlog('WS created id=' + id + ' url=' + JSON.stringify(wsUrl.slice(0, 200)));
+            wlog('WS created id=' + id + ' url=' + JSON.stringify(wsUrl.slice(0, 200)));
 
-        ws.addEventListener('open', function() {
-            openTime = Date.now();
-            wlog('WS open id=' + id);
-        });
+            ws.addEventListener('open', function() {
+                openTime = Date.now();
+                wlog('WS open id=' + id);
+            });
 
-        ws.addEventListener('close', function(e) {
-            var duration = openTime ? (Date.now() - openTime) + 'ms' : 'N/A';
-            wlog('WS close id=' + id + ' code=' + e.code + ' reason=' + JSON.stringify(e.reason||'').slice(0,100) + ' duration=' + duration);
-        });
+            ws.addEventListener('close', function(e) {
+                var duration = openTime ? (Date.now() - openTime) + 'ms' : 'N/A';
+                wlog('WS close id=' + id + ' code=' + e.code + ' reason=' + JSON.stringify(e.reason||'').slice(0,100) + ' duration=' + duration);
+            });
 
-        ws.addEventListener('error', function(e) {
-            wlog('WS error id=' + id);
-        });
+            ws.addEventListener('error', function(e) {
+                wlog('WS error id=' + id);
+            });
 
-        // Count messages (but don't log content for privacy)
-        var msgCount = 0;
-        var _origSend = ws.send;
-        ws.send = function(data) {
-            msgCount++;
-            if (msgCount <= 3 || msgCount % 50 === 0) {
-                var size = typeof data === 'string' ? data.length : (data && data.byteLength ? data.byteLength : 0);
-                wlog('WS send id=' + id + ' msg#' + msgCount + ' size=' + size);
-            }
-            return _origSend.apply(this, arguments);
-        };
+            // Count messages (but don't log content for privacy)
+            var _origSend = ws.send;
+            ws.send = function(data) {
+                msgCount++;
+                if (msgCount <= 3 || msgCount % 50 === 0) {
+                    var size = typeof data === 'string' ? data.length : (data && data.byteLength ? data.byteLength : 0);
+                    wlog('WS send id=' + id + ' msg#' + msgCount + ' size=' + size);
+                }
+                return _origSend.apply(this, arguments);
+            };
 
-        var _origAddEventListener = ws.addEventListener;
-        ws.addEventListener = function(type, handler, options) {
-            if (type === 'message') {
-                var wrapped = function(e) {
-                    msgCount++;
-                    if (msgCount <= 3 || msgCount % 50 === 0) {
-                        var size = typeof e.data === 'string' ? e.data.length : (e.data && e.data.byteLength ? e.data.byteLength : 0);
-                        wlog('WS recv id=' + id + ' msg#' + msgCount + ' size=' + size);
-                    }
-                    return handler.apply(this, arguments);
-                };
-                return _origAddEventListener.call(this, type, wrapped, options);
-            }
-            return _origAddEventListener.apply(this, arguments);
-        };
-
-        return ws;
-    };
-    window.WebSocket.prototype = _origWebSocket.prototype;
+            var _origAddEventListener = ws.addEventListener;
+            ws.addEventListener = function(type, handler, options) {
+                if (type === 'message') {
+                    var wrapped = function(e) {
+                        msgCount++;
+                        if (msgCount <= 3 || msgCount % 50 === 0) {
+                            var size = typeof e.data === 'string' ? e.data.length : (e.data && e.data.byteLength ? e.data.byteLength : 0);
+                            wlog('WS recv id=' + id + ' msg#' + msgCount + ' size=' + size);
+                        }
+                        return handler.apply(this, arguments);
+                    };
+                    return _origAddEventListener.call(this, type, wrapped, options);
+                }
+                return _origAddEventListener.apply(this, arguments);
+            };
+        }
+    }
+    window.WebSocket = LoggedWebSocket;
 
     wlog('WebSocket logger registered v=' + APP_VERSION);
 })();
@@ -4802,6 +4755,28 @@ fn is_facebook_in_app_path(path: &str) -> bool {
         || path.starts_with("/connect/")
         || path == "/two_step_verification"
         || path.starts_with("/two_step_verification/")
+}
+
+/// Resolves a Facebook/Messenger link-shim URL (`l.facebook.com/l.php?u=…` or
+/// `l.messenger.com/l.php?u=…`) to the real destination, so external opening
+/// follows the same tracking-stripped URL the JS click interceptor uses.
+///
+/// Returns `None` for anything that is not a shim URL or whose `u` parameter
+/// is not an absolute `http(s)` URL.
+fn resolve_facebook_shim_url(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?;
+    if !(host == "l.facebook.com" || host == "l.messenger.com") || url.path() != "/l.php" {
+        return None;
+    }
+    let target = url
+        .query_pairs()
+        .find(|(key, _)| key == "u")
+        .map(|(_, value)| value.to_string())?;
+    let parsed = url::Url::parse(&target).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    Some(target)
 }
 
 #[derive(Default)]
@@ -6124,8 +6099,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                  "[MessengerX][CrashDetect] post_crash_proxy_block cleared \
                                   (page loaded successfully after crash)"
                              );
+                         }
                      }
-                      }
                  }
              }
          })
@@ -6224,6 +6199,24 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // No `u` param — this is likely a Messenger OAuth / login
                     // cookie redirect (NOT an external link shim).  Let it
                     // navigate inside the WebView so the login flow can complete.
+                }
+
+                // Link shims (l.facebook.com/l.php?u=…, l.messenger.com/l.php?u=…)
+                // resolve to the real destination and open THAT externally, so
+                // JS-triggered navigations get the same tracking-stripped URL
+                // the document-level click interceptor produces.
+                if let Some(real_url) = resolve_facebook_shim_url(url) {
+                    log::info!(
+                        "[MessengerX][Navigation] Link shim resolved — opening externally: {real_url}"
+                    );
+                    let handle = nav_app_handle.clone();
+                    std::thread::spawn(move || {
+                        use tauri_plugin_opener::OpenerExt;
+                        if let Err(e) = handle.opener().open_url(&real_url, None::<&str>) {
+                            log::warn!("[MessengerX] Failed to open shim URL {real_url}: {e}");
+                        }
+                    });
+                    return false;
                 }
 
                 // Facebook profile pages (e.g. /username or /profile.php) must
@@ -8272,8 +8265,7 @@ mod tests {
         fn recurring_telemetry_uses_conservative_intervals() {
             assert!(GIF_DEBUG_SCRIPT.contains("setInterval(checkGifState, 5000)"));
             assert!(
-                PERFORMANCE_LOGGER_SCRIPT
-                    .contains("setInterval(logPerformanceSnapshot, 30000)")
+                PERFORMANCE_LOGGER_SCRIPT.contains("setInterval(logPerformanceSnapshot, 30000)")
             );
             assert!(PERFORMANCE_LOGGER_SCRIPT.contains("}, 10000)"));
             assert!(!GIF_DEBUG_SCRIPT.contains("setInterval(checkGifState, 1000)"));
@@ -8301,7 +8293,9 @@ mod tests {
         #[test]
         fn media_observer_is_created_once_outside_its_callback() {
             assert_eq!(
-                MEDIA_LOAD_LOGGER_SCRIPT.matches("new MutationObserver").count(),
+                MEDIA_LOAD_LOGGER_SCRIPT
+                    .matches("new MutationObserver")
+                    .count(),
                 1
             );
         }
@@ -8329,6 +8323,43 @@ mod tests {
         fn rejects_profile_paths() {
             assert!(!is_facebook_in_app_path("/some.user"));
             assert!(!is_facebook_in_app_path("/profile.php"));
+        }
+    }
+
+    mod link_shim_resolution {
+        use super::super::resolve_facebook_shim_url;
+
+        fn resolve(url: &str) -> Option<String> {
+            resolve_facebook_shim_url(&url::Url::parse(url).expect("test url must parse"))
+        }
+
+        #[test]
+        fn resolves_facebook_and_messenger_shims_to_real_url() {
+            assert_eq!(
+                resolve("https://l.facebook.com/l.php?u=https%3A%2F%2Fexample.com%2Fpage"),
+                Some("https://example.com/page".to_string())
+            );
+            assert_eq!(
+                resolve("https://l.messenger.com/l.php?u=https%3A%2F%2Fexample.com"),
+                Some("https://example.com".to_string())
+            );
+        }
+
+        #[test]
+        fn ignores_non_shim_urls() {
+            assert_eq!(resolve("https://example.com/page"), None);
+            assert_eq!(resolve("https://l.facebook.com/other"), None);
+            assert_eq!(resolve("https://facebook.com/profile.php"), None);
+        }
+
+        #[test]
+        fn rejects_shims_without_or_with_non_http_targets() {
+            assert_eq!(resolve("https://l.facebook.com/l.php"), None);
+            assert_eq!(resolve("https://l.facebook.com/l.php?e=1"), None);
+            assert_eq!(
+                resolve("https://l.facebook.com/l.php?u=javascript%3Aalert(1)"),
+                None
+            );
         }
     }
 
