@@ -3096,7 +3096,7 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                 if (document.body) _fileObs.observe(document.body, { childList: true, subtree: true });
             });
         }
-        dlog('[FileTrap] file/paste/drag listeners installed');
+        dlog('[FileTrap] file/drag listeners installed (paste handled by DragDropJS)');
     } catch(_) {}
 
     // -----------------------------------------------------------------------
@@ -4037,7 +4037,10 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
     // A real class subclass (not a plain function) keeps `constructor.name`,
     // super-chained initialization, and prototype identity intact so that
     // Messenger's anti-bot heuristics cannot detect the logger override.
-    class LoggedWebSocket extends _origWebSocket {
+    // The class is bound to the identifier `WebSocket` so that both
+    // `window.WebSocket.name` and `new WebSocket().constructor.name`
+    // still report "WebSocket".
+    window.WebSocket = class WebSocket extends _origWebSocket {
         constructor(url, protocols) {
             super(url, protocols);
             var ws = this;
@@ -4089,8 +4092,7 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
                 return _origAddEventListener.apply(this, arguments);
             };
         }
-    }
-    window.WebSocket = LoggedWebSocket;
+    };
 
     wlog('WebSocket logger registered v=' + APP_VERSION);
 })();
@@ -6177,13 +6179,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // the actual URL from the `u` query param and open it in the system browser.
                 if (host == "l.facebook.com" || host == "l.messenger.com") && url.path() == "/l.php"
                 {
-                    if let Some(actual_url) = url
-                        .query_pairs()
-                        .find(|(k, _)| k == "u")
-                        .map(|(_, v)| v.into_owned())
-                    {
+                    if let Some(actual_url) = resolve_facebook_shim_url(url) {
                         log::info!(
-                            "[MessengerX] Link shim detected — opening real URL: {actual_url}"
+                            "[MessengerX] Link shim resolved — opening real URL: {actual_url}"
                         );
                         let handle = nav_app_handle.clone();
                         std::thread::spawn(move || {
@@ -6196,27 +6194,18 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         });
                         return false;
                     }
+                    // A `u` param that failed validation must not reach the
+                    // opener — if present but not an http(s) URL, block the
+                    // navigation outright.
+                    if url.query_pairs().any(|(k, _)| k == "u") {
+                        log::warn!(
+                            "[MessengerX] Link shim with unsuitable `u` param — blocking navigation: {url}"
+                        );
+                        return false;
+                    }
                     // No `u` param — this is likely a Messenger OAuth / login
                     // cookie redirect (NOT an external link shim).  Let it
                     // navigate inside the WebView so the login flow can complete.
-                }
-
-                // Link shims (l.facebook.com/l.php?u=…, l.messenger.com/l.php?u=…)
-                // resolve to the real destination and open THAT externally, so
-                // JS-triggered navigations get the same tracking-stripped URL
-                // the document-level click interceptor produces.
-                if let Some(real_url) = resolve_facebook_shim_url(url) {
-                    log::info!(
-                        "[MessengerX][Navigation] Link shim resolved — opening externally: {real_url}"
-                    );
-                    let handle = nav_app_handle.clone();
-                    std::thread::spawn(move || {
-                        use tauri_plugin_opener::OpenerExt;
-                        if let Err(e) = handle.opener().open_url(&real_url, None::<&str>) {
-                            log::warn!("[MessengerX] Failed to open shim URL {real_url}: {e}");
-                        }
-                    });
-                    return false;
                 }
 
                 // Facebook profile pages (e.g. /username or /profile.php) must
