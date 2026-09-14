@@ -4559,47 +4559,40 @@ pub fn dispatch_notification_from_bundle(
 // Application entry point
 // ---------------------------------------------------------------------------
 
-/// Phase A diagnostic — log the runtime platform environment once at startup.
-///
-/// Per-platform fields:
-///  - **Linux**: `XDG_SESSION_TYPE`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`,
-///    `DESKTOP_SESSION`, `DBUS_SESSION_BUS_ADDRESS`, presence of `notify-send`
-///    on `$PATH`. Used to validate H2 (Wayland focus gating) and the
-///    notify-send transport path.
-///  - **Windows**: OS version via `cmd /c ver` and WebView2 runtime version
-///    via the EdgeUpdate registry key. Used for H3/H4.
-///  - **macOS**: kernel version via `uname -r`.
 /// Returns `true` when the GStreamer plugins required by WebKitGTK for
-/// video/GIF playback are available on the host system.
+/// video/GIF/audio playback are available on the host system.
 ///
 /// Uses the full path to `gst-inspect-1.0` because AppImage overrides PATH
 /// and may not see the host-installed binary.
 #[cfg(target_os = "linux")]
 fn has_gstreamer_codecs() -> bool {
     // Try to locate gst-inspect-1.0 on the host system.
-    let gst_inspect = [
-        "/usr/bin/gst-inspect-1.0",
-        "/usr/local/bin/gst-inspect-1.0",
-    ]
-    .iter()
-    .find(|p| std::path::Path::new(p).exists())
-    .map(|s| s.to_string())
-    .or_else(|| {
-        // Fallback: try via `which` using the host's shell (AppImage
-        // sometimes strips PATH, so expand it explicitly).
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg("PATH=/usr/bin:/usr/local/bin:/bin:$PATH which gst-inspect-1.0 2>/dev/null")
-            .output()
-            .ok()
-            .and_then(|out| {
-                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if path.is_empty() { None } else { Some(path) }
-            })
-    });
+    let gst_inspect = ["/usr/bin/gst-inspect-1.0", "/usr/local/bin/gst-inspect-1.0"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // Fallback: try via `which` using the host's shell (AppImage
+            // sometimes strips PATH, so expand it explicitly).
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("PATH=/usr/bin:/usr/local/bin:/bin:$PATH which gst-inspect-1.0 2>/dev/null")
+                .output()
+                .ok()
+                .and_then(|out| {
+                    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(path)
+                    }
+                })
+        });
 
     let Some(gst_inspect) = gst_inspect else {
-        log::debug!("[MessengerX][Env][Linux] has_gstreamer_codecs=false (gst-inspect-1.0 not found)");
+        log::debug!(
+            "[MessengerX][Env][Linux] has_gstreamer_codecs=false (gst-inspect-1.0 not found)"
+        );
         return false;
     };
 
@@ -4623,12 +4616,29 @@ fn has_gstreamer_codecs() -> bool {
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
+            .unwrap_or(false)
+        && std::process::Command::new(&gst_inspect)
+            .arg("autoaudiosink")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
             .unwrap_or(false);
 
     log::debug!("[MessengerX][Env][Linux] has_gstreamer_codecs={ok} (using {gst_inspect})");
     ok
 }
 
+/// Phase A diagnostic — log the runtime platform environment once at startup.
+///
+/// Per-platform fields:
+///  - **Linux**: `XDG_SESSION_TYPE`, `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`,
+///    `DESKTOP_SESSION`, `DBUS_SESSION_BUS_ADDRESS`, presence of `notify-send`
+///    on `$PATH`. Used to validate H2 (Wayland focus gating) and the
+///    notify-send transport path.
+///  - **Windows**: OS version via `cmd /c ver` and WebView2 runtime version
+///    via the EdgeUpdate registry key. Used for H3/H4.
+///  - **macOS**: kernel version via `uname -r`.
 fn log_platform_environment() {
     // MESSENGERX_BUILD_VERSION is set by build.rs via `git describe --tags
     // --long --dirty` (e.g. "v1.5.7-3-gafc7ffe-dirty").  Falls back to
@@ -4640,7 +4650,11 @@ fn log_platform_environment() {
     log::info!(
         "[MessengerX][Env] arch={} profile={}",
         std::env::consts::ARCH,
-        if cfg!(debug_assertions) { "debug" } else { "release" }
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
     );
 
     #[cfg(target_os = "linux")]
@@ -4690,11 +4704,13 @@ fn log_platform_environment() {
         // in WebKitGTK.  Missing plugins produce silent failures.
         let gst_probe = std::process::Command::new("sh")
             .arg("-c")
-            .arg("gst-inspect-1.0 --version 2>/dev/null; echo '---'; \
+            .arg(
+                "gst-inspect-1.0 --version 2>/dev/null; echo '---'; \
                   gst-inspect-1.0 libav 2>/dev/null | head -n1; \
                   gst-inspect-1.0 vp8dec 2>/dev/null | head -n1; \
                   gst-inspect-1.0 vp9dec 2>/dev/null | head -n1; \
-                  gst-inspect-1.0 h264parse 2>/dev/null | head -n1")
+                  gst-inspect-1.0 h264parse 2>/dev/null | head -n1",
+            )
             .output();
         match gst_probe {
             Ok(out) => {
@@ -4705,7 +4721,9 @@ fn log_platform_environment() {
                 );
             }
             Err(e) => {
-                log::debug!("[MessengerX][Env][Linux] gstreamer_probe spawn failed (non-fatal): {e}");
+                log::debug!(
+                    "[MessengerX][Env][Linux] gstreamer_probe spawn failed (non-fatal): {e}"
+                );
             }
         }
     }
@@ -4747,6 +4765,40 @@ fn log_platform_environment() {
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
             log::info!("[MessengerX][Env][macOS] kernel={stdout:?}");
         }
+    }
+}
+
+const CRASH_COUNT_RESET_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn crash_count_before_next_attempt(
+    current_count: u32,
+    stable_for: Option<std::time::Duration>,
+) -> u32 {
+    if stable_for.is_some_and(|duration| duration >= CRASH_COUNT_RESET_AFTER) {
+        0
+    } else {
+        current_count
+    }
+}
+
+#[derive(Default)]
+struct LastUrlWriteCoordinator {
+    generation: std::sync::atomic::AtomicU64,
+    lock: std::sync::Mutex<()>,
+}
+
+impl LastUrlWriteCoordinator {
+    fn token(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn invalidate(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_current(&self, token: u64) -> bool {
+        token == self.token()
     }
 }
 
@@ -5003,10 +5055,7 @@ fn prune_old_logs(log_dir: &std::path::Path, prefix: &str, max_age_days: u64) {
         };
         let file_name = entry.file_name().to_string_lossy().into_owned();
         let age_secs = match entry.metadata().and_then(|m| m.modified()) {
-            Ok(mtime) => now
-                .duration_since(mtime)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            Ok(mtime) => now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0),
             Err(e) => {
                 log::debug!(
                     "[MessengerX][Log] Cannot read metadata for {file_name}, skipping: {e}"
@@ -5100,13 +5149,13 @@ fn open_log_on_linux(log_dir: &std::path::Path, log_file: &std::path::Path) {
         if !opened {
             let terminals: &[(&str, &[&str])] = &[
                 ("x-terminal-emulator", &["-e", "less"]),
-                ("xterm",               &["-e", "less"]),
-                ("gnome-terminal",      &["--", "less"]),
-                ("xfce4-terminal",      &["-e", "less"]),
-                ("konsole",             &["-e", "less"]),
-                ("mate-terminal",       &["-e", "less"]),
-                ("lxterminal",          &["-e", "less"]),
-                ("tilix",               &["-e", "less"]),
+                ("xterm", &["-e", "less"]),
+                ("gnome-terminal", &["--", "less"]),
+                ("xfce4-terminal", &["-e", "less"]),
+                ("konsole", &["-e", "less"]),
+                ("mate-terminal", &["-e", "less"]),
+                ("lxterminal", &["-e", "less"]),
+                ("tilix", &["-e", "less"]),
             ];
             for (term, pre) in terminals {
                 match std::process::Command::new(term)
@@ -5397,8 +5446,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     // Timestamp for the current uninterrupted stable page generation. Reset on
     // navigation/crash so an older page cannot clear newer crash attempts.
-    let crash_stable_since =
-        std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    let crash_stable_since = std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+    // Serializes persisted-thread writes. A crash advances the generation
+    // before clearing, invalidating save workers queued for the crashed page.
+    let last_url_writes = std::sync::Arc::new(LastUrlWriteCoordinator::default());
     // Set to `true` by `on_navigation` the first time a navigation to a
     // `www.messenger.com` URL is allowed through the policy callback.
     // (`on_navigation` is a policy hook that may also return `false` to
@@ -5407,8 +5458,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // title ("Messenger X") — that would cause a false-positive CrashDetect
     // when the page title briefly clears during the initial SPA navigation on
     // macOS WKWebView.
-    let messenger_com_navigated =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let messenger_com_navigated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // The document title briefly becomes `""` during certain events:
     //   • macOS WKWebView: on EVERY SPA navigation (not only after a real
     //     WebKit crash) — thread-to-thread navigation clears the title.
@@ -5424,8 +5474,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // and CrashDetect may only fire when it is `true` (all platforms).
     // Real crashes that happen AFTER the page has fully loaded still fire
     // correctly because `page_load_stable` is `true` at that point.
-    let page_load_stable =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let page_load_stable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // ------------------------------------------------------------------
     // Sender-hint cache.
     //
@@ -5632,6 +5681,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let had_good_title = had_good_title.clone();
             let crash_reload_count = crash_reload_count.clone();
             let crash_stable_since = crash_stable_since.clone();
+            let last_url_writes = last_url_writes.clone();
             let pending_sender_hint = pending_sender_hint.clone();
             let post_crash_proxy_block = post_crash_proxy_block.clone();
             let messenger_com_navigated = messenger_com_navigated.clone();
@@ -5892,23 +5942,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     && had_good_title.load(std::sync::atomic::Ordering::Relaxed)
                     && page_load_stable.load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    const CRASH_COUNT_RESET_AFTER: std::time::Duration =
-                        std::time::Duration::from_secs(30);
-                    let stable_long_enough = crash_stable_since
+                    let stable_for = crash_stable_since
                         .lock()
                         .ok()
                         .and_then(|stable_since| *stable_since)
-                        .is_some_and(|stable_since| {
-                            stable_since.elapsed() >= CRASH_COUNT_RESET_AFTER
-                        });
-                    if stable_long_enough {
-                        let old = crash_reload_count.swap(0, std::sync::atomic::Ordering::Relaxed);
-                        if old > 0 {
-                            log::info!(
-                                "[MessengerX][CrashDetect] crash_reload_count reset after \
-                                 30s uninterrupted stability (was {old})"
-                            );
-                        }
+                        .map(|stable_since| stable_since.elapsed());
+                    let old = crash_reload_count.load(std::sync::atomic::Ordering::Relaxed);
+                    let retained_count = crash_count_before_next_attempt(old, stable_for);
+                    if retained_count != old {
+                        crash_reload_count.store(retained_count, std::sync::atomic::Ordering::Relaxed);
+                        log::info!(
+                            "[MessengerX][CrashDetect] crash_reload_count reset after \
+                             30s uninterrupted stability (was {old})"
+                        );
                     }
                     if let Ok(mut stable_since) = crash_stable_since.lock() {
                         *stable_since = None;
@@ -5930,8 +5976,16 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         post_crash_proxy_block.store(true, std::sync::atomic::Ordering::Relaxed);
                         // Clear the persisted last URL so Messenger does not
                         // auto-redirect back to the problematic thread after reload.
+                        last_url_writes.invalidate();
                         let app_handle_for_clear = crash_app_handle.clone();
+                        let last_url_writes_for_clear = last_url_writes.clone();
                         std::thread::spawn(move || {
+                            let Ok(_guard) = last_url_writes_for_clear.lock.lock() else {
+                                log::warn!(
+                                    "[MessengerX][CrashDetect] Last-URL write lock poisoned"
+                                );
+                                return;
+                            };
                             commands::clear_last_messenger_url(app_handle_for_clear);
                         });
                         let wv = webview_window.clone();
@@ -6059,6 +6113,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let messenger_com_navigated_nav = messenger_com_navigated.clone();
             let page_load_stable_nav = page_load_stable.clone();
             let crash_stable_since_nav = crash_stable_since.clone();
+            let last_url_writes_nav = last_url_writes.clone();
             move |url| {
                 let scheme = url.scheme();
                 // Pass through non-HTTP schemes (blob:, data:, about:, tauri:, etc.).
@@ -6224,7 +6279,19 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     if !url.path().starts_with("/e2ee/") {
                         let handle = nav_app_handle.clone();
                         let url_str = url.to_string();
+                        let write_token = last_url_writes_nav.token();
+                        let last_url_writes = last_url_writes_nav.clone();
                         std::thread::spawn(move || {
+                            let Ok(_guard) = last_url_writes.lock.lock() else {
+                                log::warn!("[MessengerX][Boot] Last-URL write lock poisoned");
+                                return;
+                            };
+                            if !last_url_writes.is_current(write_token) {
+                                log::debug!(
+                                    "[MessengerX][Boot] skipped stale last-URL write: {url_str}"
+                                );
+                                return;
+                            }
                             let mut s = services::auth::load_settings(&handle).unwrap_or_default();
                             if s.last_messenger_url.as_deref() == Some(url_str.as_str()) {
                                 return;
@@ -7562,15 +7629,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(debug_assertions)]
         {
-            app_submenu_builder = app_submenu_builder
-                .separator()
-                .item(&inspect_item);
+            app_submenu_builder = app_submenu_builder.separator().item(&inspect_item);
         }
 
-        let app_submenu = app_submenu_builder
-            .separator()
-            .quit()
-            .build()?;
+        let app_submenu = app_submenu_builder.separator().quit().build()?;
 
         let edit_submenu = SubmenuBuilder::new(app, "Edit")
             .undo()
@@ -8089,6 +8151,54 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    mod crash_counter_reset {
+        use super::super::{crash_count_before_next_attempt, CRASH_COUNT_RESET_AFTER};
+
+        #[test]
+        fn keeps_count_without_a_stable_page() {
+            assert_eq!(crash_count_before_next_attempt(2, None), 2);
+        }
+
+        #[test]
+        fn keeps_count_before_stability_window_elapses() {
+            assert_eq!(
+                crash_count_before_next_attempt(
+                    2,
+                    Some(CRASH_COUNT_RESET_AFTER - std::time::Duration::from_secs(1))
+                ),
+                2
+            );
+        }
+
+        #[test]
+        fn resets_count_after_uninterrupted_stability() {
+            assert_eq!(
+                crash_count_before_next_attempt(2, Some(CRASH_COUNT_RESET_AFTER)),
+                0
+            );
+        }
+    }
+
+    mod last_url_write_coordinator {
+        use super::super::LastUrlWriteCoordinator;
+
+        #[test]
+        fn accepts_current_write_token() {
+            let coordinator = LastUrlWriteCoordinator::default();
+            assert!(coordinator.is_current(coordinator.token()));
+        }
+
+        #[test]
+        fn rejects_token_captured_before_crash_invalidation() {
+            let coordinator = LastUrlWriteCoordinator::default();
+            let stale_token = coordinator.token();
+
+            coordinator.invalidate();
+
+            assert!(!coordinator.is_current(stale_token));
+        }
+    }
+
     mod console_error_logger {
         use super::super::{CONSOLE_ERROR_LOGGER_SCRIPT, DIAGNOSTIC_TELEMETRY_SCRIPT};
 
@@ -8122,7 +8232,9 @@ mod tests {
         fn format_preserves_local_offset_clock_time() {
             // Same instant, two zones — the formatted wall-clock must differ,
             // proving we render the supplied local time rather than UTC.
-            let utc = chrono::Utc.with_ymd_and_hms(2026, 5, 31, 6, 43, 12).unwrap();
+            let utc = chrono::Utc
+                .with_ymd_and_hms(2026, 5, 31, 6, 43, 12)
+                .unwrap();
             let cest = utc.with_timezone(&FixedOffset::east_opt(2 * 3600).unwrap());
             let line = format_log_line(&cest, "t", log::Level::Warn, &"m");
             assert_eq!(line, "[2026-05-31][08:43:12][t][WARN] m");
@@ -8534,8 +8646,9 @@ mod tests {
         #[test]
         fn reset_only_clears_latch_when_title_is_zero() {
             assert!(
-                UNREAD_OBSERVER_SCRIPT
-                    .contains("if (getUnreadCountFromTitle() <= 0) {\n            clearReconcileLatch();"),
+                UNREAD_OBSERVER_SCRIPT.contains(
+                    "if (getUnreadCountFromTitle() <= 0) {\n            clearReconcileLatch();"
+                ),
                 "resetActivityState must guard clearReconcileLatch behind a title<=0 check"
             );
         }
@@ -8566,7 +8679,8 @@ mod tests {
                 "MultiSender diagnostic must only fire when domUnread changes"
             );
             assert!(
-                !UNREAD_OBSERVER_SCRIPT.contains("if (domUnread > titleCount) {\n            clearReconcileLatch();"),
+                !UNREAD_OBSERVER_SCRIPT
+                    .contains("if (domUnread > titleCount) {\n            clearReconcileLatch();"),
                 "MultiSender branch must not reset the throttle before checking it"
             );
             assert!(
@@ -8574,7 +8688,9 @@ mod tests {
                 "latch-only reset helper must keep throttle-safe reset logic in one place"
             );
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("clearLatchOnly();\n            if (domUnread !== _lastMultiSenderDom)"),
+                UNREAD_OBSERVER_SCRIPT.contains(
+                    "clearLatchOnly();\n            if (domUnread !== _lastMultiSenderDom)"
+                ),
                 "MultiSender branch must clear only the latch before throttle check"
             );
         }
@@ -8622,7 +8738,8 @@ mod tests {
                 "getAllThreadLinks must use a multi-family selector array for resilience"
             );
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("searchRoot.querySelectorAll(selectorFamilies[si])"),
+                UNREAD_OBSERVER_SCRIPT
+                    .contains("searchRoot.querySelectorAll(selectorFamilies[si])"),
                 "thread-link selectors must be issued against searchRoot"
             );
             // Navigation tabs must be filtered out by content heuristics, not
@@ -8632,18 +8749,20 @@ mod tests {
                 "getAllThreadLinks must filter navigation tabs via isNavigationTab"
             );
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("'chats'") && UNREAD_OBSERVER_SCRIPT.contains("'chaty'"),
+                UNREAD_OBSERVER_SCRIPT.contains("'chats'")
+                    && UNREAD_OBSERVER_SCRIPT.contains("'chaty'"),
                 "navigation-tab filter must cover common Messenger locales"
             );
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("'marketplace'") && UNREAD_OBSERVER_SCRIPT.contains("'žádosti'"),
+                UNREAD_OBSERVER_SCRIPT.contains("'marketplace'")
+                    && UNREAD_OBSERVER_SCRIPT.contains("'žádosti'"),
                 "navigation-tab filter must cover Czech locale tab names"
             );
             // De-duplicate by href for anchors, by text for everything else.
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("var key = isThreadAnchor") &&
-                UNREAD_OBSERVER_SCRIPT.contains("'href:' + href") &&
-                UNREAD_OBSERVER_SCRIPT.contains("|| ('idx:' + si + ':' + ni)"),
+                UNREAD_OBSERVER_SCRIPT.contains("var key = isThreadAnchor")
+                    && UNREAD_OBSERVER_SCRIPT.contains("'href:' + href")
+                    && UNREAD_OBSERVER_SCRIPT.contains("|| ('idx:' + si + ':' + ni)"),
                 "thread links must de-duplicate by href when anchor, by text otherwise"
             );
             assert!(
@@ -8659,7 +8778,8 @@ mod tests {
                 "sender name extraction must update the last-known cache"
             );
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("var isThreadAnchor = (tag === 'a') && (role === 'link')"),
+                UNREAD_OBSERVER_SCRIPT
+                    .contains("var isThreadAnchor = (tag === 'a') && (role === 'link')"),
                 "<a> tags with role=link must be accepted as conversation anchors"
             );
             assert!(
@@ -8704,7 +8824,9 @@ mod tests {
         #[test]
         fn thread_mutation_path_uses_effective_count() {
             assert!(
-                UNREAD_OBSERVER_SCRIPT.contains("var currentCount = effectiveUnreadCount();\n            jlog('[ThreadMut]"),
+                UNREAD_OBSERVER_SCRIPT.contains(
+                    "var currentCount = effectiveUnreadCount();\n            jlog('[ThreadMut]"
+                ),
                 "thread mutation batching must use effectiveUnreadCount before tryBumpThreadMutSeq"
             );
         }
@@ -8840,5 +8962,4 @@ mod tests {
             );
         }
     }
-
 }

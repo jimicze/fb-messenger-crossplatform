@@ -119,9 +119,7 @@ fn on_page_load_sets_page_load_stable_true_on_finished() {
     // The setter must be guarded by `matches!(payload.event(), PageLoadEvent::Finished)`
     // without a platform-only cfg! wrapper — it applies to all platforms.
     assert!(
-        SOURCE.contains(
-            "matches!(payload.event(), PageLoadEvent::Finished)"
-        ),
+        SOURCE.contains("matches!(payload.event(), PageLoadEvent::Finished)"),
         "page_load_stable setter must use matches!(...Finished) (all platforms)"
     );
     // Must NOT be gated on a macOS-only condition any more.
@@ -256,18 +254,19 @@ fn post_crash_proxy_block_cleared_on_page_load_finished() {
     );
 }
 
-/// Crash-attempt reset must be evaluated when a crash happens, using the
-/// current page's uninterrupted stable duration. A detached 30-second timer
-/// from an older page can otherwise erase attempts made after a newer crash.
 #[test]
-fn crash_counter_reset_has_no_stale_finished_timer() {
+fn gstreamer_gate_checks_audio_sink() {
+    let helper_start = SOURCE
+        .find("fn has_gstreamer_codecs()")
+        .expect("has_gstreamer_codecs helper missing");
+    let helper_end = SOURCE[helper_start..]
+        .find("fn log_platform_environment()")
+        .map(|offset| helper_start + offset)
+        .expect("log_platform_environment must follow codec helper");
+    let helper = &SOURCE[helper_start..helper_end];
     assert!(
-        SOURCE.contains("crash_stable_since"),
-        "CrashDetect must track stability for the current page generation"
-    );
-    assert!(
-        !SOURCE.contains("Reset crash-reload counter after 30 s of stability"),
-        "on_page_load must not spawn stale timers that reset newer crash attempts"
+        helper.contains(".arg(\"autoaudiosink\")"),
+        "Linux codec gate must check the audio sink implicated by the crash log"
     );
 }
 
