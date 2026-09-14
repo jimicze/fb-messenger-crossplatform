@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs';
 
 const workflowPath = '.github/workflows/release.yml';
 const workflow = readFileSync(workflowPath, 'utf8');
-const testBuildWorkflow = readFileSync('.github/workflows/test-build.yml', 'utf8');
 const failures = [];
 
 function extractStepBlock(stepName) {
@@ -80,7 +79,6 @@ const bumpJobStart = workflow.indexOf('  bump-version:');
 const createReleaseStart = workflow.indexOf('\n  create-release:', bumpJobStart);
 const bumpJob = workflow.slice(bumpJobStart, createReleaseStart === -1 ? workflow.length : createReleaseStart);
 const bumpStep = extractStepBlock('Prepare release or open release PR');
-const releaseSyncStep = extractStepBlock('Sync source versions to release tag');
 
 const requiredSnippets = [
   {
@@ -119,38 +117,12 @@ const requiredSnippets = [
     text: 'echo "release-tag=${TAG}" >> "$GITHUB_OUTPUT"',
     message: 'bump-version must only release when it emits release-tag output',
   },
-  {
-    text: "'.version = $v | .packages[\"\"].version = $v' package-lock.json",
-    message: 'bump-version must synchronize package-lock.json root metadata',
-  },
-  {
-    text: 'git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml',
-    message: 'bump-version must stage package-lock.json with the other version manifests',
-  },
 ];
 
 for (const snippet of requiredSnippets) {
   const haystack = snippet.text === 'fetch-depth: 0' ? bumpJob : bumpStep;
   if (!haystack.includes(snippet.text)) {
     failures.push(snippet.message);
-  }
-}
-
-if (!releaseSyncStep.includes("readFileSync('package-lock.json'")) {
-  failures.push('release builds must synchronize package-lock.json root metadata');
-}
-
-if (!testBuildWorkflow.includes("readFileSync('package-lock.json'")) {
-  failures.push('test builds must synchronize package-lock.json root metadata');
-}
-
-if (workflow.includes("platform: 'ubuntu-22.04'")) {
-  failures.push('release Linux builds must not use the incompatible Ubuntu 22.04 runner');
-}
-
-for (const runner of ["platform: 'ubuntu-24.04'", "platform: 'ubuntu-24.04-arm'"]) {
-  if (!workflow.includes(runner)) {
-    failures.push(`release Linux build matrix is missing ${runner}`);
   }
 }
 

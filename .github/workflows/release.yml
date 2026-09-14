@@ -157,9 +157,6 @@ jobs:
           jq --arg v "$NEW" '.version = $v' package.json \
             > /tmp/package.json && mv /tmp/package.json package.json
 
-          jq --arg v "$NEW" '.version = $v | .packages[""].version = $v' package-lock.json \
-            > /tmp/package-lock.json && mv /tmp/package-lock.json package-lock.json
-
           jq --arg v "$NEW" '.version = $v' src-tauri/tauri.conf.json \
             > /tmp/tauri.conf.json && mv /tmp/tauri.conf.json src-tauri/tauri.conf.json
 
@@ -179,7 +176,7 @@ jobs:
 
           git switch -c "${BRANCH}"
 
-          git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
           git commit -m "chore: bump version to ${TAG}"
 
           git push origin "${BRANCH}"
@@ -366,13 +363,13 @@ jobs:
             label: 'Windows-arm64'
 
           # ── Linux x64 ─────────────────────────────────────────────────────
-          - platform: 'ubuntu-24.04'
+          - platform: 'ubuntu-22.04'
             args: ''
             rust-targets: ''
             label: 'Linux-x64'
 
           # ── Linux arm64 ───────────────────────────────────────────────────
-          - platform: 'ubuntu-24.04-arm'
+          - platform: 'ubuntu-22.04-arm'
             args: ''
             rust-targets: ''
             label: 'Linux-arm64'
@@ -431,12 +428,6 @@ jobs:
             const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
             pkg.version = v;
             fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-
-            // package-lock.json root metadata
-            const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
-            lock.version = v;
-            lock.packages[''].version = v;
-            fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2) + '\n');
 
             // tauri.conf.json
             const tc = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
