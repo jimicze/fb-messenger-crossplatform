@@ -4794,6 +4794,16 @@ fn crash_count_before_next_attempt(
     }
 }
 
+fn is_facebook_in_app_path(path: &str) -> bool {
+    path.starts_with("/groupcall/")
+        || path.starts_with("/login")
+        || path.starts_with("/oauth")
+        || path.starts_with("/dialog/")
+        || path.starts_with("/connect/")
+        || path == "/two_step_verification"
+        || path.starts_with("/two_step_verification/")
+}
+
 #[derive(Default)]
 struct LastUrlWriteCoordinator {
     generation: std::sync::atomic::AtomicU64,
@@ -6217,17 +6227,12 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Facebook profile pages (e.g. /username or /profile.php) must
-                // open in the system browser, not inside the WebView.  The only
-                // facebook.com URLs that should stay in-app are e2ee group calls
-                // (/groupcall/...) and login/oauth flows.
+                // open in the system browser, not inside the WebView. Paths that
+                // stay in-app are defined by `is_facebook_in_app_path` (including
+                // group calls, login/oauth flows, and two-step verification).
                 if host == "facebook.com" || host.ends_with(".facebook.com") {
                     let path = url.path();
-                    let is_call = path.starts_with("/groupcall/");
-                    let is_login = path.starts_with("/login")
-                        || path.starts_with("/oauth")
-                        || path.starts_with("/dialog/")
-                        || path.starts_with("/connect/");
-                    if !is_call && !is_login {
+                    if !is_facebook_in_app_path(path) {
                         let url_str = url.to_string();
                         log::info!(
                             "[MessengerX][Navigation] Blocking Facebook profile page — opening externally: {url_str}"
@@ -8299,6 +8304,31 @@ mod tests {
                 MEDIA_LOAD_LOGGER_SCRIPT.matches("new MutationObserver").count(),
                 1
             );
+        }
+    }
+
+    mod facebook_navigation {
+        use super::super::is_facebook_in_app_path;
+
+        #[test]
+        fn keeps_two_step_authentication_in_app() {
+            assert!(is_facebook_in_app_path(
+                "/two_step_verification/authentication/"
+            ));
+            assert!(is_facebook_in_app_path("/two_step_verification"));
+        }
+
+        #[test]
+        fn keeps_existing_login_and_call_paths_in_app() {
+            assert!(is_facebook_in_app_path("/login/password/"));
+            assert!(is_facebook_in_app_path("/oauth/authorize/"));
+            assert!(is_facebook_in_app_path("/groupcall/ROOM"));
+        }
+
+        #[test]
+        fn rejects_profile_paths() {
+            assert!(!is_facebook_in_app_path("/some.user"));
+            assert!(!is_facebook_in_app_path("/profile.php"));
         }
     }
 
