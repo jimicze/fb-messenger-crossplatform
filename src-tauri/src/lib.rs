@@ -63,7 +63,8 @@ pub(crate) const NOTIFICATION_OVERRIDE_SCRIPT: &str = concat!(
 
     function jlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[NotificationJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[NotificationJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -489,7 +490,8 @@ const UNREAD_OBSERVER_SCRIPT: &str = r#"
 
     function jlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[UnreadJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[UnreadJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -2305,7 +2307,7 @@ pub(crate) const CALL_COMPAT_SCRIPT: &str = r#"(function() {
     // Retries once after 2 s in case Tauri IPC is not yet ready at document-start.
     function diag(msg) {
         function send() {
-            try { window.__TAURI__.core.invoke('js_log', { message: '[CallCompat] ' + msg }); } catch(_) {}
+            try { window.__TAURI__.core.invoke('js_log', { message: '[CallCompat] ' + msg }).catch(function() {}); } catch(_) {}
         }
         send();
         setTimeout(send, 2000);
@@ -2607,7 +2609,7 @@ pub(crate) const CALL_BUTTON_UNLOCK_SCRIPT: &str = r#"(function() {
         try {
             window.__TAURI__.core.invoke('js_log', {
                 message: '[CallUnlock] unlocked: ' + (el.getAttribute('aria-label') || el.tagName)
-            });
+            }).catch(function() {});
         } catch(_) {}
     }
 
@@ -2668,7 +2670,7 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
     ];
 
     function jlog(msg) {
-        try { window.__TAURI__.core.invoke('js_log', { message: msg }); } catch(_) {}
+        try { window.__TAURI__.core.invoke('js_log', { message: msg }).catch(function() {}); } catch(_) {}
     }
 
     function isAllowedUrl(url) {
@@ -2921,7 +2923,8 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     r#"";
     function dlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[DiagJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[DiagJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -3422,7 +3425,8 @@ const AUDIO_HOOK_SCRIPT: &str = concat!(
 
     function alog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[AudioJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[AudioJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -3476,7 +3480,8 @@ const MEDIA_ERROR_LOGGER_SCRIPT: &str = concat!(
 
     function mlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[MediaErrorJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[MediaErrorJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -3581,7 +3586,8 @@ const MEDIA_LOAD_LOGGER_SCRIPT: &str = concat!(
 
     function mlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[MediaLoadJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[MediaLoadJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -3669,7 +3675,8 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
 
     function dlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[DragDropJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[DragDropJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -3813,7 +3820,8 @@ const GIF_DEBUG_SCRIPT: &str = concat!(
 
     function glog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[GifDebugJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[GifDebugJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -3906,7 +3914,8 @@ const CONSOLE_ERROR_LOGGER_SCRIPT: &str = concat!(
 
     function clog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[ConsoleJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[ConsoleJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -3968,7 +3977,8 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
 
     function nlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[NetworkJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[NetworkJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -4069,7 +4079,8 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
 
     function wlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[WebSocketJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[WebSocketJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -4145,7 +4156,8 @@ const PERFORMANCE_LOGGER_SCRIPT: &str = concat!(
 
     function plog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[PerfJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[PerfJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -4333,7 +4345,8 @@ const VISIBILITY_OVERRIDE_SCRIPT: &str = r#"(function() {
 
     function jlog(msg) {
         try {
-            window.__TAURI__.core.invoke('js_log', { message: '[VisibilityJS] ' + msg });
+            window.__TAURI__.core.invoke('js_log', { message: '[VisibilityJS] ' + msg })
+                .catch(function() {});
         } catch(_) {}
     }
 
@@ -8151,6 +8164,144 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    mod diagnostic_telemetry {
+        use super::super::DIAGNOSTIC_TELEMETRY_SCRIPT;
+
+        #[test]
+        fn dlog_consumes_async_invoke_rejections() {
+            let dlog_start = DIAGNOSTIC_TELEMETRY_SCRIPT
+                .find("function dlog(msg)")
+                .expect("dlog helper missing");
+            let dlog_end = DIAGNOSTIC_TELEMETRY_SCRIPT[dlog_start..]
+                .find("var _ipcAvailable")
+                .map(|offset| dlog_start + offset)
+                .expect("IPC probe must follow dlog helper");
+            let dlog = &DIAGNOSTIC_TELEMETRY_SCRIPT[dlog_start..dlog_end];
+
+            assert!(
+                dlog.contains(".catch(function() {})"),
+                "dlog must consume rejected js_log invokes to prevent an unhandledrejection loop"
+            );
+        }
+    }
+
+    mod telemetry_performance_audit {
+        use super::super::{
+            AUDIO_HOOK_SCRIPT, CALL_BUTTON_UNLOCK_SCRIPT, CALL_COMPAT_SCRIPT,
+            CONSOLE_ERROR_LOGGER_SCRIPT, DIAGNOSTIC_TELEMETRY_SCRIPT, DRAG_DROP_LOGGER_SCRIPT,
+            GIF_DEBUG_SCRIPT, MEDIA_ERROR_LOGGER_SCRIPT, MEDIA_LOAD_LOGGER_SCRIPT,
+            NETWORK_LOGGER_SCRIPT, NOTIFICATION_OVERRIDE_SCRIPT, PERFORMANCE_LOGGER_SCRIPT,
+            UNREAD_OBSERVER_SCRIPT, WEBSOCKET_LOGGER_SCRIPT, WINDOW_OPEN_OVERRIDE_SCRIPT,
+        };
+
+        // Linux-only script; gated import to keep macOS/Windows test builds warning-free.
+        #[cfg(target_os = "linux")]
+        use super::super::VISIBILITY_OVERRIDE_SCRIPT;
+
+        fn assert_js_log_rejections_consumed(name: &str, script: &str) {
+            let needle = "core.invoke('js_log'";
+            let matches: Vec<usize> = script
+                .match_indices(needle)
+                .map(|(offset, _)| offset)
+                .collect();
+            assert!(
+                !matches.is_empty(),
+                "{name} contains no js_log invokes — audit needle stale?"
+            );
+            for offset in matches {
+                let statement_end = script[offset..]
+                    .find(';')
+                    .map(|end| offset + end + 1)
+                    .expect("js_log statement must end with a semicolon");
+                let statement = &script[offset..statement_end];
+                assert!(
+                    statement.contains(".catch(function() {})"),
+                    "{name} has a fire-and-forget js_log invoke without rejection handling: {statement}"
+                );
+            }
+        }
+
+        #[test]
+        fn all_js_log_invocations_consume_rejections() {
+            let scripts = [
+                ("notification", NOTIFICATION_OVERRIDE_SCRIPT),
+                ("unread", UNREAD_OBSERVER_SCRIPT),
+                ("call-compat", CALL_COMPAT_SCRIPT),
+                ("call-unlock", CALL_BUTTON_UNLOCK_SCRIPT),
+                ("window-open", WINDOW_OPEN_OVERRIDE_SCRIPT),
+                ("diagnostic", DIAGNOSTIC_TELEMETRY_SCRIPT),
+                ("audio", AUDIO_HOOK_SCRIPT),
+                ("media-error", MEDIA_ERROR_LOGGER_SCRIPT),
+                ("media-load", MEDIA_LOAD_LOGGER_SCRIPT),
+                ("drag-drop", DRAG_DROP_LOGGER_SCRIPT),
+                ("gif", GIF_DEBUG_SCRIPT),
+                ("console", CONSOLE_ERROR_LOGGER_SCRIPT),
+                ("network", NETWORK_LOGGER_SCRIPT),
+                ("websocket", WEBSOCKET_LOGGER_SCRIPT),
+                ("performance", PERFORMANCE_LOGGER_SCRIPT),
+                #[cfg(target_os = "linux")]
+                ("visibility", VISIBILITY_OVERRIDE_SCRIPT),
+            ];
+            for (name, script) in scripts {
+                assert_js_log_rejections_consumed(name, script);
+            }
+        }
+
+        // Linux-only script; audit the shared visibility override in place so
+        // the rejection-handling invariant is verified on every platform's test run.
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn visibility_script_js_log_invocations_consume_rejections() {
+            const SOURCE: &str = include_str!("lib.rs");
+            let start = SOURCE
+                .find("const VISIBILITY_OVERRIDE_SCRIPT: &str")
+                .expect("visibility override script must exist in lib.rs");
+            let end = SOURCE[start..]
+                .find("\nconst ")
+                .map(|offset| start + offset)
+                .unwrap_or(SOURCE.len());
+            assert_js_log_rejections_consumed("visibility", &SOURCE[start..end]);
+        }
+
+        #[test]
+        fn recurring_telemetry_uses_conservative_intervals() {
+            assert!(GIF_DEBUG_SCRIPT.contains("setInterval(checkGifState, 5000)"));
+            assert!(
+                PERFORMANCE_LOGGER_SCRIPT
+                    .contains("setInterval(logPerformanceSnapshot, 30000)")
+            );
+            assert!(PERFORMANCE_LOGGER_SCRIPT.contains("}, 10000)"));
+            assert!(!GIF_DEBUG_SCRIPT.contains("setInterval(checkGifState, 1000)"));
+            assert!(!PERFORMANCE_LOGGER_SCRIPT.contains("}, 1000)"));
+        }
+
+        #[test]
+        fn whole_document_scan_is_limited_to_performance_snapshot() {
+            let telemetry_scripts = [
+                MEDIA_LOAD_LOGGER_SCRIPT,
+                DRAG_DROP_LOGGER_SCRIPT,
+                GIF_DEBUG_SCRIPT,
+                CONSOLE_ERROR_LOGGER_SCRIPT,
+                NETWORK_LOGGER_SCRIPT,
+                WEBSOCKET_LOGGER_SCRIPT,
+                PERFORMANCE_LOGGER_SCRIPT,
+            ];
+            let whole_document_scans = telemetry_scripts
+                .iter()
+                .map(|script| script.matches("document.querySelectorAll('*')").count())
+                .sum::<usize>();
+            assert_eq!(whole_document_scans, 1);
+        }
+
+        #[test]
+        fn media_observer_is_created_once_outside_its_callback() {
+            assert_eq!(
+                MEDIA_LOAD_LOGGER_SCRIPT.matches("new MutationObserver").count(),
+                1
+            );
+        }
+    }
+
     mod crash_counter_reset {
         use super::super::{crash_count_before_next_attempt, CRASH_COUNT_RESET_AFTER};
 
