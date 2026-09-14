@@ -119,9 +119,7 @@ fn on_page_load_sets_page_load_stable_true_on_finished() {
     // The setter must be guarded by `matches!(payload.event(), PageLoadEvent::Finished)`
     // without a platform-only cfg! wrapper — it applies to all platforms.
     assert!(
-        SOURCE.contains(
-            "matches!(payload.event(), PageLoadEvent::Finished)"
-        ),
+        SOURCE.contains("matches!(payload.event(), PageLoadEvent::Finished)"),
         "page_load_stable setter must use matches!(...Finished) (all platforms)"
     );
     // Must NOT be gated on a macOS-only condition any more.
@@ -253,6 +251,22 @@ fn post_crash_proxy_block_cleared_on_page_load_finished() {
     assert!(
         preceding.contains("Finished"),
         "post_crash_proxy_block clear must be inside the on_page_load::Finished branch"
+    );
+}
+
+#[test]
+fn gstreamer_gate_checks_audio_sink() {
+    let helper_start = SOURCE
+        .find("fn has_gstreamer_codecs()")
+        .expect("has_gstreamer_codecs helper missing");
+    let helper_end = SOURCE[helper_start..]
+        .find("fn log_platform_environment()")
+        .map(|offset| helper_start + offset)
+        .expect("log_platform_environment must follow codec helper");
+    let helper = &SOURCE[helper_start..helper_end];
+    assert!(
+        helper.contains(".arg(\"autoaudiosink\")"),
+        "Linux codec gate must check the audio sink implicated by the crash log"
     );
 }
 
