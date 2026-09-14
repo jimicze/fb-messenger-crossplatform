@@ -6214,9 +6214,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Facebook profile pages (e.g. /username or /profile.php) must
-                // open in the system browser, not inside the WebView.  The only
-                // facebook.com URLs that should stay in-app are e2ee group calls
-                // (/groupcall/...) and login/oauth flows.
+                // open in the system browser, not inside the WebView. Paths that
+                // stay in-app are defined by `is_facebook_in_app_path` (including
+                // group calls, login/oauth flows, and two-step verification).
                 if host == "facebook.com" || host.ends_with(".facebook.com") {
                     let path = url.path();
                     if !is_facebook_in_app_path(path) {
