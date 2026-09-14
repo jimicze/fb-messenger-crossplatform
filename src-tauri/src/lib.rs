@@ -2696,7 +2696,17 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
             var parsed = new URL(urlStr);
             if ((parsed.hostname === 'l.facebook.com' || parsed.hostname === 'l.messenger.com')
                     && parsed.pathname === '/l.php') {
-                return parsed.searchParams.get('u') || null;
+                var target = parsed.searchParams.get('u');
+                // Same scheme validation as resolve_facebook_shim_url in Rust:
+                // the shim must resolve to an absolute http(s) URL before it
+                // reaches the opener path; anything else is not a usable
+                // external link (returning null lets the caller fall through
+                // and the on_navigation policy blocks/decides).
+                if (target && (target.indexOf('https://') === 0 || target.indexOf('http://') === 0)) {
+                    return target;
+                }
+                jlog('Link shim `u` param is not an http(s) URL — ignoring shim: ' + (target || '').slice(0, 200));
+                return null;
             }
         } catch(e) {}
         return null;
@@ -8348,6 +8358,30 @@ mod tests {
             assert_eq!(
                 resolve("https://l.facebook.com/l.php?u=javascript%3Aalert(1)"),
                 None
+            );
+        }
+    }
+
+    mod window_open_shim_guard {
+        use super::super::WINDOW_OPEN_OVERRIDE_SCRIPT;
+
+        #[test]
+        fn js_shim_resolver_validates_http_s_scheme() {
+            let start = WINDOW_OPEN_OVERRIDE_SCRIPT
+                .find("function extractLinkShimUrl(urlStr)")
+                .expect("extractLinkShimUrl helper missing");
+            let end = WINDOW_OPEN_OVERRIDE_SCRIPT[start..]
+                .find("function openExternal(")
+                .map(|offset| start + offset)
+                .expect("openExternal must follow the shim resolver");
+            let helper = &WINDOW_OPEN_OVERRIDE_SCRIPT[start..end];
+            assert!(
+                helper.contains("indexOf('https://') === 0"),
+                "window.open shim resolver must require an https:// target"
+            );
+            assert!(
+                helper.contains("indexOf('http://') === 0"),
+                "window.open shim resolver must require an http:// target"
             );
         }
     }
