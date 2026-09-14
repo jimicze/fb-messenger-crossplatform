@@ -256,6 +256,21 @@ fn post_crash_proxy_block_cleared_on_page_load_finished() {
     );
 }
 
+/// Crash-attempt reset must be evaluated when a crash happens, using the
+/// current page's uninterrupted stable duration. A detached 30-second timer
+/// from an older page can otherwise erase attempts made after a newer crash.
+#[test]
+fn crash_counter_reset_has_no_stale_finished_timer() {
+    assert!(
+        SOURCE.contains("crash_stable_since"),
+        "CrashDetect must track stability for the current page generation"
+    );
+    assert!(
+        !SOURCE.contains("Reset crash-reload counter after 30 s of stability"),
+        "on_page_load must not spawn stale timers that reset newer crash attempts"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Startup notification baseline — pre-existing unread must not re-notify
 // ---------------------------------------------------------------------------

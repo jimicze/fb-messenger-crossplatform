@@ -3894,9 +3894,9 @@ const GIF_DEBUG_SCRIPT: &str = concat!(
 "#
 );
 
-/// Console error logger — captures window.onerror, unhandledrejection, and
-/// console.error calls. Many Messenger JS errors don't surface as media errors
-/// but still break attachment rendering or cause silent failures.
+/// Console error logger — captures window.onerror and console.error calls.
+/// Promise rejections remain covered by `DIAGNOSTIC_TELEMETRY_SCRIPT`; adding a
+/// second handler that inspects rejection stacks crashes WKWebView on E2EE pages.
 const CONSOLE_ERROR_LOGGER_SCRIPT: &str = concat!(
     r#"
 (function() {
@@ -3933,21 +3933,6 @@ const CONSOLE_ERROR_LOGGER_SCRIPT: &str = concat!(
         if (typeof _origOnError === 'function') return _origOnError.apply(this, arguments);
         return false;
     };
-
-    // unhandledrejection — catches Promise rejections
-    window.addEventListener('unhandledrejection', function(e) {
-        try {
-            var reason = e.reason;
-            var msg = '';
-            try {
-                msg = reason instanceof Error ? reason.message : String(reason);
-            } catch(_) { msg = String(reason); }
-            var stack = '';
-            try { stack = reason && reason.stack ? reason.stack.split('\n').slice(0,3).join(' || ') : ''; } catch(_) {}
-            clog('unhandledrejection reason=' + JSON.stringify(msg.slice(0,300)) +
-                 (stack ? ' stack=' + JSON.stringify(stack.slice(0,300)) : ''));
-        } catch(_) {}
-    });
 
     // Intercept console.error — Messenger logs many internal errors here
     var _origConsoleError = console.error;
@@ -5410,6 +5395,10 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     let had_good_title = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let crash_reload_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Timestamp for the current uninterrupted stable page generation. Reset on
+    // navigation/crash so an older page cannot clear newer crash attempts.
+    let crash_stable_since =
+        std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     // Set to `true` by `on_navigation` the first time a navigation to a
     // `www.messenger.com` URL is allowed through the policy callback.
     // (`on_navigation` is a policy hook that may also return `false` to
@@ -5642,6 +5631,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .on_document_title_changed({
             let had_good_title = had_good_title.clone();
             let crash_reload_count = crash_reload_count.clone();
+            let crash_stable_since = crash_stable_since.clone();
             let pending_sender_hint = pending_sender_hint.clone();
             let post_crash_proxy_block = post_crash_proxy_block.clone();
             let messenger_com_navigated = messenger_com_navigated.clone();
@@ -5877,6 +5867,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     && !page_load_stable.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     page_load_stable.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(mut stable_since) = crash_stable_since.lock() {
+                        *stable_since = Some(std::time::Instant::now());
+                    }
                     log::info!(
                         "[MessengerX][CrashDetect] page_load_stable=true \
                          (good-title recovery — on_page_load::Finished not received)"
@@ -5899,6 +5892,27 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     && had_good_title.load(std::sync::atomic::Ordering::Relaxed)
                     && page_load_stable.load(std::sync::atomic::Ordering::Relaxed)
                 {
+                    const CRASH_COUNT_RESET_AFTER: std::time::Duration =
+                        std::time::Duration::from_secs(30);
+                    let stable_long_enough = crash_stable_since
+                        .lock()
+                        .ok()
+                        .and_then(|stable_since| *stable_since)
+                        .is_some_and(|stable_since| {
+                            stable_since.elapsed() >= CRASH_COUNT_RESET_AFTER
+                        });
+                    if stable_long_enough {
+                        let old = crash_reload_count.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        if old > 0 {
+                            log::info!(
+                                "[MessengerX][CrashDetect] crash_reload_count reset after \
+                                 30s uninterrupted stability (was {old})"
+                            );
+                        }
+                    }
+                    if let Ok(mut stable_since) = crash_stable_since.lock() {
+                        *stable_since = None;
+                    }
                     let prev_count =
                         crash_reload_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if prev_count < MAX_CRASH_RELOADS {
@@ -5998,7 +6012,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
          .on_page_load({
              let page_load_stable_pl = page_load_stable.clone();
              let post_crash_proxy_block_pl = post_crash_proxy_block.clone();
-             let crash_reload_count_pl = crash_reload_count.clone();
+             let crash_stable_since_pl = crash_stable_since.clone();
              move |_webview_window, payload| {
                  use tauri::webview::PageLoadEvent;
                  let event_str = match payload.event() {
@@ -6017,6 +6031,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                      let host = payload.url().host_str().unwrap_or("");
                      if host == "www.messenger.com" {
                          page_load_stable_pl.store(true, std::sync::atomic::Ordering::Relaxed);
+                         if let Ok(mut stable_since) = crash_stable_since_pl.lock() {
+                             *stable_since = Some(std::time::Instant::now());
+                         }
                          log::info!(
                              "[MessengerX][CrashDetect] page_load_stable=true (Finished, \
                               www.messenger.com)"
@@ -6030,23 +6047,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                  "[MessengerX][CrashDetect] post_crash_proxy_block cleared \
                                   (page loaded successfully after crash)"
                              );
-                         }
-                         // Reset crash-reload counter after 30 s of stability.
-                         // This prevents the counter from reaching MAX_CRASH_RELOADS
-                         // during a transient network hiccup and permanently disabling
-                         // CrashDetect for the rest of the session.
-                         let crc = crash_reload_count_pl.clone();
-                         std::thread::spawn(move || {
-                             std::thread::sleep(std::time::Duration::from_secs(30));
-                             let old = crc.swap(0, std::sync::atomic::Ordering::Relaxed);
-                             if old > 0 {
-                                 log::info!(
-                                     "[MessengerX][CrashDetect] crash_reload_count reset \
-                                      after 30s stability (was {old})"
-                                 );
-                             }
-                         });
                      }
+                      }
                  }
              }
          })
@@ -6056,6 +6058,7 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let post_crash_proxy_block = post_crash_proxy_block.clone();
             let messenger_com_navigated_nav = messenger_com_navigated.clone();
             let page_load_stable_nav = page_load_stable.clone();
+            let crash_stable_since_nav = crash_stable_since.clone();
             move |url| {
                 let scheme = url.scheme();
                 // Pass through non-HTTP schemes (blob:, data:, about:, tauri:, etc.).
@@ -6089,6 +6092,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // window.location.reload()) doesn't trigger CrashDetect.
                     // Stability is restored by on_page_load::Finished.
                     page_load_stable_nav.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(mut stable_since) = crash_stable_since_nav.lock() {
+                        *stable_since = None;
+                    }
                 }
 
                 // Post-crash fbsbx proxy block (Linux only).
@@ -8083,6 +8089,22 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    mod console_error_logger {
+        use super::super::{CONSOLE_ERROR_LOGGER_SCRIPT, DIAGNOSTIC_TELEMETRY_SCRIPT};
+
+        #[test]
+        fn leaves_unhandled_rejection_capture_to_diagnostic_telemetry() {
+            assert!(
+                DIAGNOSTIC_TELEMETRY_SCRIPT.contains("addEventListener('unhandledrejection'"),
+                "diagnostic telemetry must retain unhandled-rejection coverage"
+            );
+            assert!(
+                !CONSOLE_ERROR_LOGGER_SCRIPT.contains("addEventListener('unhandledrejection'"),
+                "console logger must not duplicate the rejection hook that crashes WKWebView"
+            );
+        }
+    }
+
     mod log_formatting {
         use super::super::{format_log_line, is_prunable_archived_log, LOG_RETENTION_DAYS};
         use chrono::{FixedOffset, TimeZone};

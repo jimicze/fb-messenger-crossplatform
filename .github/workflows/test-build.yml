@@ -129,6 +129,11 @@ jobs:
             pkg.version = v;
             fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 
+            const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+            lock.version = v;
+            lock.packages[''].version = v;
+            fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2) + '\n');
+
             const tc = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'));
             tc.version = v;
             fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(tc, null, 2) + '\n');
