@@ -3310,13 +3310,18 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                     if (URL_RE.test(url || '')) {
                         this.__mxDiagUrl = url;
                         this.__mxDiagMethod = method;
-                        var self = this;
-                        this.addEventListener('loadend', function() {
-                            try {
-                                dlog('[XHR] ' + self.__mxDiagMethod + ' '
-                                    + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
-                            } catch(_) {}
-                        });
+                        // Attach the loadend listener once per XHR instance so
+                        // reused objects do not accumulate duplicate handlers.
+                        if (!this.__mxDiagLoadendInstalled) {
+                            this.__mxDiagLoadendInstalled = true;
+                            var self = this;
+                            this.addEventListener('loadend', function() {
+                                try {
+                                    dlog('[XHR] ' + self.__mxDiagMethod + ' '
+                                        + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
+                                } catch(_) {}
+                            });
+                        }
                     }
                 } catch(_) {}
                 return origOpen.apply(this, arguments);
@@ -4051,65 +4056,69 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
     }
 
     var _origWebSocket = window.WebSocket;
-    // A real class subclass (not a plain function) keeps `constructor.name`,
-    // super-chained initialization, and prototype identity intact so that
-    // Messenger's anti-bot heuristics cannot detect the logger override.
-    // The class is bound to the identifier `WebSocket` so that both
-    // `window.WebSocket.name` and `new WebSocket().constructor.name`
-    // still report "WebSocket".
-    window.WebSocket = class WebSocket extends _origWebSocket {
-        constructor(url, protocols) {
-            super(url, protocols);
-            var ws = this;
-            var wsUrl = String(url || '');
-            var id = Math.random().toString(36).slice(2, 8);
-            var openTime = 0;
-            var msgCount = 0;
+    // Named wrapper function (not a class): keeping the original prototype
+    // identity is what anti-detection really requires:
+    //  · `window.WebSocket.prototype === WebSocket.prototype` (the native one)
+    //  · `window.WebSocket.name === 'WebSocket'`
+    //  · `new WebSocket(...).constructor === WebSocket` (via the shared prototype)
+    // A subclass has its own fresh prototype object, which would break the
+    // prototype-identity contract even though constructor.name looks fine.
+    var _origWsSend = _origWebSocket.prototype.send;
+    var _origWsAddEventListener = _origWebSocket.prototype.addEventListener;
+    window.WebSocket = function WebSocket(url, protocols) {
+        var ws = protocols ? new _origWebSocket(url, protocols) : new _origWebSocket(url);
+        var wsUrl = String(url || '');
+        var id = Math.random().toString(36).slice(2, 8);
+        var openTime = 0;
+        var msgCount = 0;
 
-            wlog('WS created id=' + id + ' url=' + JSON.stringify(wsUrl.slice(0, 200)));
+        wlog('WS created id=' + id + ' url=' + JSON.stringify(wsUrl.slice(0, 200)));
 
-            ws.addEventListener('open', function() {
-                openTime = Date.now();
-                wlog('WS open id=' + id);
-            });
+        ws.addEventListener('open', function() {
+            openTime = Date.now();
+            wlog('WS open id=' + id);
+        });
 
-            ws.addEventListener('close', function(e) {
-                var duration = openTime ? (Date.now() - openTime) + 'ms' : 'N/A';
-                wlog('WS close id=' + id + ' code=' + e.code + ' reason=' + JSON.stringify(e.reason||'').slice(0,100) + ' duration=' + duration);
-            });
+        ws.addEventListener('close', function(e) {
+            var duration = openTime ? (Date.now() - openTime) + 'ms' : 'N/A';
+            wlog('WS close id=' + id + ' code=' + e.code + ' reason=' + JSON.stringify(e.reason||'').slice(0,100) + ' duration=' + duration);
+        });
 
-            ws.addEventListener('error', function(e) {
-                wlog('WS error id=' + id);
-            });
+        ws.addEventListener('error', function(e) {
+            wlog('WS error id=' + id);
+        });
 
-            // Count messages (but don't log content for privacy)
-            var _origSend = ws.send;
-            ws.send = function(data) {
-                msgCount++;
-                if (msgCount <= 3 || msgCount % 50 === 0) {
-                    var size = typeof data === 'string' ? data.length : (data && data.byteLength ? data.byteLength : 0);
-                    wlog('WS send id=' + id + ' msg#' + msgCount + ' size=' + size);
-                }
-                return _origSend.apply(this, arguments);
-            };
+        // Count messages (but don't log content for privacy)
+        ws.send = function(data) {
+            msgCount++;
+            if (msgCount <= 3 || msgCount % 50 === 0) {
+                var size = typeof data === 'string' ? data.length : (data && data.byteLength ? data.byteLength : 0);
+                wlog('WS send id=' + id + ' msg#' + msgCount + ' size=' + size);
+            }
+            return _origWsSend.apply(this, arguments);
+        };
 
-            var _origAddEventListener = ws.addEventListener;
-            ws.addEventListener = function(type, handler, options) {
-                if (type === 'message') {
-                    var wrapped = function(e) {
-                        msgCount++;
-                        if (msgCount <= 3 || msgCount % 50 === 0) {
-                            var size = typeof e.data === 'string' ? e.data.length : (e.data && e.data.byteLength ? e.data.byteLength : 0);
-                            wlog('WS recv id=' + id + ' msg#' + msgCount + ' size=' + size);
-                        }
-                        return handler.apply(this, arguments);
-                    };
-                    return _origAddEventListener.call(this, type, wrapped, options);
-                }
-                return _origAddEventListener.apply(this, arguments);
-            };
-        }
+        ws.addEventListener = function(type, handler, options) {
+            if (type === 'message') {
+                var wrapped = function(e) {
+                    msgCount++;
+                    if (msgCount <= 3 || msgCount % 50 === 0) {
+                        var size = typeof e.data === 'string' ? e.data.length : (e.data && e.data.byteLength ? e.data.byteLength : 0);
+                        wlog('WS recv id=' + id + ' msg#' + msgCount + ' size=' + size);
+                    }
+                    return handler.apply(this, arguments);
+                };
+                return _origWsAddEventListener.call(this, type, wrapped, options);
+            }
+            return _origWsAddEventListener.apply(this, arguments);
+        };
+
+        return ws;
     };
+    // Share the native prototype object so `WebSocket.prototype` identity
+    // checks (`window.WebSocket.prototype === WebSocket.prototype` captured by
+    // earlier scripts) still pass.
+    window.WebSocket.prototype = _origWebSocket.prototype;
 
     wlog('WebSocket logger registered v=' + APP_VERSION);
 })();
@@ -8187,6 +8196,27 @@ mod tests {
                 "dlog must consume rejected js_log invokes to prevent an unhandledrejection loop"
             );
         }
+
+        #[test]
+        fn diagnostic_xhr_loadend_listener_is_installed_once() {
+            let proxy_start = DIAGNOSTIC_TELEMETRY_SCRIPT
+                .find("XHRProto.open = function(method, url)")
+                .expect("diagnostic XHR open override missing");
+            let proxy_end = DIAGNOSTIC_TELEMETRY_SCRIPT[proxy_start..]
+                .find("dlog('[HTTP] proxies installed')")
+                .map(|offset| proxy_start + offset)
+                .expect("HTTP proxies footer must follow the XHR override");
+            let proxy = &DIAGNOSTIC_TELEMETRY_SCRIPT[proxy_start..proxy_end];
+            assert!(
+                proxy.contains("if (!this.__mxDiagLoadendInstalled)"),
+                "diagnostic XHR loadend listener must be guarded per instance so reused XHR objects do not accumulate handlers"
+            );
+            assert_eq!(
+                proxy.matches("addEventListener('loadend'").count(),
+                1,
+                "diagnostic XHR override must attach the loadend listener in exactly one guarded place"
+            );
+        }
     }
 
     mod telemetry_performance_audit {
@@ -8370,7 +8400,20 @@ mod tests {
     }
 
     mod window_open_shim_guard {
-        use super::super::WINDOW_OPEN_OVERRIDE_SCRIPT;
+        use super::super::{WEBSOCKET_LOGGER_SCRIPT, WINDOW_OPEN_OVERRIDE_SCRIPT};
+
+        #[test]
+        fn websocket_logger_preserves_native_identity_contract() {
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT
+                    .contains("window.WebSocket = function WebSocket(url, protocols)"),
+                "WebSocket override must be a named wrapper function so .name stays \"WebSocket\""
+            );
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT.contains("window.WebSocket.prototype = _origWebSocket.prototype"),
+                "WebSocket override must share the native prototype so prototype-identity checks pass"
+            );
+        }
 
         #[test]
         fn js_shim_resolver_validates_http_s_scheme() {
