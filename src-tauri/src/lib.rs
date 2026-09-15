@@ -2696,7 +2696,28 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
             var parsed = new URL(urlStr);
             if ((parsed.hostname === 'l.facebook.com' || parsed.hostname === 'l.messenger.com')
                     && parsed.pathname === '/l.php') {
-                return parsed.searchParams.get('u') || null;
+                var target = parsed.searchParams.get('u');
+                // Same scheme validation as resolve_facebook_shim_url in Rust:
+                // the shim must resolve to an absolute http(s) URL before it
+                // reaches the opener path. Validate via an actual URL parse
+                // (schemes are case-insensitive, so prefix checks like
+                // indexOf('https://') would wrongly reject `u=HTTPS://...`).
+                if (target) {
+                    try {
+                        var targetUrl = new URL(target);
+                        if (targetUrl.protocol === 'https:' || targetUrl.protocol === 'http:') {
+                            return target;
+                        }
+                    } catch(_) {}
+                }
+                jlog('Link shim `u` param is not an http(s) URL — dropping open: ' + (target || '').slice(0, 200));
+                // Distinguish "invalid shim" from "not a shim": an invalid
+                // shim must NOT fall through to _originalOpen, because the
+                // on_new_window popup policy allowlists *.facebook.com and
+                // would load `u=javascript:...` in an embedded popup without
+                // ever passing through on_navigation. Returning `false` (not
+                // null) makes the window.open override drop the open.
+                return false;
             }
         } catch(e) {}
         return null;
@@ -2726,6 +2747,14 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
             // with that URL would be silently dropped by WKWebView (no
             // createWebViewWith UI delegate in WRY).
             var realUrl = extractLinkShimUrl(urlStr);
+            if (realUrl === false) {
+                // Invalid shim (`u` present but not an http(s) URL): drop the
+                // open entirely instead of letting _originalOpen create an
+                // embedded popup (on_new_window allowlists *.facebook.com and
+                // would bypass the on_navigation scheme validation).
+                jlog('Invalid link shim — open dropped: ' + urlStr.slice(0, 200));
+                return null;
+            }
             if (realUrl) {
                 jlog('Link shim in window.open — routing real URL to browser: ' + realUrl);
                 openExternal(realUrl);
@@ -3049,20 +3078,14 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
     //     the files actually reached the page.
     // -----------------------------------------------------------------------
     try {
-        var _fileTrapLogged = {};
+        var         _fileTrapLogged = {};
         function _fileTrapLog(key, msg) {
             if (_fileTrapLogged[key]) return;
             _fileTrapLogged[key] = true;
             dlog(msg);
         }
-        document.addEventListener('paste', function(e) {
-            try {
-                var items = (e.clipboardData && e.clipboardData.items) ? e.clipboardData.items.length : 0;
-                var files = (e.clipboardData && e.clipboardData.files) ? e.clipboardData.files.length : 0;
-                var types = (e.clipboardData && e.clipboardData.types) ? e.clipboardData.types.join(',') : '';
-                _fileTrapLog('paste', '[FileTrap] paste items=' + items + ' files=' + files + ' types=' + types.slice(0, 120));
-            } catch(_) {}
-        });
+        // Paste events are logged per-event by DRAG_DROP_LOGGER_SCRIPT
+        // ([DragDropJS]); no duplicate listener here.
         document.addEventListener('dragover', function(e) {
             _fileTrapLog('dragover', '[FileTrap] dragover');
         });
@@ -3102,7 +3125,7 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                 if (document.body) _fileObs.observe(document.body, { childList: true, subtree: true });
             });
         }
-        dlog('[FileTrap] file/paste/drag listeners installed');
+        dlog('[FileTrap] file/drag listeners installed (paste handled by DragDropJS)');
     } catch(_) {}
 
     // -----------------------------------------------------------------------
@@ -3296,16 +3319,26 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
             var origOpen = XHRProto.open;
             XHRProto.open = function(method, url) {
                 try {
-                    if (URL_RE.test(url || '')) {
-                        this.__mxDiagUrl = url;
-                        this.__mxDiagMethod = method;
-                        var self = this;
-                        this.addEventListener('loadend', function() {
-                            try {
-                                dlog('[XHR] ' + self.__mxDiagMethod + ' '
-                                    + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
-                            } catch(_) {}
-                        });
+                    var matched = URL_RE.test(url || '');
+                    // Update per-open match state even for non-matching URLs
+                    // so a reused XHR cannot log stale URL/method data.
+                    this.__mxDiagMatched = matched;
+                    this.__mxDiagMethod = method;
+                    this.__mxDiagUrl = url;
+                    if (matched) {
+                        // Attach the loadend listener once per XHR instance so
+                        // reused objects do not accumulate duplicate handlers.
+                        if (!this.__mxDiagLoadendInstalled) {
+                            this.__mxDiagLoadendInstalled = true;
+                            var self = this;
+                            this.addEventListener('loadend', function() {
+                                try {
+                                    if (!self.__mxDiagMatched) return;
+                                    dlog('[XHR] ' + self.__mxDiagMethod + ' '
+                                        + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
+                                } catch(_) {}
+                            });
+                        }
                     }
                 } catch(_) {}
                 return origOpen.apply(this, arguments);
@@ -3729,7 +3762,8 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
         }
     }, true);
 
-    // Log paste events (alternative way to attach images on some platforms)
+    // Log paste events (alternative way to attach images on some platforms).
+    // This is the single per-paste logging path; FileTrap no longer duplicates it.
     document.addEventListener('paste', function(e) {
         try {
             var items = [];
@@ -3739,70 +3773,18 @@ const DRAG_DROP_LOGGER_SCRIPT: &str = concat!(
                     items.push(item.type + (item.kind ? '/' + item.kind : ''));
                 }
             }
-            dlog('paste items=[' + items.join('; ') + ']');
+            dlog('paste items=[' + items.join('; ') + '] target=' + (e.target && e.target.tagName ? e.target.tagName : 'none'));
         } catch(err) {
             dlog('paste ERROR: ' + (err && err.message ? err.message : String(err)));
         }
     }, true);
 
-    // Handler called from Rust when Tauri native drag-drop events fire.
-    // WKWebView on macOS doesn't deliver HTML5 DnD to JS, so Rust forwards
-    // the file paths and we create synthetic drop events with real File objects.
-    window.__messengerx_handleDroppedFiles = async function(paths) {
-        try {
-            dlog('handleDroppedFiles paths=' + JSON.stringify(paths));
-            const { convertFileSrc } = await import('@tauri-apps/api/core');
-            const files = [];
-            for (const path of paths) {
-                try {
-                    const url = convertFileSrc(path);
-                    dlog('fetching ' + url);
-                    const response = await fetch(url);
-                    if (!response.ok) {
-                        dlog('fetch FAILED status=' + response.status + ' url=' + url);
-                        continue;
-                    }
-                    const blob = await response.blob();
-                    // Extract filename from path
-                    const filename = path.replace(/\\/g, '/').split('/').pop() || 'file';
-                    // Guess mime type from extension
-                    const ext = filename.split('.').pop().toLowerCase();
-                    const mimeMap = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif', webp:'image/webp', mp4:'video/mp4', mov:'video/quicktime', avi:'video/x-msvideo', webm:'video/webm', pdf:'application/pdf' };
-                    const type = mimeMap[ext] || blob.type || 'application/octet-stream';
-                    const file = new File([blob], filename, { type: type });
-                    files.push(file);
-                    dlog('created File name=' + filename + ' size=' + file.size + ' type=' + type);
-                } catch(err) {
-                    dlog('handleDroppedFiles path ERROR: ' + (err && err.message ? err.message : String(err)));
-                }
-            }
-            if (files.length === 0) {
-                dlog('handleDroppedFiles: no files created');
-                return;
-            }
-            // Create synthetic drop event with File objects
-            const dt = new DataTransfer();
-            for (const f of files) {
-                dt.items.add(f);
-            }
-            const dropEvent = new DragEvent('drop', {
-                bubbles: true,
-                cancelable: true,
-                dataTransfer: dt
-            });
-            // Find the best target — Messenger's drop zone (usually the composer area)
-            var target = document.querySelector('[contenteditable="true"]') ||
-                         document.querySelector('[role="textbox"]') ||
-                         document.activeElement ||
-                         document.body;
-            dlog('dispatching drop on ' + target.tagName + ' files=' + files.length);
-            target.dispatchEvent(dropEvent);
-            // Also dispatch on document for global listeners
-            document.dispatchEvent(dropEvent);
-        } catch(err) {
-            dlog('handleDroppedFiles ERROR: ' + (err && err.message ? err.message : String(err)));
-        }
-    };
+    // Note: a Rust-driven `__messengerx_handleDroppedFiles` bridge that fetched
+    // dropped files through the asset protocol was removed — no Rust code ever
+    // invoked it and `assetProtocol.scope` is empty (all asset fetches would
+    // have failed with 403 anyway). File drops now go straight to the WebView
+    // as native HTML5 drag-and-drop via `.disable_drag_drop_handler()`.
+    // Paste events are logged once per event here; FileTrap no longer duplicates them.
 
     dlog('listeners registered v=' + APP_VERSION);
 })();
@@ -4050,14 +4032,20 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
                  ' url=' + JSON.stringify(sanitizeUrl(self._netLogUrl)));
         }
 
-        self.addEventListener('loadend', function() {
-            if (!self._netLogShould) return;
-            var ms = Math.round(performance.now() - self._netLogStart);
-            var ct = '';
-            try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
-            nlog('xhr end id=' + self._netLogId + ' status=' + self.status + ' ms=' + ms +
-                 ' type=' + ct);
-        });
+        // One loadend listener per XHR instance (loadend fires after every
+        // send), never re-added — reused XHR objects would otherwise
+        // accumulate listeners.
+        if (!self._netLogLoadendAdded) {
+            self._netLogLoadendAdded = true;
+            self.addEventListener('loadend', function() {
+                if (!self._netLogShould) return;
+                var ms = Math.round(performance.now() - self._netLogStart);
+                var ct = '';
+                try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
+                nlog('xhr end id=' + self._netLogId + ' status=' + self.status + ' ms=' + ms +
+                     ' type=' + ct);
+            });
+        }
 
         return _origXHRSend.apply(this, arguments);
     };
@@ -4085,11 +4073,27 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
     }
 
     var _origWebSocket = window.WebSocket;
-    window.WebSocket = function(url, protocols) {
+    // Named wrapper function (not a class): keeping the original prototype
+    // identity is what anti-detection really requires:
+    //  · `window.WebSocket.prototype === WebSocket.prototype` (the native one)
+    //  · `window.WebSocket.name === 'WebSocket'`
+    //  · `new WebSocket(...).constructor === native WebSocket` (via the shared prototype)
+    // A subclass has its own fresh prototype object, which would break the
+    // prototype-identity contract even though constructor.name looks fine.
+    var _origWsSend = _origWebSocket.prototype.send;
+    var _origWsAddEventListener = _origWebSocket.prototype.addEventListener;
+    window.WebSocket = function WebSocket(url, protocols) {
+        // Mirror the native constructor contract: calling the constructor
+        // without `new` must raise the same TypeError instead of silently
+        // returning a socket.
+        if (!new.target) {
+            throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+        }
         var ws = protocols ? new _origWebSocket(url, protocols) : new _origWebSocket(url);
         var wsUrl = String(url || '');
         var id = Math.random().toString(36).slice(2, 8);
         var openTime = 0;
+        var msgCount = 0;
 
         wlog('WS created id=' + id + ' url=' + JSON.stringify(wsUrl.slice(0, 200)));
 
@@ -4108,18 +4112,15 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
         });
 
         // Count messages (but don't log content for privacy)
-        var msgCount = 0;
-        var _origSend = ws.send;
         ws.send = function(data) {
             msgCount++;
             if (msgCount <= 3 || msgCount % 50 === 0) {
                 var size = typeof data === 'string' ? data.length : (data && data.byteLength ? data.byteLength : 0);
                 wlog('WS send id=' + id + ' msg#' + msgCount + ' size=' + size);
             }
-            return _origSend.apply(this, arguments);
+            return _origWsSend.apply(this, arguments);
         };
 
-        var _origAddEventListener = ws.addEventListener;
         ws.addEventListener = function(type, handler, options) {
             if (type === 'message') {
                 var wrapped = function(e) {
@@ -4130,14 +4131,21 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
                     }
                     return handler.apply(this, arguments);
                 };
-                return _origAddEventListener.call(this, type, wrapped, options);
+                return _origWsAddEventListener.call(this, type, wrapped, options);
             }
-            return _origAddEventListener.apply(this, arguments);
+            return _origWsAddEventListener.apply(this, arguments);
         };
 
         return ws;
     };
+    // Share the native prototype object so `WebSocket.prototype` identity
+    // checks (`window.WebSocket.prototype === WebSocket.prototype` captured by
+    // earlier scripts) still pass.
     window.WebSocket.prototype = _origWebSocket.prototype;
+    // Inherit the native constructor chain so static constants
+    // (CONNECTING/OPEN/CLOSING/CLOSED) and any later-added statics resolve
+    // through the normal prototype chain instead of reading as undefined.
+    window.WebSocket.__proto__ = _origWebSocket;
 
     wlog('WebSocket logger registered v=' + APP_VERSION);
 })();
@@ -4802,6 +4810,28 @@ fn is_facebook_in_app_path(path: &str) -> bool {
         || path.starts_with("/connect/")
         || path == "/two_step_verification"
         || path.starts_with("/two_step_verification/")
+}
+
+/// Resolves a Facebook/Messenger link-shim URL (`l.facebook.com/l.php?u=…` or
+/// `l.messenger.com/l.php?u=…`) to the real destination, so external opening
+/// follows the same tracking-stripped URL the JS click interceptor uses.
+///
+/// Returns `None` for anything that is not a shim URL or whose `u` parameter
+/// is not an absolute `http(s)` URL.
+fn resolve_facebook_shim_url(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?;
+    if !(host == "l.facebook.com" || host == "l.messenger.com") || url.path() != "/l.php" {
+        return None;
+    }
+    let target = url
+        .query_pairs()
+        .find(|(key, _)| key == "u")
+        .map(|(_, value)| value.to_string())?;
+    let parsed = url::Url::parse(&target).ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    Some(target)
 }
 
 #[derive(Default)]
@@ -6124,8 +6154,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                  "[MessengerX][CrashDetect] post_crash_proxy_block cleared \
                                   (page loaded successfully after crash)"
                              );
+                         }
                      }
-                      }
                  }
              }
          })
@@ -6202,13 +6232,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // the actual URL from the `u` query param and open it in the system browser.
                 if (host == "l.facebook.com" || host == "l.messenger.com") && url.path() == "/l.php"
                 {
-                    if let Some(actual_url) = url
-                        .query_pairs()
-                        .find(|(k, _)| k == "u")
-                        .map(|(_, v)| v.into_owned())
-                    {
+                    if let Some(actual_url) = resolve_facebook_shim_url(url) {
                         log::info!(
-                            "[MessengerX] Link shim detected — opening real URL: {actual_url}"
+                            "[MessengerX] Link shim resolved — opening real URL: {actual_url}"
                         );
                         let handle = nav_app_handle.clone();
                         std::thread::spawn(move || {
@@ -6219,6 +6245,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         });
+                        return false;
+                    }
+                    // A `u` param that failed validation must not reach the
+                    // opener — if present but not an http(s) URL, block the
+                    // navigation outright.
+                    if url.query_pairs().any(|(k, _)| k == "u") {
+                        log::warn!(
+                            "[MessengerX] Link shim with unsuitable `u` param — blocking navigation: {url}"
+                        );
                         return false;
                     }
                     // No `u` param — this is likely a Messenger OAuth / login
@@ -8188,6 +8223,35 @@ mod tests {
                 "dlog must consume rejected js_log invokes to prevent an unhandledrejection loop"
             );
         }
+
+        #[test]
+        fn diagnostic_xhr_loadend_listener_is_installed_once() {
+            let proxy_start = DIAGNOSTIC_TELEMETRY_SCRIPT
+                .find("XHRProto.open = function(method, url)")
+                .expect("diagnostic XHR open override missing");
+            let proxy_end = DIAGNOSTIC_TELEMETRY_SCRIPT[proxy_start..]
+                .find("dlog('[HTTP] proxies installed')")
+                .map(|offset| proxy_start + offset)
+                .expect("HTTP proxies footer must follow the XHR override");
+            let proxy = &DIAGNOSTIC_TELEMETRY_SCRIPT[proxy_start..proxy_end];
+            assert!(
+                proxy.contains("this.__mxDiagMatched = matched"),
+                "diagnostic XHR override must update the per-open match state on every open so reused XHR objects cannot log stale URLs"
+            );
+            assert!(
+                proxy.contains("if (!self.__mxDiagMatched) return;"),
+                "diagnostic XHR loadend callback must skip non-matching re-opens instead of logging stale URL/method data"
+            );
+            assert!(
+                proxy.contains("if (!this.__mxDiagLoadendInstalled)"),
+                "diagnostic XHR loadend listener must be guarded per instance so reused XHR objects do not accumulate handlers"
+            );
+            assert_eq!(
+                proxy.matches("addEventListener('loadend'").count(),
+                1,
+                "diagnostic XHR override must attach the loadend listener in exactly one guarded place"
+            );
+        }
     }
 
     mod telemetry_performance_audit {
@@ -8272,8 +8336,7 @@ mod tests {
         fn recurring_telemetry_uses_conservative_intervals() {
             assert!(GIF_DEBUG_SCRIPT.contains("setInterval(checkGifState, 5000)"));
             assert!(
-                PERFORMANCE_LOGGER_SCRIPT
-                    .contains("setInterval(logPerformanceSnapshot, 30000)")
+                PERFORMANCE_LOGGER_SCRIPT.contains("setInterval(logPerformanceSnapshot, 30000)")
             );
             assert!(PERFORMANCE_LOGGER_SCRIPT.contains("}, 10000)"));
             assert!(!GIF_DEBUG_SCRIPT.contains("setInterval(checkGifState, 1000)"));
@@ -8301,7 +8364,9 @@ mod tests {
         #[test]
         fn media_observer_is_created_once_outside_its_callback() {
             assert_eq!(
-                MEDIA_LOAD_LOGGER_SCRIPT.matches("new MutationObserver").count(),
+                MEDIA_LOAD_LOGGER_SCRIPT
+                    .matches("new MutationObserver")
+                    .count(),
                 1
             );
         }
@@ -8329,6 +8394,96 @@ mod tests {
         fn rejects_profile_paths() {
             assert!(!is_facebook_in_app_path("/some.user"));
             assert!(!is_facebook_in_app_path("/profile.php"));
+        }
+    }
+
+    mod link_shim_resolution {
+        use super::super::resolve_facebook_shim_url;
+
+        fn resolve(url: &str) -> Option<String> {
+            resolve_facebook_shim_url(&url::Url::parse(url).expect("test url must parse"))
+        }
+
+        #[test]
+        fn resolves_facebook_and_messenger_shims_to_real_url() {
+            assert_eq!(
+                resolve("https://l.facebook.com/l.php?u=https%3A%2F%2Fexample.com%2Fpage"),
+                Some("https://example.com/page".to_string())
+            );
+            assert_eq!(
+                resolve("https://l.messenger.com/l.php?u=https%3A%2F%2Fexample.com"),
+                Some("https://example.com".to_string())
+            );
+        }
+
+        #[test]
+        fn ignores_non_shim_urls() {
+            assert_eq!(resolve("https://example.com/page"), None);
+            assert_eq!(resolve("https://l.facebook.com/other"), None);
+            assert_eq!(resolve("https://facebook.com/profile.php"), None);
+        }
+
+        #[test]
+        fn rejects_shims_without_or_with_non_http_targets() {
+            assert_eq!(resolve("https://l.facebook.com/l.php"), None);
+            assert_eq!(resolve("https://l.facebook.com/l.php?e=1"), None);
+            assert_eq!(
+                resolve("https://l.facebook.com/l.php?u=javascript%3Aalert(1)"),
+                None
+            );
+        }
+    }
+
+    mod window_open_shim_guard {
+        use super::super::{WEBSOCKET_LOGGER_SCRIPT, WINDOW_OPEN_OVERRIDE_SCRIPT};
+
+        #[test]
+        fn websocket_logger_preserves_native_identity_contract() {
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT
+                    .contains("window.WebSocket = function WebSocket(url, protocols)"),
+                "WebSocket override must be a named wrapper function so .name stays \"WebSocket\""
+            );
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT.contains("window.WebSocket.prototype = _origWebSocket.prototype"),
+                "WebSocket override must share the native prototype so prototype-identity checks pass"
+            );
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT.contains("if (!new.target) {"),
+                "WebSocket override must preserve the native constructor contract (TypeError without new)"
+            );
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT.contains("window.WebSocket.__proto__ = _origWebSocket"),
+                "WebSocket override must inherit the native constructor chain so static constants resolve"
+            );
+        }
+
+        #[test]
+        fn js_shim_resolver_validates_http_s_scheme() {
+            let start = WINDOW_OPEN_OVERRIDE_SCRIPT
+                .find("function extractLinkShimUrl(urlStr)")
+                .expect("extractLinkShimUrl helper missing");
+            let end = WINDOW_OPEN_OVERRIDE_SCRIPT[start..]
+                .find("function openExternal(")
+                .map(|offset| start + offset)
+                .expect("openExternal must follow the shim resolver");
+            let helper = &WINDOW_OPEN_OVERRIDE_SCRIPT[start..end];
+            assert!(
+                helper.contains("return false;"),
+                "invalid shim must be distinguishable from \"not a shim\" (null) so the window.open path can drop it before on_new_window creates an embedded popup"
+            );
+            assert!(
+                helper.contains("new URL(target)"),
+                "window.open shim resolver must validate the target via URL parse (schemes are case-insensitive)"
+            );
+            assert!(
+                helper.contains("targetUrl.protocol === 'https:'"),
+                "window.open shim resolver must require an https: protocol"
+            );
+            assert!(
+                helper.contains("targetUrl.protocol === 'http:'"),
+                "window.open shim resolver must require an http: protocol"
+            );
         }
     }
 
