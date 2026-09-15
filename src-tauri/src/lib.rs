@@ -3307,9 +3307,13 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
             var origOpen = XHRProto.open;
             XHRProto.open = function(method, url) {
                 try {
-                    if (URL_RE.test(url || '')) {
-                        this.__mxDiagUrl = url;
-                        this.__mxDiagMethod = method;
+                    var matched = URL_RE.test(url || '');
+                    // Update per-open match state even for non-matching URLs
+                    // so a reused XHR cannot log stale URL/method data.
+                    this.__mxDiagMatched = matched;
+                    this.__mxDiagMethod = method;
+                    this.__mxDiagUrl = url;
+                    if (matched) {
                         // Attach the loadend listener once per XHR instance so
                         // reused objects do not accumulate duplicate handlers.
                         if (!this.__mxDiagLoadendInstalled) {
@@ -3317,6 +3321,7 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                             var self = this;
                             this.addEventListener('loadend', function() {
                                 try {
+                                    if (!self.__mxDiagMatched) return;
                                     dlog('[XHR] ' + self.__mxDiagMethod + ' '
                                         + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
                                 } catch(_) {}
@@ -8207,6 +8212,14 @@ mod tests {
                 .map(|offset| proxy_start + offset)
                 .expect("HTTP proxies footer must follow the XHR override");
             let proxy = &DIAGNOSTIC_TELEMETRY_SCRIPT[proxy_start..proxy_end];
+            assert!(
+                proxy.contains("this.__mxDiagMatched = matched"),
+                "diagnostic XHR override must update the per-open match state on every open so reused XHR objects cannot log stale URLs"
+            );
+            assert!(
+                proxy.contains("if (!self.__mxDiagMatched) return;"),
+                "diagnostic XHR loadend callback must skip non-matching re-opens instead of logging stale URL/method data"
+            );
             assert!(
                 proxy.contains("if (!this.__mxDiagLoadendInstalled)"),
                 "diagnostic XHR loadend listener must be guarded per instance so reused XHR objects do not accumulate handlers"
