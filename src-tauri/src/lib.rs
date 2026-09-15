@@ -2702,8 +2702,6 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
                 // reaches the opener path. Validate via an actual URL parse
                 // (schemes are case-insensitive, so prefix checks like
                 // indexOf('https://') would wrongly reject `u=HTTPS://...`).
-                // Returning null lets the caller fall through and the
-                // on_navigation policy blocks/decides.
                 if (target) {
                     try {
                         var targetUrl = new URL(target);
@@ -2712,8 +2710,14 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
                         }
                     } catch(_) {}
                 }
-                jlog('Link shim `u` param is not an http(s) URL — ignoring shim: ' + (target || '').slice(0, 200));
-                return null;
+                jlog('Link shim `u` param is not an http(s) URL — dropping open: ' + (target || '').slice(0, 200));
+                // Distinguish "invalid shim" from "not a shim": an invalid
+                // shim must NOT fall through to _originalOpen, because the
+                // on_new_window popup policy allowlists *.facebook.com and
+                // would load `u=javascript:...` in an embedded popup without
+                // ever passing through on_navigation. Returning `false` (not
+                // null) makes the window.open override drop the open.
+                return false;
             }
         } catch(e) {}
         return null;
@@ -2743,6 +2747,14 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
             // with that URL would be silently dropped by WKWebView (no
             // createWebViewWith UI delegate in WRY).
             var realUrl = extractLinkShimUrl(urlStr);
+            if (realUrl === false) {
+                // Invalid shim (`u` present but not an http(s) URL): drop the
+                // open entirely instead of letting _originalOpen create an
+                // embedded popup (on_new_window allowlists *.facebook.com and
+                // would bypass the on_navigation scheme validation).
+                jlog('Invalid link shim — open dropped: ' + urlStr.slice(0, 200));
+                return null;
+            }
             if (realUrl) {
                 jlog('Link shim in window.open — routing real URL to browser: ' + realUrl);
                 openExternal(realUrl);
@@ -4065,12 +4077,18 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
     // identity is what anti-detection really requires:
     //  · `window.WebSocket.prototype === WebSocket.prototype` (the native one)
     //  · `window.WebSocket.name === 'WebSocket'`
-    //  · `new WebSocket(...).constructor === WebSocket` (via the shared prototype)
+    //  · `new WebSocket(...).constructor === native WebSocket` (via the shared prototype)
     // A subclass has its own fresh prototype object, which would break the
     // prototype-identity contract even though constructor.name looks fine.
     var _origWsSend = _origWebSocket.prototype.send;
     var _origWsAddEventListener = _origWebSocket.prototype.addEventListener;
     window.WebSocket = function WebSocket(url, protocols) {
+        // Mirror the native constructor contract: calling the constructor
+        // without `new` must raise the same TypeError instead of silently
+        // returning a socket.
+        if (!new.target) {
+            throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+        }
         var ws = protocols ? new _origWebSocket(url, protocols) : new _origWebSocket(url);
         var wsUrl = String(url || '');
         var id = Math.random().toString(36).slice(2, 8);
@@ -4124,6 +4142,10 @@ const WEBSOCKET_LOGGER_SCRIPT: &str = concat!(
     // checks (`window.WebSocket.prototype === WebSocket.prototype` captured by
     // earlier scripts) still pass.
     window.WebSocket.prototype = _origWebSocket.prototype;
+    // Inherit the native constructor chain so static constants
+    // (CONNECTING/OPEN/CLOSING/CLOSED) and any later-added statics resolve
+    // through the normal prototype chain instead of reading as undefined.
+    window.WebSocket.__proto__ = _origWebSocket;
 
     wlog('WebSocket logger registered v=' + APP_VERSION);
 })();
@@ -8426,6 +8448,14 @@ mod tests {
                 WEBSOCKET_LOGGER_SCRIPT.contains("window.WebSocket.prototype = _origWebSocket.prototype"),
                 "WebSocket override must share the native prototype so prototype-identity checks pass"
             );
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT.contains("if (!new.target) {"),
+                "WebSocket override must preserve the native constructor contract (TypeError without new)"
+            );
+            assert!(
+                WEBSOCKET_LOGGER_SCRIPT.contains("window.WebSocket.__proto__ = _origWebSocket"),
+                "WebSocket override must inherit the native constructor chain so static constants resolve"
+            );
         }
 
         #[test]
@@ -8438,6 +8468,10 @@ mod tests {
                 .map(|offset| start + offset)
                 .expect("openExternal must follow the shim resolver");
             let helper = &WINDOW_OPEN_OVERRIDE_SCRIPT[start..end];
+            assert!(
+                helper.contains("return false;"),
+                "invalid shim must be distinguishable from \"not a shim\" (null) so the window.open path can drop it before on_new_window creates an embedded popup"
+            );
             assert!(
                 helper.contains("new URL(target)"),
                 "window.open shim resolver must validate the target via URL parse (schemes are case-insensitive)"
