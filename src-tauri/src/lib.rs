@@ -2699,11 +2699,18 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
                 var target = parsed.searchParams.get('u');
                 // Same scheme validation as resolve_facebook_shim_url in Rust:
                 // the shim must resolve to an absolute http(s) URL before it
-                // reaches the opener path; anything else is not a usable
-                // external link (returning null lets the caller fall through
-                // and the on_navigation policy blocks/decides).
-                if (target && (target.indexOf('https://') === 0 || target.indexOf('http://') === 0)) {
-                    return target;
+                // reaches the opener path. Validate via an actual URL parse
+                // (schemes are case-insensitive, so prefix checks like
+                // indexOf('https://') would wrongly reject `u=HTTPS://...`).
+                // Returning null lets the caller fall through and the
+                // on_navigation policy blocks/decides.
+                if (target) {
+                    try {
+                        var targetUrl = new URL(target);
+                        if (targetUrl.protocol === 'https:' || targetUrl.protocol === 'http:') {
+                            return target;
+                        }
+                    } catch(_) {}
                 }
                 jlog('Link shim `u` param is not an http(s) URL — ignoring shim: ' + (target || '').slice(0, 200));
                 return null;
@@ -8376,12 +8383,16 @@ mod tests {
                 .expect("openExternal must follow the shim resolver");
             let helper = &WINDOW_OPEN_OVERRIDE_SCRIPT[start..end];
             assert!(
-                helper.contains("indexOf('https://') === 0"),
-                "window.open shim resolver must require an https:// target"
+                helper.contains("new URL(target)"),
+                "window.open shim resolver must validate the target via URL parse (schemes are case-insensitive)"
             );
             assert!(
-                helper.contains("indexOf('http://') === 0"),
-                "window.open shim resolver must require an http:// target"
+                helper.contains("targetUrl.protocol === 'https:'"),
+                "window.open shim resolver must require an https: protocol"
+            );
+            assert!(
+                helper.contains("targetUrl.protocol === 'http:'"),
+                "window.open shim resolver must require an http: protocol"
             );
         }
     }
