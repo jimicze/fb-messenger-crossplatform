@@ -400,9 +400,8 @@ fn decide_notification(
                 // indicator dropped activity_sig), the return of any real
                 // signature reads as "changed" → duplicate notification.
                 // Applies to both individual and group conversations.
-                let sig_changed = !activity_sig.is_empty()
-                    && !prev_sig.is_empty()
-                    && activity_sig != prev_sig;
+                let sig_changed =
+                    !activity_sig.is_empty() && !prev_sig.is_empty() && activity_sig != prev_sig;
                 let elapsed = now.saturating_sub(fired_at_secs);
                 // sig_changed fires are rate-limited to prevent JS thread-mutation
                 // sequences from producing rapid-fire banners.  count_increased always
@@ -461,9 +460,7 @@ fn decide_notification(
                         typing_rearm_exhausted: new_exhausted,
                         time_rearm_exhausted: new_time_exhausted,
                     };
-                } else if prev_sig.is_empty() && !activity_sig.is_empty()
-                    && count == prev_count
-                {
+                } else if prev_sig.is_empty() && !activity_sig.is_empty() && count == prev_count {
                     // Empty→nonempty transition that we suppressed — store
                     // the arriving sig as a baseline so the next genuine
                     // change can be detected.
@@ -538,9 +535,8 @@ fn decide_notification(
                 // message.  This was especially visible for group chats where the
                 // title oscillates between "(N) Sender | Messenger" (open tab)
                 // and "Sender píše skupině GroupName" (typing indicator).
-                let sig_changed = !activity_sig.is_empty()
-                    && !prev_sig.is_empty()
-                    && activity_sig != prev_sig;
+                let sig_changed =
+                    !activity_sig.is_empty() && !prev_sig.is_empty() && activity_sig != prev_sig;
                 let elapsed = now.saturating_sub(prev_fired_at_secs);
                 // Same floor as the Notified arm: sig-only fires are rate-limited.
                 let sig_under_floor =
@@ -558,9 +554,8 @@ fn decide_notification(
                 // still hasn't read the message, fire ONE more reminder.  Capped
                 // per Notified entry via `prev_time_rearm_exhausted` so an
                 // oscillating title does not re-fire every 60 s forever.
-                let time_rearm = TIME_REARM_ENABLED
-                    && elapsed >= NOTIF_REARM_SECS
-                    && !prev_time_rearm_exhausted;
+                let time_rearm =
+                    TIME_REARM_ENABLED && elapsed >= NOTIF_REARM_SECS && !prev_time_rearm_exhausted;
                 let should_fire = notifications_enabled
                     && !is_focused
                     && (count_increased
@@ -1041,9 +1036,13 @@ pub fn clear_all_data(app: AppHandle) -> Result<(), String> {
 /// Open a URL in the system default browser.
 #[tauri::command]
 pub fn open_external(url: String, app: AppHandle) -> Result<(), String> {
+    open_external_url(&app, &url)
+}
+
+fn open_external_url(app: &AppHandle, url: &str) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     app.opener()
-        .open_url(&url, None::<&str>)
+        .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())
 }
 
@@ -1073,6 +1072,27 @@ pub fn open_popup(url: String, app: AppHandle) -> Result<(), String> {
         return Err(format!("URL not allowed: {url}"));
     }
 
+    // The IPC-built popup has no on_navigation policy, so link-shim URLs must
+    // be resolved/validated here — same policy as the on_new_window handlers
+    // (shared `classify_popup_shim`). Otherwise a shim with an unvalidated
+    // `u` could land in an embedded popup.
+    match crate::classify_popup_shim(&parsed_url) {
+        Some(crate::PopupShimDecision::OpenExternal(real_url)) => {
+            log::info!(
+                "[MessengerX][Popup][IPC] Link shim resolved — opening real URL externally: {real_url}"
+            );
+            open_external_url(&app, &real_url)?;
+            return Ok(());
+        }
+        Some(crate::PopupShimDecision::Deny) => {
+            log::warn!(
+                "[MessengerX][Popup][IPC] Denying shim popup without a valid http(s) `u`: {url}"
+            );
+            return Ok(());
+        }
+        None => {}
+    }
+
     let label = format!(
         "popup-{}",
         crate::POPUP_WINDOW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1096,6 +1116,9 @@ pub fn open_popup(url: String, app: AppHandle) -> Result<(), String> {
         })
         // Handle further window.open() calls from within the call window.
         .on_new_window(move |nested_url, nested_features| {
+            if let Some(denied) = crate::popup_shim_decision(&nested_url, &nested_app) {
+                return denied;
+            }
             let h = nested_url.host_str().unwrap_or("");
             let ok = h == "messenger.com"
                 || h.ends_with(".messenger.com")
@@ -1369,10 +1392,7 @@ pub async fn pick_save_path(
                 }
                 // File already exists — auto-increment the name (fallback).
                 let dir = p.parent().unwrap_or_else(|| std::path::Path::new("."));
-                let base = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("download");
+                let base = p.file_name().and_then(|n| n.to_str()).unwrap_or("download");
                 let (stem, ext) = base
                     .rfind('.')
                     .map(|i| (&base[..i], &base[i..]))
@@ -1395,11 +1415,7 @@ pub async fn pick_save_path(
 /// Called from JS after the user has chosen a save path and the blob data
 /// has been fetched via `fetch(blobUrl) → arrayBuffer()`.
 #[tauri::command]
-pub fn write_file_bytes(
-    path: String,
-    data: Vec<u8>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+pub fn write_file_bytes(path: String, data: Vec<u8>, app: tauri::AppHandle) -> Result<(), String> {
     std::fs::write(&path, &data).map_err(|e| format!("File write failed: {e}"))?;
 
     // Extract filename for the notification.
@@ -1429,11 +1445,11 @@ pub fn write_file_bytes(
 /// Saves a DOM snapshot to a file in the app's data directory for debugging.
 /// Called from JS via `invoke('save_dom_snapshot', { html: '...' })`.
 #[tauri::command]
-pub fn save_dom_snapshot(
-    html: String,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let file_name = format!("dom_snapshot_{}.html", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+pub fn save_dom_snapshot(html: String, app: tauri::AppHandle) -> Result<String, String> {
+    let file_name = format!(
+        "dom_snapshot_{}.html",
+        chrono::Local::now().format("%Y%m%d_%H%M%S")
+    );
     let path = app
         .path()
         .app_data_dir()
@@ -1500,6 +1516,15 @@ mod tests {
             Some("https://www.messenger.com/t/123/")
         );
         assert_eq!(deserialized.appearance, "dark");
+    }
+
+    #[test]
+    fn open_popup_nested_handler_applies_shared_shim_policy() {
+        const SOURCE: &str = include_str!("commands.rs");
+        assert!(
+            SOURCE.contains("crate::popup_shim_decision(&nested_url, &nested_app)"),
+            "open_popup nested on_new_window handler must apply the shared popup shim policy before building a nested WebView"
+        );
     }
 
     #[test]
@@ -1690,9 +1715,7 @@ mod tests {
         };
 
         // Same count, prev_sig is empty, activity_sig arrives non-empty.
-        let decision = decide_notification(
-            &mut state, 1, "1:0:Alice", false, true, false, 104,
-        );
+        let decision = decide_notification(&mut state, 1, "1:0:Alice", false, true, false, 104);
         assert!(!decision.should_fire, "empty→nonempty should NOT fire");
         assert!(!decision.sig_changed);
 
@@ -1720,10 +1743,11 @@ mod tests {
             prev_time_rearm_exhausted: false,
         };
 
-        let decision = decide_notification(
-            &mut state, 1, "1:0:Alice", false, true, false, 104,
+        let decision = decide_notification(&mut state, 1, "1:0:Alice", false, true, false, 104);
+        assert!(
+            !decision.should_fire,
+            "empty prev_sig should NOT trigger fire"
         );
-        assert!(!decision.should_fire, "empty prev_sig should NOT trigger fire");
         assert!(
             !decision.sig_changed,
             "sig_changed must be false when prev_sig is empty"
@@ -1775,12 +1799,18 @@ mod tests {
             time_rearm_exhausted: false,
         };
         let decision = decide_notification(&mut state, 1, "1:1:Alice", false, true, false, 101);
-        assert!(!decision.should_fire, "under-floor sig_changed should NOT fire");
+        assert!(
+            !decision.should_fire,
+            "under-floor sig_changed should NOT fire"
+        );
         assert_eq!(decision.reason, "sig-changed-floor-suppressed");
         // Stored sig must remain the OLD value so the next poll still sees a change.
         match &state {
             NotifState::Notified { sig, .. } => {
-                assert_eq!(sig, "1:0:Alice", "sig must not be overwritten while under floor");
+                assert_eq!(
+                    sig, "1:0:Alice",
+                    "sig must not be overwritten while under floor"
+                );
             }
             _ => panic!("expected Notified state"),
         }
@@ -2346,11 +2376,18 @@ mod tests {
         let d = decide_notification(&mut state, 0, "", true, true, false, 105);
         assert!(!d.should_fire);
         assert_eq!(d.reason, "focused-read-all");
-        assert_eq!(state, NotifState::Idle, "must reset to Idle after focused read");
+        assert_eq!(
+            state,
+            NotifState::Idle,
+            "must reset to Idle after focused read"
+        );
 
         // T=108: user minimizes; new message arrives → count=1, not focused.
         let d = decide_notification(&mut state, 1, "", false, true, false, 108);
-        assert!(d.should_fire, "new message after focused read must fire notification");
+        assert!(
+            d.should_fire,
+            "new message after focused read must fire notification"
+        );
         assert_eq!(d.reason, "idle-count-positive");
     }
 
@@ -2465,7 +2502,10 @@ mod tests {
         let now = 100 + NOTIF_REARM_SECS;
         // is_focused=true
         let d = decide_notification(&mut state, 1, "", true, true, false, now);
-        assert!(!d.should_fire, "time-rearm must not fire when window is focused");
+        assert!(
+            !d.should_fire,
+            "time-rearm must not fire when window is focused"
+        );
     }
 
     /// time-rearm from ZeroPending: user read the message quickly (within 7 s)
@@ -2488,7 +2528,10 @@ mod tests {
         };
         // New message arrives at T=162 (elapsed from original fire = 62 >= 60).
         let d = decide_notification(&mut state, 1, "", false, true, false, 162);
-        assert!(d.should_fire, "time-rearm must fire from ZeroPending after 60 s");
+        assert!(
+            d.should_fire,
+            "time-rearm must fire from ZeroPending after 60 s"
+        );
         assert_eq!(d.reason, "time-rearm-60s");
     }
 
@@ -2582,6 +2625,10 @@ mod tests {
         // 7 s later, still 0 → zero-sustained-read-all (clear_badge=true) while
         // the count has NOT changed.  Badge must now clear.
         apply(&mut shown, true, 0);
-        assert_eq!(shown, Some(0), "deferred read-all must clear the stale badge");
+        assert_eq!(
+            shown,
+            Some(0),
+            "deferred read-all must clear the stale badge"
+        );
     }
 }
