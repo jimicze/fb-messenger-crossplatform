@@ -3342,11 +3342,12 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
         }
         var XHRProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
         if (XHRProto) {
-            // Monotonic per-open counter — the guarded loadend listener
-            // attributes events to the exact open() call that installed it,
-            // so superseded (re-open reused XHR) completions are ignored.
+            // Monotonic per-open counter — paired with a per-send snapshot so
+            // the once-installed loadend listener can still correlate each
+            // completion to the current request on a reused XHR instance.
             var diagOpenCounter = 0;
             var origOpen = XHRProto.open;
+            var origSend = XHRProto.send;
             XHRProto.open = function(method, url) {
                 try {
                     var matched = URL_RE.test(url || '');
@@ -3365,11 +3366,12 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                             var self = this;
                             this.addEventListener('loadend', function() {
                                 try {
-                                    // Attribute logend only to the open() request
-                                    // it was installed for — a reused XHR's
-                                    // superseded loadend must not log the new
-                                    // request's metadata.
-                                    if (self.__mxDiagOpenId !== openId) return;
+                                    // Attribute loadend only to the send() in
+                                    // flight for this XHR instance — reused
+                                    // objects update __mxDiagOpenId on each
+                                    // open(), so the per-send snapshot avoids
+                                    // stale first-open closure state.
+                                    if (self.__mxDiagOpenId !== self.__mxDiagLoadendOpenId) return;
                                     if (!self.__mxDiagMatched) return;
                                     dlog('[XHR] ' + self.__mxDiagMethod + ' '
                                         + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
@@ -3379,6 +3381,12 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                     }
                 } catch(_) {}
                 return origOpen.apply(this, arguments);
+            };
+            XHRProto.send = function() {
+                try {
+                    this.__mxDiagLoadendOpenId = this.__mxDiagOpenId;
+                } catch(_) {}
+                return origSend.apply(this, arguments);
             };
         }
         dlog('[HTTP] proxies installed');
@@ -4919,7 +4927,7 @@ pub(crate) fn classify_popup_shim(url: &url::Url) -> Option<PopupShimDecision> {
 /// valid shims and opens the real destination in the system browser, denies
 /// shims whose `u` is missing or not http(s), and otherwise returns `None`
 /// so the caller continues with its own allowlist.
-fn popup_shim_decision(
+pub(crate) fn popup_shim_decision(
     url: &url::Url,
     app_handle: &tauri::AppHandle,
 ) -> Option<tauri::webview::NewWindowResponse<tauri::Wry>> {
@@ -8372,8 +8380,12 @@ mod tests {
                 "diagnostic XHR loadend callback must skip non-matching re-opens instead of logging stale URL/method data"
             );
             assert!(
-                proxy.contains("if (self.__mxDiagOpenId !== openId) return;"),
-                "diagnostic XHR loadend callback must attribute events to the open() call that installed them so superseded requests are ignored"
+                proxy.contains("if (self.__mxDiagOpenId !== self.__mxDiagLoadendOpenId) return;"),
+                "diagnostic XHR loadend callback must correlate completions to the current send() on a reused XHR instead of retaining stale first-open state"
+            );
+            assert!(
+                proxy.contains("this.__mxDiagLoadendOpenId = this.__mxDiagOpenId;"),
+                "diagnostic XHR send override must snapshot the active open() generation so the guarded loadend listener can attribute each completion correctly"
             );
             assert!(
                 proxy.contains("if (!this.__mxDiagLoadendInstalled)"),

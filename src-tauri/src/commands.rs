@@ -1116,6 +1116,9 @@ pub fn open_popup(url: String, app: AppHandle) -> Result<(), String> {
         })
         // Handle further window.open() calls from within the call window.
         .on_new_window(move |nested_url, nested_features| {
+            if let Some(denied) = crate::popup_shim_decision(&nested_url, &nested_app) {
+                return denied;
+            }
             let h = nested_url.host_str().unwrap_or("");
             let ok = h == "messenger.com"
                 || h.ends_with(".messenger.com")
@@ -1513,6 +1516,15 @@ mod tests {
             Some("https://www.messenger.com/t/123/")
         );
         assert_eq!(deserialized.appearance, "dark");
+    }
+
+    #[test]
+    fn open_popup_nested_handler_applies_shared_shim_policy() {
+        const SOURCE: &str = include_str!("commands.rs");
+        assert!(
+            SOURCE.contains("crate::popup_shim_decision(&nested_url, &nested_app)"),
+            "open_popup nested on_new_window handler must apply the shared popup shim policy before building a nested WebView"
+        );
     }
 
     #[test]
