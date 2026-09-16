@@ -3342,12 +3342,13 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
         }
         var XHRProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
         if (XHRProto) {
-            // Monotonic per-open counter — paired with a per-send snapshot so
-            // the once-installed loadend listener can still correlate each
-            // completion to the current request on a reused XHR instance.
+            // Fresh per-open listener with a FROZEN snapshot of that open's
+            // metadata: a superseded (aborted) loadend that fires after a
+            // later open() sees a different generation id and is ignored, and
+            // re-installing (remove previous, attach new) keeps exactly one
+            // handler so reused XHR objects never accumulate duplicates.
             var diagOpenCounter = 0;
             var origOpen = XHRProto.open;
-            var origSend = XHRProto.send;
             XHRProto.open = function(method, url) {
                 try {
                     var matched = URL_RE.test(url || '');
@@ -3356,37 +3357,27 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                     this.__mxDiagMatched = matched;
                     this.__mxDiagMethod = method;
                     this.__mxDiagUrl = url;
-                    var openId = ++diagOpenCounter;
-                    this.__mxDiagOpenId = openId;
+                    var diagOpenId = ++diagOpenCounter;
+                    this.__mxDiagOpenId = diagOpenId;
                     if (matched) {
-                        // Attach the loadend listener once per XHR instance so
-                        // reused objects do not accumulate duplicate handlers.
-                        if (!this.__mxDiagLoadendInstalled) {
-                            this.__mxDiagLoadendInstalled = true;
-                            var self = this;
-                            this.addEventListener('loadend', function() {
-                                try {
-                                    // Attribute loadend only to the send() in
-                                    // flight for this XHR instance — reused
-                                    // objects update __mxDiagOpenId on each
-                                    // open(), so the per-send snapshot avoids
-                                    // stale first-open closure state.
-                                    if (self.__mxDiagOpenId !== self.__mxDiagLoadendOpenId) return;
-                                    if (!self.__mxDiagMatched) return;
-                                    dlog('[XHR] ' + self.__mxDiagMethod + ' '
-                                        + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
-                                } catch(_) {}
-                            });
+                        if (this.__mxDiagLoadendHandler) {
+                            this.removeEventListener('loadend', this.__mxDiagLoadendHandler);
                         }
+                        var self = this;
+                        var diagMethod = String(method);
+                        var diagUrl = String(url || '');
+                        var handler = function() {
+                            try {
+                                if (self.__mxDiagOpenId !== diagOpenId) return;
+                                dlog('[XHR] ' + diagMethod + ' '
+                                    + diagUrl.slice(0, 80) + ' -> ' + self.status);
+                            } catch(_) {}
+                        };
+                        this.addEventListener('loadend', handler);
+                        this.__mxDiagLoadendHandler = handler;
                     }
                 } catch(_) {}
                 return origOpen.apply(this, arguments);
-            };
-            XHRProto.send = function() {
-                try {
-                    this.__mxDiagLoadendOpenId = this.__mxDiagOpenId;
-                } catch(_) {}
-                return origSend.apply(this, arguments);
             };
         }
         dlog('[HTTP] proxies installed');
@@ -4010,8 +4001,6 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
     }
 
     var _requestId = 0;
-    // Monotonic per-open generation counter — see XMLHttpRequest.open below.
-    var _openGeneration = 0;
     var _pending = new Map();
 
     function shouldLogUrl(url) {
@@ -4066,45 +4055,44 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
         this._netLogId = ++_requestId;
         this._netLogUrl = String(url || '');
         this._netLogMethod = method;
-        this._netLogStart = 0;
         this._netLogShould = shouldLogUrl(this._netLogUrl);
-        // Per-open generation: the once-installed loadend listener attributes
-        // events to the open() call that installed it, so a reused XHR's
-        // superseded (abort) loadend never logs the NEW request's metadata
-        // (or swallows it). Re-open invalidates the captured generation.
-        this._netLogOpenId = ++_openGeneration;
         return _origXHROpen.apply(this, arguments);
     };
 
     XMLHttpRequest.prototype.send = function() {
         var self = this;
         if (self._netLogShould) {
-            self._netLogStart = performance.now();
-            nlog('xhr start id=' + self._netLogId + ' method=' + self._netLogMethod +
-                 ' url=' + JSON.stringify(sanitizeUrl(self._netLogUrl)));
-        }
+            // Freeze this request's metadata — the per-send loadend handler
+            // below logs from these locals, never from mutable instance
+            // fields, so a superseded (aborted) loadend can never report the
+            // next request's id/url/status.
+            var startedAt = performance.now();
+            var reqId = self._netLogId;
+            var reqUrl = String(self._netLogUrl || '');
+            var reqMethod = String(self._netLogMethod || '');
+            nlog('xhr start id=' + reqId + ' method=' + reqMethod +
+                 ' url=' + JSON.stringify(sanitizeUrl(reqUrl)));
 
-        // One loadend listener per XHR instance (loadend fires after every
-        // send), never re-added — reused XHR objects would otherwise
-        // accumulate listeners.
-        if (!self._netLogLoadendAdded) {
-            self._netLogLoadendAdded = true;
-            self.addEventListener('loadend', function() {
-                if (!self._netLogShould) return;
-                // Attribute only to the open() call it was installed for —
-                // superseded re-opens must not log the latest request's
-                // metadata.
-                if (self._netLogOpenId !== self._netLogLoadendOpenId) return;
-                var ms = Math.round(performance.now() - self._netLogStart);
+            // Replace any previous per-send handler with this request's own.
+            // Re-installing keeps exactly one loadend attached per XHR
+            // (no accumulation), and the previous handler is detached before
+            // the new request starts. Their handler is replaced on every
+            // send to fix mis-attribution after open() aborts an in-flight
+            // request: the old listener saw equal snapshot ids and could log
+            // the new request's metadata for the old event.
+            if (self._netLogLoadendHandler) {
+                self.removeEventListener('loadend', self._netLogLoadendHandler);
+            }
+            var handler = function() {
+                var ms = Math.round(performance.now() - startedAt);
                 var ct = '';
                 try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
-                nlog('xhr end id=' + self._netLogId + ' status=' + self.status + ' ms=' + ms +
+                nlog('xhr end id=' + reqId + ' status=' + self.status + ' ms=' + ms +
                      ' type=' + ct);
-            });
+            };
+            self.addEventListener('loadend', handler);
+            self._netLogLoadendHandler = handler;
         }
-        // Snapshot of the current generation for this send() so the guarded
-        // listener can correlate its event with this exact request.
-        self._netLogLoadendOpenId = self._netLogOpenId;
 
         return _origXHRSend.apply(this, arguments);
     };
@@ -8344,7 +8332,36 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     mod diagnostic_telemetry {
-        use super::super::DIAGNOSTIC_TELEMETRY_SCRIPT;
+        use super::super::{DIAGNOSTIC_TELEMETRY_SCRIPT, NETWORK_LOGGER_SCRIPT};
+
+        #[test]
+        fn network_xhr_loadend_correlates_by_frozen_snapshot() {
+            let override_start = NETWORK_LOGGER_SCRIPT
+                .find("XMLHttpRequest.prototype.send = function()")
+                .expect("network XHR send override missing");
+            let override_end = NETWORK_LOGGER_SCRIPT[override_start..]
+                .find("nlog('Network logger registered")
+                .map(|offset| override_start + offset)
+                .expect("network footer must follow the send override");
+            let proxy = &NETWORK_LOGGER_SCRIPT[override_start..override_end];
+            assert!(
+                proxy.contains("self.removeEventListener('loadend', self._netLogLoadendHandler)"),
+                "network XHR send override must replace its per-send handler (exactly one listener) instead of accumulating"
+            );
+            assert_eq!(
+                proxy.matches("addEventListener('loadend'").count(),
+                1,
+                "network XHR send override must attach the fresh per-send handler in exactly one place"
+            );
+            assert!(
+                proxy.contains("nlog('xhr end id=' + reqId"),
+                "network XHR loadend must log from the frozen per-send snapshot (reqId), never from mutable instance fields"
+            );
+            assert!(
+                !proxy.contains("_netLogLoadendOpenId"),
+                "the snapshot-compare guard is insufficient when loadend from an in-flight request is superseded by a later send — the per-send replace pattern must be used instead"
+            );
+        }
 
         #[test]
         fn dlog_consumes_async_invoke_rejections() {
@@ -8378,25 +8395,22 @@ mod tests {
                 "diagnostic XHR override must update the per-open match state on every open so reused XHR objects cannot log stale URLs"
             );
             assert!(
-                proxy.contains("if (!self.__mxDiagMatched) return;"),
-                "diagnostic XHR loadend callback must skip non-matching re-opens instead of logging stale URL/method data"
+                proxy.contains("if (self.__mxDiagOpenId !== diagOpenId) return;"),
+                "diagnostic XHR loadend callback must attribute events to the open() call that installed them (frozen snapshot) so superseded requests are ignored"
             );
             assert!(
-                proxy.contains("if (self.__mxDiagOpenId !== self.__mxDiagLoadendOpenId) return;"),
-                "diagnostic XHR loadend callback must correlate completions to the current send() on a reused XHR instead of retaining stale first-open state"
+                proxy.contains("this.removeEventListener('loadend', this.__mxDiagLoadendHandler)"),
+                "diagnostic XHR override must replace its per-open handler (exactly one listener) instead of accumulating"
             );
-            assert!(
-                proxy.contains("this.__mxDiagLoadendOpenId = this.__mxDiagOpenId;"),
-                "diagnostic XHR send override must snapshot the active open() generation so the guarded loadend listener can attribute each completion correctly"
-            );
-            assert!(
-                proxy.contains("if (!this.__mxDiagLoadendInstalled)"),
-                "diagnostic XHR loadend listener must be guarded per instance so reused XHR objects do not accumulate handlers"
+            assert_eq!(
+                proxy.matches("this.removeEventListener('loadend'").count(),
+                1,
+                "diagnostic XHR override must detach the previous handler in exactly one place"
             );
             assert_eq!(
                 proxy.matches("addEventListener('loadend'").count(),
                 1,
-                "diagnostic XHR override must attach the loadend listener in exactly one guarded place"
+                "diagnostic XHR override must attach the fresh per-open handler in exactly one place"
             );
         }
     }
