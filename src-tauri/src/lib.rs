@@ -2697,19 +2697,23 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
             if ((parsed.hostname === 'l.facebook.com' || parsed.hostname === 'l.messenger.com')
                     && parsed.pathname === '/l.php') {
                 var target = parsed.searchParams.get('u');
+                // No `u` param is NOT an invalid shim — return null so callers
+                // fall through to the normal policy chain (e.g. Messenger
+                // OAuth/login cookie redirects navigate in-app).
+                if (target === null) {
+                    return null;
+                }
                 // Same scheme validation as resolve_facebook_shim_url in Rust:
                 // the shim must resolve to an absolute http(s) URL before it
                 // reaches the opener path. Validate via an actual URL parse
                 // (schemes are case-insensitive, so prefix checks like
                 // indexOf('https://') would wrongly reject `u=HTTPS://...`).
-                if (target) {
-                    try {
-                        var targetUrl = new URL(target);
-                        if (targetUrl.protocol === 'https:' || targetUrl.protocol === 'http:') {
-                            return target;
-                        }
-                    } catch(_) {}
-                }
+                try {
+                    var targetUrl = new URL(target);
+                    if (targetUrl.protocol === 'https:' || targetUrl.protocol === 'http:') {
+                        return target;
+                    }
+                } catch(_) {}
                 jlog('Link shim `u` param is not an http(s) URL — dropping open: ' + (target || '').slice(0, 200));
                 // Distinguish "invalid shim" from "not a shim": an invalid
                 // shim must NOT fall through to _originalOpen, because the
@@ -2741,7 +2745,12 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
         var featStr = features ? String(features) : '';
         jlog('window.open intercepted: url=' + urlStr + ' target=' + (target||'') + ' features=' + featStr);
 
-        if (urlStr && (urlStr.startsWith('http://') || urlStr.startsWith('https://'))) {
+        var parsedOpen = null;
+        try { parsedOpen = urlStr ? new URL(urlStr) : null; } catch(e) {}
+        var isOpenHttp = parsedOpen
+            && (parsedOpen.protocol === 'http:' || parsedOpen.protocol === 'https:');
+
+        if (isOpenHttp) {
             // Check for the Facebook/Messenger link shim BEFORE isAllowedUrl,
             // because l.facebook.com IS an allowed domain but window.open()
             // with that URL would be silently dropped by WKWebView (no
@@ -4834,6 +4843,46 @@ fn resolve_facebook_shim_url(url: &url::Url) -> Option<String> {
     Some(target)
 }
 
+/// Popup policy for link-shim URLs (`l.facebook.com/l.php?u=…`,
+/// `l.messenger.com/l.php?u=…`), shared by the main and nested
+/// `on_new_window` handlers.
+///
+/// * Valid shim (`u` is an absolute http(s) URL) → open the real destination
+///   in the system browser and answer the popup request with `Deny`
+///   (popup creation bypasses `on_navigation` and must never embed shims).
+/// * Present but invalid `u` → `Deny` (popup creation would bypass the
+///   collected scheme validation).
+/// * Not a shim → `None`, the caller continues with its own allowlist.
+fn popup_shim_decision(
+    url: &url::Url,
+    app_handle: &tauri::AppHandle,
+) -> Option<tauri::webview::NewWindowResponse<tauri::Wry>> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let host = url.host_str()?;
+    if !(host == "l.facebook.com" || host == "l.messenger.com") || url.path() != "/l.php" {
+        return None;
+    }
+
+    if let Some(real_url) = resolve_facebook_shim_url(url) {
+        log::info!(
+            "[MessengerX][Popup] Link shim resolved — opening real URL externally: {real_url}"
+        );
+        let handle = app_handle.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = handle.opener().open_url(&real_url, None::<&str>) {
+                log::warn!("[MessengerX] Failed to open shim URL {real_url}: {e}");
+            }
+        });
+    } else {
+        log::warn!(
+            "[MessengerX][Popup] Denying shim popup without a valid http(s) `u`: {}",
+            url.as_str()
+        );
+    }
+    Some(tauri::webview::NewWindowResponse::Deny)
+}
+
 #[derive(Default)]
 struct LastUrlWriteCoordinator {
     generation: std::sync::atomic::AtomicU64,
@@ -6541,6 +6590,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     return tauri::webview::NewWindowResponse::Deny;
                 }
 
+                // Link-shim policy mirrors the JS window.open override:
+                // valid shims resolve to the real destination and open THAT
+                // in the system browser, shims whose `u` is missing or not
+                // http(s) are denied (never embedded), so a popup cannot be
+                // used to bypass the on_navigation scheme validation.
+                if let Some(denied) = popup_shim_decision(&url, &popup_app_handle) {
+                    return denied;
+                }
+
                 let label = format!(
                     "popup-{}",
                     POPUP_WINDOW_COUNTER
@@ -6604,6 +6662,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                             nested_url.as_str()
                         );
                         return tauri::webview::NewWindowResponse::Deny;
+                    }
+
+                    // Link-shim policy for nested popups — mirrors the JS
+                    // window.open override and the outer on_new_window
+                    // handler; see `popup_shim_decision`.
+                    if let Some(denied) = popup_shim_decision(&nested_url, &nested_app) {
+                        return denied;
                     }
 
                     let nested_label = format!(
@@ -8468,6 +8533,28 @@ mod tests {
                 .map(|offset| start + offset)
                 .expect("openExternal must follow the shim resolver");
             let helper = &WINDOW_OPEN_OVERRIDE_SCRIPT[start..end];
+            let prefix_start = WINDOW_OPEN_OVERRIDE_SCRIPT
+                .find("var isOpenHttp = parsedOpen")
+                .expect("scheme-agnostic open gate missing");
+            let prefix_end = WINDOW_OPEN_OVERRIDE_SCRIPT[prefix_start..]
+                .find("if (isOpenHttp)")
+                .map(|offset| prefix_start + offset)
+                .expect("isOpenHttp must be consumed right after its definition");
+            let gate = &WINDOW_OPEN_OVERRIDE_SCRIPT[prefix_start..prefix_end];
+            assert!(
+                gate.contains("parsedOpen.protocol === 'http:'"),
+                "window.open gate must compare the parsed protocol, not case-sensitive startsWith prefixes"
+            );
+            assert!(
+                gate.contains("parsedOpen.protocol === 'https:'"),
+                "window.open gate must accept the https: protocol from the URL parser"
+            );
+            assert!(
+                helper.contains(
+                    "if (target === null) {\n                    return null;\n                }"
+                ),
+                "shim without a `u` param must return null (not-a-shim), not false"
+            );
             assert!(
                 helper.contains("return false;"),
                 "invalid shim must be distinguishable from \"not a shim\" (null) so the window.open path can drop it before on_new_window creates an embedded popup"
@@ -8483,6 +8570,17 @@ mod tests {
             assert!(
                 helper.contains("targetUrl.protocol === 'http:'"),
                 "window.open shim resolver must require an http: protocol"
+            );
+        }
+
+        #[test]
+        fn popup_handlers_apply_shared_shim_policy() {
+            const SOURCE: &str = include_str!("lib.rs");
+            assert!(SOURCE.contains("fn popup_shim_decision("));
+            assert_eq!(
+                SOURCE.matches("popup_shim_decision(").count(),
+                5,
+                "on_new_window (main + nested) must call the shared popup_shim_decision helper (call sites + test needles)"
             );
         }
     }
