@@ -4923,10 +4923,12 @@ pub(crate) fn classify_popup_shim(url: &url::Url) -> Option<PopupShimDecision> {
     }
 }
 
-/// Shared on_new_window consumption of [`classify_popup_shim`]: resolves
-/// valid shims and opens the real destination in the system browser, denies
-/// shims whose `u` is missing or not http(s), and otherwise returns `None`
-/// so the caller continues with its own allowlist.
+/// Shared popup shim-policy helper used by the `lib.rs` `on_new_window`
+/// handlers and the `commands.rs` IPC-built call popup's nested
+/// `on_new_window` callback. Resolves valid shims and opens the real
+/// destination in the system browser, denies shims whose `u` is missing or
+/// not http(s), and otherwise returns `None` so the caller continues with its
+/// own allowlist.
 pub(crate) fn popup_shim_decision(
     url: &url::Url,
     app_handle: &tauri::AppHandle,
