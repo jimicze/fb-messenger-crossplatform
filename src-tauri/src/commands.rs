@@ -1036,9 +1036,13 @@ pub fn clear_all_data(app: AppHandle) -> Result<(), String> {
 /// Open a URL in the system default browser.
 #[tauri::command]
 pub fn open_external(url: String, app: AppHandle) -> Result<(), String> {
+    open_external_url(&app, &url)
+}
+
+fn open_external_url(app: &AppHandle, url: &str) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     app.opener()
-        .open_url(&url, None::<&str>)
+        .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())
 }
 
@@ -1066,6 +1070,27 @@ pub fn open_popup(url: String, app: AppHandle) -> Result<(), String> {
     if !allowed {
         log::warn!("[MessengerX][Popup][IPC] Denied non-FB url={url}");
         return Err(format!("URL not allowed: {url}"));
+    }
+
+    // The IPC-built popup has no on_navigation policy, so link-shim URLs must
+    // be resolved/validated here — same policy as the on_new_window handlers
+    // (shared `classify_popup_shim`). Otherwise a shim with an unvalidated
+    // `u` could land in an embedded popup.
+    match crate::classify_popup_shim(&parsed_url) {
+        Some(crate::PopupShimDecision::OpenExternal(real_url)) => {
+            log::info!(
+                "[MessengerX][Popup][IPC] Link shim resolved — opening real URL externally: {real_url}"
+            );
+            open_external_url(&app, &real_url)?;
+            return Ok(());
+        }
+        Some(crate::PopupShimDecision::Deny) => {
+            log::warn!(
+                "[MessengerX][Popup][IPC] Denying shim popup without a valid http(s) `u`: {url}"
+            );
+            return Ok(());
+        }
+        None => {}
     }
 
     let label = format!(

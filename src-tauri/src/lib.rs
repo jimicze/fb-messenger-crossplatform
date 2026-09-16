@@ -2795,6 +2795,23 @@ const WINDOW_OPEN_OVERRIDE_SCRIPT: &str = r#"
                 // the current page origin so they become absolute https:// URLs.
                 try { dest = new URL(dest, window.location.href).toString(); } catch(e) {}
                 if (!dest.startsWith('http://') && !dest.startsWith('https://')) return;
+                // The open_popup command builds its WebView without an
+                // on_navigation policy, so shim URLs must be resolved/validated
+                // here the same way the on_new_window policy does via
+                // popup_shim_decision — otherwise an l.facebook.com/l.php?u=…
+                // blank-open lands in an unvalidated embedded popup. An
+                // invalid shim (`false`) is dropped entirely.
+                var shimRealUrl = extractLinkShimUrl(dest);
+                if (shimRealUrl === false) {
+                    jlog('[CallPopup] invalid link shim — popup open dropped: ' + dest.slice(0, 200));
+                    return;
+                }
+                if (shimRealUrl) {
+                    jlog('[CallPopup] link shim resolved to real URL — routing to browser: ' + shimRealUrl);
+                    openExternal(shimRealUrl);
+                    proxyNavigated = true;
+                    return;
+                }
                 proxyNavigated = true;
                 jlog('[CallPopup] popup proxy navigating to: ' + dest);
                 try {
@@ -3325,6 +3342,10 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
         }
         var XHRProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
         if (XHRProto) {
+            // Monotonic per-open counter — the guarded loadend listener
+            // attributes events to the exact open() call that installed it,
+            // so superseded (re-open reused XHR) completions are ignored.
+            var diagOpenCounter = 0;
             var origOpen = XHRProto.open;
             XHRProto.open = function(method, url) {
                 try {
@@ -3334,6 +3355,8 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                     this.__mxDiagMatched = matched;
                     this.__mxDiagMethod = method;
                     this.__mxDiagUrl = url;
+                    var openId = ++diagOpenCounter;
+                    this.__mxDiagOpenId = openId;
                     if (matched) {
                         // Attach the loadend listener once per XHR instance so
                         // reused objects do not accumulate duplicate handlers.
@@ -3342,6 +3365,11 @@ const DIAGNOSTIC_TELEMETRY_SCRIPT: &str = concat!(
                             var self = this;
                             this.addEventListener('loadend', function() {
                                 try {
+                                    // Attribute logend only to the open() request
+                                    // it was installed for — a reused XHR's
+                                    // superseded loadend must not log the new
+                                    // request's metadata.
+                                    if (self.__mxDiagOpenId !== openId) return;
                                     if (!self.__mxDiagMatched) return;
                                     dlog('[XHR] ' + self.__mxDiagMethod + ' '
                                         + String(self.__mxDiagUrl).slice(0, 80) + ' -> ' + self.status);
@@ -3974,6 +4002,8 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
     }
 
     var _requestId = 0;
+    // Monotonic per-open generation counter — see XMLHttpRequest.open below.
+    var _openGeneration = 0;
     var _pending = new Map();
 
     function shouldLogUrl(url) {
@@ -4030,6 +4060,11 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
         this._netLogMethod = method;
         this._netLogStart = 0;
         this._netLogShould = shouldLogUrl(this._netLogUrl);
+        // Per-open generation: the once-installed loadend listener attributes
+        // events to the open() call that installed it, so a reused XHR's
+        // superseded (abort) loadend never logs the NEW request's metadata
+        // (or swallows it). Re-open invalidates the captured generation.
+        this._netLogOpenId = ++_openGeneration;
         return _origXHROpen.apply(this, arguments);
     };
 
@@ -4048,6 +4083,10 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
             self._netLogLoadendAdded = true;
             self.addEventListener('loadend', function() {
                 if (!self._netLogShould) return;
+                // Attribute only to the open() call it was installed for —
+                // superseded re-opens must not log the latest request's
+                // metadata.
+                if (self._netLogOpenId !== self._netLogLoadendOpenId) return;
                 var ms = Math.round(performance.now() - self._netLogStart);
                 var ct = '';
                 try { ct = self.getResponseHeader('content-type') || ''; ct = ct.split(';')[0]; } catch(_) {}
@@ -4055,6 +4094,9 @@ const NETWORK_LOGGER_SCRIPT: &str = concat!(
                      ' type=' + ct);
             });
         }
+        // Snapshot of the current generation for this send() so the guarded
+        // listener can correlate its event with this exact request.
+        self._netLogLoadendOpenId = self._netLogOpenId;
 
         return _origXHRSend.apply(this, arguments);
     };
@@ -4844,41 +4886,63 @@ fn resolve_facebook_shim_url(url: &url::Url) -> Option<String> {
 }
 
 /// Popup policy for link-shim URLs (`l.facebook.com/l.php?u=…`,
-/// `l.messenger.com/l.php?u=…`), shared by the main and nested
-/// `on_new_window` handlers.
+/// `l.messenger.com/l.php?u=…`), shared by every popup entry point:
+/// the main and nested `on_new_window` handlers, the blank-open
+/// `open_popup` IPC command, and any future popup path.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PopupShimDecision {
+    /// Valid shim — the caller should open this destination in the system
+    /// browser instead of creating a popup window.
+    OpenExternal(String),
+    /// Invalid shim (missing or non-http(s) `u`) — the caller must deny /
+    /// drop the popup request so the unvalidated URL can never be embedded.
+    Deny,
+}
+
+/// Classifies a popup URL against the link-shim policy.
 ///
-/// * Valid shim (`u` is an absolute http(s) URL) → open the real destination
-///   in the system browser and answer the popup request with `Deny`
-///   (popup creation bypasses `on_navigation` and must never embed shims).
-/// * Present but invalid `u` → `Deny` (popup creation would bypass the
-///   collected scheme validation).
-/// * Not a shim → `None`, the caller continues with its own allowlist.
+/// Returns `None` when the URL is not a shim and the caller should continue
+/// with its own allowlist.
+pub(crate) fn classify_popup_shim(url: &url::Url) -> Option<PopupShimDecision> {
+    let host = url.host_str()?;
+    if !(host == "l.facebook.com" || host == "l.messenger.com") || url.path() != "/l.php" {
+        return None;
+    }
+
+    match resolve_facebook_shim_url(url) {
+        Some(real_url) => Some(PopupShimDecision::OpenExternal(real_url)),
+        None => Some(PopupShimDecision::Deny),
+    }
+}
+
+/// Shared on_new_window consumption of [`classify_popup_shim`]: resolves
+/// valid shims and opens the real destination in the system browser, denies
+/// shims whose `u` is missing or not http(s), and otherwise returns `None`
+/// so the caller continues with its own allowlist.
 fn popup_shim_decision(
     url: &url::Url,
     app_handle: &tauri::AppHandle,
 ) -> Option<tauri::webview::NewWindowResponse<tauri::Wry>> {
     use tauri_plugin_opener::OpenerExt;
 
-    let host = url.host_str()?;
-    if !(host == "l.facebook.com" || host == "l.messenger.com") || url.path() != "/l.php" {
-        return None;
-    }
-
-    if let Some(real_url) = resolve_facebook_shim_url(url) {
-        log::info!(
-            "[MessengerX][Popup] Link shim resolved — opening real URL externally: {real_url}"
-        );
-        let handle = app_handle.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = handle.opener().open_url(&real_url, None::<&str>) {
-                log::warn!("[MessengerX] Failed to open shim URL {real_url}: {e}");
-            }
-        });
-    } else {
-        log::warn!(
-            "[MessengerX][Popup] Denying shim popup without a valid http(s) `u`: {}",
-            url.as_str()
-        );
+    match classify_popup_shim(url)? {
+        PopupShimDecision::OpenExternal(real_url) => {
+            log::info!(
+                "[MessengerX][Popup] Link shim resolved — opening real URL externally: {real_url}"
+            );
+            let handle = app_handle.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = handle.opener().open_url(&real_url, None::<&str>) {
+                    log::warn!("[MessengerX] Failed to open shim URL {real_url}: {e}");
+                }
+            });
+        }
+        PopupShimDecision::Deny => {
+            log::warn!(
+                "[MessengerX][Popup] Denying shim popup without a valid http(s) `u`: {}",
+                url.as_str()
+            );
+        }
     }
     Some(tauri::webview::NewWindowResponse::Deny)
 }
@@ -8308,6 +8372,10 @@ mod tests {
                 "diagnostic XHR loadend callback must skip non-matching re-opens instead of logging stale URL/method data"
             );
             assert!(
+                proxy.contains("if (self.__mxDiagOpenId !== openId) return;"),
+                "diagnostic XHR loadend callback must attribute events to the open() call that installed them so superseded requests are ignored"
+            );
+            assert!(
                 proxy.contains("if (!this.__mxDiagLoadendInstalled)"),
                 "diagnostic XHR loadend listener must be guarded per instance so reused XHR objects do not accumulate handlers"
             );
@@ -8558,6 +8626,24 @@ mod tests {
             assert!(
                 helper.contains("return false;"),
                 "invalid shim must be distinguishable from \"not a shim\" (null) so the window.open path can drop it before on_new_window creates an embedded popup"
+            );
+            assert!(
+                WINDOW_OPEN_OVERRIDE_SCRIPT.contains(
+                    "var shimRealUrl = extractLinkShimUrl(dest);",
+                ),
+                "the blank-open popup proxy must resolve/validate shim URLs before invoking the open_popup IPC command (no on_navigation there)"
+            );
+            assert!(
+                WINDOW_OPEN_OVERRIDE_SCRIPT
+                    .contains("[CallPopup] invalid link shim — popup open dropped:",),
+                "the blank-open popup proxy must drop invalid shims entirely"
+            );
+            assert_eq!(
+                WINDOW_OPEN_OVERRIDE_SCRIPT
+                    .matches("shimRealUrl === false")
+                    .count(),
+                1,
+                "the blank-open popup proxy must apply the invalid-shim sentinel exactly once before invoking open_popup"
             );
             assert!(
                 helper.contains("new URL(target)"),
